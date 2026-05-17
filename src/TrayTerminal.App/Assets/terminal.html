@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' file: data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="./xterm/xterm.css" />
+  <script src="./xterm/xterm.js"></script>
+  <title>TrayTerminal</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #050607;
+    }
+
+    body {
+      color: #d7dde2;
+      font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+      font-size: 13px;
+    }
+
+    #terminal {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background-color: transparent;
+      background-position: left top;
+      background-repeat: no-repeat;
+      background-size: cover;
+    }
+
+    .xterm,
+    .xterm-screen,
+    .xterm-viewport {
+      background: transparent !important;
+    }
+
+    #fallback {
+      box-sizing: border-box;
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 10px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      outline: none;
+      caret-color: #20b486;
+      line-height: 18px;
+      background: transparent;
+      color: #d7dde2;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <pre id="fallback" tabindex="0" hidden></pre>
+
+  <script>
+    (() => {
+      const decoder = new TextDecoder();
+      const terminalHost = document.getElementById('terminal');
+      const fallback = document.getElementById('fallback');
+      let terminal = null;
+      let fontSize = 16;
+      let lastCols = 120;
+      let lastRows = 30;
+
+      function post(message) {
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage(message);
+        }
+      }
+
+      function sendInput(text) {
+        post({ type: 'input', data: text });
+      }
+
+      function estimateSize() {
+        const width = document.body.clientWidth || 900;
+        const height = document.body.clientHeight || 500;
+        const cols = Math.max(20, Math.floor(width / Math.max(7, fontSize * 0.62)));
+        const rows = Math.max(5, Math.floor(height / Math.max(14, fontSize * 1.35)));
+        if (cols !== lastCols || rows !== lastRows) {
+          lastCols = cols;
+          lastRows = rows;
+          post({ type: 'resize', cols, rows });
+          if (terminal) {
+            terminal.resize(cols, rows);
+          }
+        }
+      }
+
+      function stripAnsi(text) {
+        return text
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+          .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '')
+          .replace(/\x1b[>=c78]/g, '');
+      }
+
+      function writeFallback(text) {
+        const clean = stripAnsi(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        fallback.textContent += clean;
+        if (fallback.textContent.length > 800000) {
+          fallback.textContent = fallback.textContent.slice(-600000);
+        }
+        fallback.scrollTop = fallback.scrollHeight;
+      }
+
+      function mapKey(event) {
+        if (event.ctrlKey && !event.altKey && event.key.length === 1) {
+          const code = event.key.toUpperCase().charCodeAt(0);
+          if (code >= 65 && code <= 90) {
+            return String.fromCharCode(code - 64);
+          }
+        }
+
+        switch (event.key) {
+          case 'Enter': return '\r';
+          case 'Backspace': return '\x7f';
+          case 'Tab': return '\t';
+          case 'Escape': return '\x1b';
+          case 'ArrowUp': return '\x1b[A';
+          case 'ArrowDown': return '\x1b[B';
+          case 'ArrowRight': return '\x1b[C';
+          case 'ArrowLeft': return '\x1b[D';
+          case 'Home': return '\x1b[H';
+          case 'End': return '\x1b[F';
+          case 'Insert': return '\x1b[2~';
+          case 'Delete': return '\x1b[3~';
+          case 'PageUp': return '\x1b[5~';
+          case 'PageDown': return '\x1b[6~';
+          default:
+            return event.key.length === 1 && !event.ctrlKey && !event.metaKey ? event.key : null;
+        }
+      }
+
+      function attachInput(target) {
+        target.addEventListener('keydown', event => {
+          const input = mapKey(event);
+          if (input !== null) {
+            event.preventDefault();
+            sendInput(input);
+          }
+        });
+
+        target.addEventListener('paste', event => {
+          const text = event.clipboardData.getData('text/plain');
+          if (text) {
+            event.preventDefault();
+            sendInput(text);
+          }
+        });
+      }
+
+      function initTerminal() {
+        if (window.Terminal) {
+          terminal = new window.Terminal({
+            cursorBlink: true,
+            convertEol: true,
+            scrollback: 5000,
+            fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
+            fontSize,
+            lineHeight: 1.2,
+            cursorStyle: 'block',
+            allowTransparency: true,
+            theme: {
+              background: 'rgba(0, 0, 0, 0)',
+              foreground: '#d7dde2',
+              cursor: '#20b486',
+              selectionBackground: '#264f78'
+            }
+          });
+          terminal.open(terminalHost);
+          terminal.focus();
+          terminal.onData(sendInput);
+        } else {
+          terminalHost.hidden = true;
+          fallback.hidden = false;
+          fallback.focus();
+          attachInput(fallback);
+          writeFallback('xterm.js 静态文件未找到，已启用轻量渲染模式。\n');
+        }
+
+        estimateSize();
+        post({ type: 'ready' });
+      }
+
+      window.trayTerminal = {
+        writeBase64(payload) {
+          const binary = atob(payload);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+
+          const text = decoder.decode(bytes, { stream: true });
+          if (terminal) {
+            terminal.write(text);
+          } else {
+            writeFallback(text);
+          }
+        },
+        setFontSize(value) {
+          fontSize = Math.max(10, Math.min(32, Number(value) || 16));
+          document.body.style.fontSize = `${fontSize}px`;
+          fallback.style.fontSize = `${fontSize}px`;
+          fallback.style.lineHeight = `${Math.round(fontSize * 1.35)}px`;
+          if (terminal) {
+            terminal.options.fontSize = fontSize;
+            terminal.options.lineHeight = 1.2;
+          }
+          window.requestAnimationFrame(estimateSize);
+        },
+        setBackground(uri) {
+          if (uri) {
+            terminalHost.style.backgroundImage = `url("${uri}")`;
+          } else {
+            terminalHost.style.backgroundImage = 'none';
+          }
+        }
+      };
+
+      window.addEventListener('resize', () => window.requestAnimationFrame(estimateSize));
+      document.addEventListener('DOMContentLoaded', initTerminal);
+    })();
+  </script>
+</body>
+</html>

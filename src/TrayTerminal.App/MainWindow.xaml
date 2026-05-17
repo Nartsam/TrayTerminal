@@ -1,0 +1,67 @@
+<Window x:Class="TrayTerminal.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TrayTerminal"
+        Width="1100"
+        Height="720"
+        MinWidth="760"
+        MinHeight="480"
+        Background="{StaticResource WindowBackgroundBrush}"
+        Foreground="{StaticResource TextBrush}"
+        Icon="Assets/app.ico"
+        WindowStartupLocation="CenterScreen">
+    <DockPanel>
+        <Border DockPanel.Dock="Top"
+                Height="48"
+                Background="{StaticResource PanelBackgroundBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1">
+            <Grid Margin="12,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="NewTabButton"
+                            MinWidth="112"
+                            Height="30"
+                            Content="添加新终端"
+                            FontSize="13"
+                            Padding="12,0"
+                            ToolTip="添加新终端" />
+                </StackPanel>
+
+                <TextBlock Grid.Column="1"
+                           x:Name="StatusText"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           VerticalAlignment="Center"
+                           Margin="24,0,0,0"
+                           TextTrimming="CharacterEllipsis" />
+
+                <StackPanel Grid.Column="2"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center">
+                    <TextBlock Text="字号"
+                               VerticalAlignment="Center"
+                               Margin="0,0,8,0" />
+                    <ComboBox x:Name="FontSizeComboBox"
+                              Width="72"
+                              Height="30"
+                              Margin="0,0,12,0" />
+                    <Button x:Name="HideToTrayButton"
+                            MinWidth="96"
+                            Height="30"
+                            Content="隐藏到托盘"
+                            ToolTip="隐藏窗口到系统托盘" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <TabControl x:Name="Tabs"
+                    Background="{StaticResource WindowBackgroundBrush}"
+                    BorderThickness="0"
+                    Padding="8" />
+    </DockPanel>
+</Window>
