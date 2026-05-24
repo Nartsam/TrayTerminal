@@ -1,5 +1,6 @@
 using System.IO;
 using System.Windows;
+using TrayTerminal.App.Dialogs;
 using TrayTerminal.Shared;
 
 namespace TrayTerminal.App;
@@ -20,7 +21,7 @@ public partial class App : System.Windows.Application
         DispatcherUnhandledException += (_, args) =>
         {
             _logger.Error(args.Exception, "Unhandled UI exception.");
-            System.Windows.MessageBox.Show(args.Exception.Message, "TrayTerminal", MessageBoxButton.OK, MessageBoxImage.Error);
+            AppMessageDialog.Info(MainWindow as Window ?? new Window(), args.Exception.Message);
             args.Handled = true;
         };
 

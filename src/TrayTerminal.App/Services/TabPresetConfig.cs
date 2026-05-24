@@ -5,6 +5,7 @@ namespace TrayTerminal.App.Services;
 public sealed record TabPreset(
     string? WorkingDirectory,
     string? RunCommand,
+    string? FillCommand,
     string? BackgroundPath);
 
 public static class TabPresetConfig
@@ -21,6 +22,7 @@ public static class TabPresetConfig
         string? currentName = null;
         string? cd = null;
         string? run = null;
+        string? fill = null;
         string? bg = null;
 
         foreach (var rawLine in lines)
@@ -31,10 +33,11 @@ public static class TabPresetConfig
             {
                 if (currentName is not null)
                 {
-                    result[currentName] = new TabPreset(cd, run, bg);
+                    result[currentName] = new TabPreset(cd, run, fill, bg);
                     currentName = null;
                     cd = null;
                     run = null;
+                    fill = null;
                     bg = null;
                 }
                 continue;
@@ -44,11 +47,12 @@ public static class TabPresetConfig
             {
                 if (currentName is not null)
                 {
-                    result[currentName] = new TabPreset(cd, run, bg);
+                    result[currentName] = new TabPreset(cd, run, fill, bg);
                 }
                 currentName = line[..^1];
                 cd = null;
                 run = null;
+                fill = null;
                 bg = null;
             }
             else if (currentName is not null)
@@ -77,6 +81,9 @@ public static class TabPresetConfig
                     case "run":
                         run = value;
                         break;
+                    case "fill":
+                        fill = value;
+                        break;
                     case "bg":
                         bg = value;
                         break;
@@ -86,7 +93,7 @@ public static class TabPresetConfig
 
         if (currentName is not null)
         {
-            result[currentName] = new TabPreset(cd, run, bg);
+            result[currentName] = new TabPreset(cd, run, fill, bg);
         }
 
         return result;

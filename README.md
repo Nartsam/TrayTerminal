@@ -4,20 +4,22 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 
 ## 软件功能
 
-- 多标签终端：启动后默认创建一个终端，也可以点击左上角“添加新终端”创建更多标签。
+- 多标签终端：启动后默认创建一个终端，也可以点击左上角”添加新终端”创建更多标签。
 - 终端类型：默认检测 CMD、Windows PowerShell；如果 `pwsh.exe` 在 `PATH` 中，会自动加入 PowerShell 7。
-- 管理员终端：新建标签时勾选“以管理员模式启动”，会通过 UAC 启动提权的 Host 进程。
+- 管理员终端：新建标签时勾选”以管理员模式启动”，会通过 UAC 启动提权的 Host 进程。
 - 标签重命名：双击标签标题可以修改名称。
 - 标签背景：在程序运行目录旁手动创建 `Backgrounds` 文件夹，放入与标签名相同的 `.png`、`.jpg`、`.jpeg` 图片，创建或重命名标签时会自动匹配为当前终端背景。匹配顺序为 `.png`、`.jpg`、`.jpeg`。
+- 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令和背景图片。
+- 启动自动建标签：通过 `Data\Config\init.txt` 指定程序启动时自动创建的标签列表。
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
-- 托盘模式：点击“隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示“显示”或“隐藏”。
-- 关闭保护：关闭仍在运行的标签或退出程序时会提示确认，确认后会强制结束该终端及子进程。
+- 托盘模式：点击”隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示”显示”或”隐藏”。
+- 关闭行为：点击窗口关闭按钮时会询问是退出程序还是隐藏到托盘；托盘右键”退出”则直接退出。关闭仍在运行的标签或退出程序时会提示确认，确认后会强制结束该终端及子进程。
 
 ## 运行时数据
 
 TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文件夹中：
 
-- `Data\Config`：预留的配置目录，当前版本尚未保存用户配置。
+- `Data\Config`：配置目录，存放 `config.txt`（标签预设配置）和 `init.txt`（启动自动建标签）。
 - `Data\Logs`：应用和 Host 日志，例如 `app-20260517.log`、`host-20260517.log`。
 - `Data\Temp`：预留的临时文件目录。
 - `Data\WebView2`：WebView2 用户数据目录，包括缓存、Local State、GPUCache 等浏览器运行数据。
@@ -25,6 +27,51 @@ TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文�
 `Backgrounds` 是用户手动创建的可选目录，程序只读取其中同名图片，不会自动创建它。
 
 便携性约定是：TrayTerminal 主动创建的配置、日志、缓存、临时文件都在程序目录内。Windows、.NET、WebView2 Runtime 自身可能存在系统级缓存或安装目录，这些不属于应用可控数据。
+
+## 配置文件
+
+### config.txt
+
+`Data\Config\config.txt` 是标签预设配置文件，YAML 格式。为特定名称的标签指定创建时的预设动作，名称区分大小写。支持的字段：
+
+- `cd`：创建标签时将终端工作目录切换到指定路径。
+- `run`：终端启动后自动执行的命令（会自动按下回车）。
+- `fill`：终端启动后预填到命令行的内容（不按回车，等待用户手动执行）。`run` 和 `fill` 同时存在时仅 `run` 生效。
+- `bg`：终端背景图片路径，支持相对路径（相对于程序运行目录）和绝对路径。优先级高于 `Backgrounds` 目录的同名图片自动匹配；如果指定的文件不存在则不显示任何背景。
+
+示例：
+
+```yaml
+MMSys:
+  cd: "D:\Program Files\MMSys"
+  run: "cmd run.bat"
+  bg: "./Backgrounds/1.png"
+
+NapCat:
+  cd: "D:\Program Files\NapCat"
+  fill: "napcat start"
+```
+
+### init.txt
+
+`Data\Config\init.txt` 是启动自动建标签配置文件。程序启动时读取此文件，按顺序自动创建标签。每个非空行表示一个标签，格式为：
+
+```
+管理员标志/终端类型/标签名称
+```
+
+- 管理员标志：`admin` 表示以管理员模式启动，其他任何内容或空串表示普通模式。
+- 终端类型：`cmd`、`powershell`（Windows PowerShell）、`pwsh`（PowerShell 7）。
+- 标签名称：创建后的标签标题，会自动应用 `config.txt` 中同名的预设配置。
+
+示例：
+
+```
+admin/pwsh/MMSys
+/powershell/Test Powershell
+```
+
+如果 `init.txt` 不存在或为空，程序启动时会按默认方式创建一个终端标签。
 
 ## 项目结构
 
@@ -70,11 +117,15 @@ src/
 - `Assets/xterm/xterm.js`：xterm.js 脚本文件。
 - `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、状态栏、TerminalSession 和 TerminalView。
 - `Controls/TerminalView.cs`：WebView2 终端控件，负责加载 `terminal.html`，把前端输入/resize 转给后端，把后端输出写回 xterm.js。
+- `Dialogs/AppMessageDialog.xaml`：自定义消息对话框界面，替代系统 MessageBox（无系统音效）。
+- `Dialogs/AppMessageDialog.xaml.cs`：自定义消息对话框逻辑，支持确认、提示和多选操作。
 - `Dialogs/NewTerminalDialog.xaml`：新建终端对话框界面。
 - `Dialogs/NewTerminalDialog.xaml.cs`：新建终端对话框逻辑，生成 `NewTerminalRequest`。
 - `Dialogs/NewTerminalRequest.cs`：创建终端所需的标题、Profile、管理员标志。
 - `Dialogs/RenameTabDialog.xaml`：重命名标签对话框界面。
 - `Dialogs/RenameTabDialog.xaml.cs`：重命名标签对话框逻辑和空名称校验。
+- `Services/InitConfig.cs`：解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
+- `Services/TabPresetConfig.cs`：解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护命名管道 IPC，发送输入/resize/kill 并接收输出/退出/错误。
 
 ### `src/TrayTerminal.Host`

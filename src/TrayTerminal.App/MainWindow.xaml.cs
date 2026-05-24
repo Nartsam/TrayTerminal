@@ -11,10 +11,8 @@ using ContextMenuStrip = System.Windows.Forms.ContextMenuStrip;
 using ControlsButton = System.Windows.Controls.Button;
 using DrawingIcon = System.Drawing.Icon;
 using MediaBrush = System.Windows.Media.Brush;
-using MessageBox = System.Windows.MessageBox;
 using NotifyIcon = System.Windows.Forms.NotifyIcon;
 using ToolStripMenuItem = System.Windows.Forms.ToolStripMenuItem;
-using ToolTipIcon = System.Windows.Forms.ToolTipIcon;
 using WpfCursors = System.Windows.Input.Cursors;
 
 namespace TrayTerminal.App;
@@ -28,6 +26,7 @@ public partial class MainWindow : Window
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
     private bool _syncingFontSize;
+    private bool _forceClose;
     private int _untitledIndex = 1;
 
     public MainWindow(PortablePaths paths, FileLogger logger)
@@ -84,7 +83,11 @@ public partial class MainWindow : Window
         menu.Items.Add(visibilityMenuItem);
         menu.Items.Add("退出", null, (_, _) =>
         {
-            Dispatcher.Invoke(Close);
+            Dispatcher.Invoke(() =>
+            {
+                _forceClose = true;
+                Close();
+            });
         });
 
         var processPath = Environment.ProcessPath;
@@ -111,7 +114,7 @@ public partial class MainWindow : Window
     {
         if (_profiles.Count == 0)
         {
-            MessageBox.Show("未找到 CMD 或 PowerShell，无法创建终端。", "TrayTerminal", MessageBoxButton.OK, MessageBoxImage.Warning);
+            AppMessageDialog.Info(this, "��找到 CMD 或 PowerShell，无法创建终端。");
             return;
         }
 
@@ -172,7 +175,11 @@ public partial class MainWindow : Window
 
         page.Exited += (_, exitCode) =>
         {
-            Dispatcher.Invoke(() => StatusText.Text = $"{request.Title} 已退出，代码 {exitCode}。");
+            Dispatcher.Invoke(() =>
+            {
+                StatusText.Text = $"{request.Title} 已退出，代码 {exitCode}。";
+                DimTabHeader(page);
+            });
         };
 
         try
@@ -182,11 +189,15 @@ public partial class MainWindow : Window
             {
                 await page.SendInputAsync(preset.RunCommand + "\r");
             }
+            else if (preset?.FillCommand is not null)
+            {
+                await page.SendInputAsync(preset.FillCommand);
+            }
         }
         catch (Exception exception)
         {
             _logger.Error(exception, "Failed to start terminal tab.");
-            MessageBox.Show(exception.Message, "启动终端失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            AppMessageDialog.Info(this, $"启动终端失败：{exception.Message}");
             await page.DisposeAsync();
             Tabs.Items.Remove(item);
         }
@@ -297,6 +308,15 @@ public partial class MainWindow : Window
         return panel;
     }
 
+    private void DimTabHeader(TerminalPage page)
+    {
+        var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
+        if (item is not null)
+        {
+            item.Background = (MediaBrush)FindResource("MutedTextBrush");
+        }
+    }
+
     private async Task RenameTabAsync(TerminalPage page)
     {
         var dialog = new RenameTabDialog(page.Title) { Owner = this };
@@ -351,13 +371,7 @@ public partial class MainWindow : Window
     {
         if (page.IsRunning)
         {
-            var result = MessageBox.Show(
-                "该标签的终端仍在运行。是否强制关闭？",
-                "关闭标签",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-
-            if (result != MessageBoxResult.Yes)
+            if (!AppMessageDialog.Confirm(this, "该标签的终端仍在运行。是否强制关闭？", "关闭", "取消"))
             {
                 return;
             }
@@ -408,6 +422,22 @@ public partial class MainWindow : Window
 
     private void OnClosing(object? sender, CancelEventArgs e)
     {
+        if (!_forceClose)
+        {
+            var choice = AppMessageDialog.ChooseInline(this, "选择操作：", "退出程序", "隐藏到托盘");
+            if (choice == 1)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+            if (choice != 0)
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+
         var runningPages = Tabs.Items
             .Cast<TabItem>()
             .Select(tab => tab.Content)
@@ -417,15 +447,10 @@ public partial class MainWindow : Window
 
         if (runningPages.Count > 0)
         {
-            var result = MessageBox.Show(
-                $"仍有 {runningPages.Count} 个终端在运行。是否强制退出 TrayTerminal？",
-                "退出 TrayTerminal",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-
-            if (result != MessageBoxResult.Yes)
+            if (!AppMessageDialog.Confirm(this, $"仍有 {runningPages.Count} 个终端在运行。是否强制退出？", "退出", "取消"))
             {
                 e.Cancel = true;
+                _forceClose = false;
                 return;
             }
         }
