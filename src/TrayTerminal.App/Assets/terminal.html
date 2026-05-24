@@ -82,10 +82,26 @@
       }
 
       function estimateSize() {
-        const width = document.body.clientWidth || 900;
-        const height = document.body.clientHeight || 500;
-        const cols = Math.max(20, Math.floor(width / Math.max(7, fontSize * 0.62)));
-        const rows = Math.max(5, Math.floor(height / Math.max(14, fontSize * 1.35)));
+        let cols, rows;
+        if (terminal && terminal._core && terminal._core._renderService) {
+          try {
+            const dims = terminal._core._renderService.dimensions;
+            if (dims && dims.css && dims.css.cell.width > 0 && dims.css.cell.height > 0) {
+              const cellWidth = dims.css.cell.width;
+              const cellHeight = dims.css.cell.height;
+              const width = terminalHost.clientWidth || document.body.clientWidth || 900;
+              const height = terminalHost.clientHeight || document.body.clientHeight || 500;
+              cols = Math.max(20, Math.floor(width / cellWidth));
+              rows = Math.max(5, Math.floor(height / cellHeight));
+            }
+          } catch (e) {}
+        }
+        if (!cols || !rows) {
+          const width = document.body.clientWidth || 900;
+          const height = document.body.clientHeight || 500;
+          cols = Math.max(20, Math.floor(width / Math.max(7, fontSize * 0.6)));
+          rows = Math.max(5, Math.floor(height / Math.max(14, fontSize * 1.2)));
+        }
         if (cols !== lastCols || rows !== lastRows) {
           lastCols = cols;
           lastRows = rows;

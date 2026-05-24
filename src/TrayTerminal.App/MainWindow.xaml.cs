@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Controls;
 using TrayTerminal.App.Controls;
 using TrayTerminal.App.Dialogs;
+using TrayTerminal.App.Services;
 using TrayTerminal.Shared;
 using TrayTerminal.Shared.Terminal;
 using ContextMenuStrip = System.Windows.Forms.ContextMenuStrip;
@@ -23,6 +24,7 @@ public partial class MainWindow : Window
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly IReadOnlyList<TerminalProfile> _profiles;
+    private readonly Dictionary<string, TabPreset> _presets;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
     private bool _syncingFontSize;
@@ -35,6 +37,7 @@ public partial class MainWindow : Window
         _paths = paths;
         _logger = logger;
         _profiles = TerminalProfileCatalog.Detect(paths);
+        _presets = TabPresetConfig.Load(Path.Combine(paths.ConfigDirectory, "config.txt"));
         (_trayIcon, _trayVisibilityMenuItem) = CreateTrayIcon();
 
         FontSizeComboBox.ItemsSource = new[] { 12, 14, 16, 18, 20, 22, 24 };
@@ -52,7 +55,15 @@ public partial class MainWindow : Window
         };
         Loaded += async (_, _) =>
         {
-            if (Tabs.Items.Count == 0)
+            var initEntries = InitConfig.Load(Path.Combine(paths.ConfigDirectory, "init.txt"));
+            if (initEntries.Count > 0)
+            {
+                foreach (var entry in initEntries)
+                {
+                    await CreateTabFromInitAsync(entry);
+                }
+            }
+            else if (Tabs.Items.Count == 0)
             {
                 await CreateTabFromDialogAsync(useDefaults: true);
             }
@@ -121,8 +132,35 @@ public partial class MainWindow : Window
             request = dialog.Request;
         }
 
+        await CreateTabCoreAsync(request);
+    }
+
+    private async Task CreateTabFromInitAsync(InitTabEntry entry)
+    {
+        var profile = FindProfileByType(entry.ProfileType);
+        if (profile is null)
+        {
+            _logger.Info($"Init: profile '{entry.ProfileType}' not found, skipping tab '{entry.Title}'.");
+            return;
+        }
+
+        var request = new NewTerminalRequest(entry.Title, profile, entry.RunAsAdministrator);
+        await CreateTabCoreAsync(request);
+    }
+
+    private async Task CreateTabCoreAsync(NewTerminalRequest request)
+    {
+        _presets.TryGetValue(request.Title, out var preset);
+
+        var profile = request.Profile;
+        if (preset?.WorkingDirectory is not null)
+        {
+            profile = profile with { WorkingDirectory = preset.WorkingDirectory };
+            request = request with { Profile = profile };
+        }
+
         var page = new TerminalPage(request, _paths, _logger, GetSelectedFontSize());
-        page.SetBackgroundImage(FindBackgroundImagePath(request.Title));
+        page.SetBackgroundImage(ResolveBackgroundImage(request.Title, preset));
         var item = new TabItem
         {
             Header = CreateTabHeader(request.Title, page),
@@ -140,6 +178,10 @@ public partial class MainWindow : Window
         try
         {
             await page.StartAsync();
+            if (preset?.RunCommand is not null)
+            {
+                await page.SendInputAsync(preset.RunCommand + "\r");
+            }
         }
         catch (Exception exception)
         {
@@ -148,6 +190,35 @@ public partial class MainWindow : Window
             await page.DisposeAsync();
             Tabs.Items.Remove(item);
         }
+    }
+
+    private TerminalProfile? FindProfileByType(string profileType)
+    {
+        var match = _profiles.FirstOrDefault(p =>
+            string.Equals(p.Id, profileType, StringComparison.OrdinalIgnoreCase));
+        if (match is not null) return match;
+
+        match = _profiles.FirstOrDefault(p =>
+            p.Id.Contains(profileType, StringComparison.OrdinalIgnoreCase));
+        if (match is not null) return match;
+
+        return _profiles.FirstOrDefault(p =>
+            p.DisplayName.Contains(profileType, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string? ResolveBackgroundImage(string title, TabPreset? preset)
+    {
+        if (preset?.BackgroundPath is not null)
+        {
+            var bgPath = preset.BackgroundPath;
+            if (!Path.IsPathRooted(bgPath))
+            {
+                bgPath = Path.GetFullPath(Path.Combine(_paths.BaseDirectory, bgPath));
+            }
+            return File.Exists(bgPath) ? bgPath : null;
+        }
+
+        return FindBackgroundImagePath(title);
     }
 
     private int GetSelectedFontSize()
@@ -236,7 +307,8 @@ public partial class MainWindow : Window
 
         var newTitle = dialog.NewTitle.Trim();
         page.SetTitle(newTitle);
-        page.SetBackgroundImage(FindBackgroundImagePath(newTitle));
+        _presets.TryGetValue(newTitle, out var preset);
+        page.SetBackgroundImage(ResolveBackgroundImage(newTitle, preset));
 
         var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
         if (item is not null)

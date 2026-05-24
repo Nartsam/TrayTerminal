@@ -90,6 +90,11 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         _terminalView.SetBackgroundImage(imagePath);
     }
 
+    public async Task SendInputAsync(string text)
+    {
+        await _session.SendInputAsync(text);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
