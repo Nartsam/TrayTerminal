@@ -2,6 +2,9 @@ using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Media3D;
 using System.Windows.Threading;
 using TrayTerminal.App.Controls;
 using TrayTerminal.App.Dialogs;
@@ -14,7 +17,12 @@ using DrawingIcon = System.Drawing.Icon;
 using MediaBrush = System.Windows.Media.Brush;
 using NotifyIcon = System.Windows.Forms.NotifyIcon;
 using ToolStripMenuItem = System.Windows.Forms.ToolStripMenuItem;
+using WpfDataObject = System.Windows.DataObject;
+using WpfDragEventArgs = System.Windows.DragEventArgs;
+using WpfDragDropEffects = System.Windows.DragDropEffects;
 using WpfCursors = System.Windows.Input.Cursors;
+using WpfMouseEventArgs = System.Windows.Input.MouseEventArgs;
+using WpfPoint = System.Windows.Point;
 
 namespace TrayTerminal.App;
 
@@ -29,6 +37,8 @@ public partial class MainWindow : Window
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
     private readonly DispatcherTimer _statusIdleTimer;
+    private WpfPoint? _tabDragStartPoint;
+    private TabItem? _draggedTab;
     private bool _syncingFontSize;
     private bool _forceClose;
     private int _untitledIndex = 1;
@@ -184,6 +194,7 @@ public partial class MainWindow : Window
             Header = CreateTabHeader(request.Title, page),
             Content = page
         };
+        ConfigureTabDragReorder(item);
 
         Tabs.Items.Add(item);
         Tabs.SelectedItem = item;
@@ -321,6 +332,102 @@ public partial class MainWindow : Window
         panel.Children.Add(text);
         panel.Children.Add(close);
         return panel;
+    }
+
+    private void ConfigureTabDragReorder(TabItem item)
+    {
+        item.AllowDrop = true;
+        item.PreviewMouseLeftButtonDown += OnTabPreviewMouseLeftButtonDown;
+        item.PreviewMouseMove += OnTabPreviewMouseMove;
+        item.DragOver += OnTabDragOver;
+        item.Drop += OnTabDrop;
+    }
+
+    private void OnTabPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs args)
+    {
+        _tabDragStartPoint = null;
+        _draggedTab = null;
+
+        if (sender is not TabItem tab || FindAncestor<ControlsButton>(args.OriginalSource as DependencyObject) is not null)
+        {
+            return;
+        }
+
+        _draggedTab = tab;
+        _tabDragStartPoint = args.GetPosition(Tabs);
+    }
+
+    private void OnTabPreviewMouseMove(object sender, WpfMouseEventArgs args)
+    {
+        if (_draggedTab is null || _tabDragStartPoint is not { } startPoint || args.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        var currentPoint = args.GetPosition(Tabs);
+        if (Math.Abs(currentPoint.X - startPoint.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(currentPoint.Y - startPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
+        {
+            return;
+        }
+
+        var data = new WpfDataObject(typeof(TabItem), _draggedTab);
+        DragDrop.DoDragDrop(_draggedTab, data, WpfDragDropEffects.Move);
+        _tabDragStartPoint = null;
+        _draggedTab = null;
+    }
+
+    private void OnTabDragOver(object sender, WpfDragEventArgs args)
+    {
+        args.Effects = sender is TabItem target
+            && args.Data.GetDataPresent(typeof(TabItem))
+            && !ReferenceEquals(args.Data.GetData(typeof(TabItem)), target)
+                ? WpfDragDropEffects.Move
+                : WpfDragDropEffects.None;
+        args.Handled = true;
+    }
+
+    private void OnTabDrop(object sender, WpfDragEventArgs args)
+    {
+        if (sender is not TabItem target || args.Data.GetData(typeof(TabItem)) is not TabItem source)
+        {
+            return;
+        }
+
+        MoveTab(source, target, args.GetPosition(target).X > target.ActualWidth / 2);
+        args.Handled = true;
+    }
+
+    private void MoveTab(TabItem source, TabItem target, bool insertAfterTarget)
+    {
+        if (ReferenceEquals(source, target) || !Tabs.Items.Contains(source) || !Tabs.Items.Contains(target))
+        {
+            return;
+        }
+
+        Tabs.Items.Remove(source);
+        var targetIndex = Tabs.Items.IndexOf(target);
+        var insertIndex = insertAfterTarget ? targetIndex + 1 : targetIndex;
+        Tabs.Items.Insert(Math.Clamp(insertIndex, 0, Tabs.Items.Count), source);
+        Tabs.SelectedItem = source;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        while (source is not null)
+        {
+            if (source is T match)
+            {
+                return match;
+            }
+
+            source = source is Visual or Visual3D
+                ? VisualTreeHelper.GetParent(source)
+                : LogicalTreeHelper.GetParent(source);
+        }
+
+        return null;
     }
 
     private void DimTabHeader(TerminalPage page)
