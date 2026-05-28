@@ -61,6 +61,8 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
 
     public string? BackgroundImagePath { get; private set; }
 
+    public int BackgroundCover { get; private set; }
+
     public bool IsRunning => _session.IsRunning;
 
     public async Task StartAsync()
@@ -84,10 +86,11 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         Title = title;
     }
 
-    public void SetBackgroundImage(string? imagePath)
+    public void SetBackgroundImage(string? imagePath, int cover = 0)
     {
         BackgroundImagePath = imagePath;
-        _terminalView.SetBackgroundImage(imagePath);
+        BackgroundCover = Math.Clamp(cover, 0, 100);
+        _terminalView.SetBackgroundImage(imagePath, BackgroundCover);
     }
 
     public async Task SendInputAsync(string text)

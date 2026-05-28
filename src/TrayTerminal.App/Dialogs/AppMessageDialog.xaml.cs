@@ -1,8 +1,10 @@
 using System.Windows;
 using System.Windows.Controls;
 using WpfButton = System.Windows.Controls.Button;
+using WpfFontFamily = System.Windows.Media.FontFamily;
 using WpfOrientation = System.Windows.Controls.Orientation;
 using WpfPanel = System.Windows.Controls.Panel;
+using WpfTextBox = System.Windows.Controls.TextBox;
 
 namespace TrayTerminal.App.Dialogs;
 
@@ -35,6 +37,17 @@ public partial class AppMessageDialog : Window
         return dialog.ShowDialog() == true && dialog.ClickedIndex == 1;
     }
 
+    public static bool ConfirmWithPreview(
+        Window owner,
+        string message,
+        string preview,
+        string yesLabel = "确定",
+        string noLabel = "取消")
+    {
+        var dialog = new AppMessageDialog(message, [noLabel, yesLabel], owner, preview);
+        return dialog.ShowDialog() == true && dialog.ClickedIndex == 1;
+    }
+
     public static void Info(Window owner, string message)
     {
         var dialog = new AppMessageDialog(message, ["确定"], owner);
@@ -51,6 +64,14 @@ public partial class AppMessageDialog : Window
     {
         var dialog = new AppMessageDialog(message, options, owner, inline: true);
         return dialog.ShowDialog() == true ? dialog.ClickedIndex : -1;
+    }
+
+    private AppMessageDialog(string message, string[] buttonLabels, Window owner, string preview)
+    {
+        InitializeComponent();
+        Owner = owner;
+        ClickedIndex = -1;
+        BuildPreviewLayout(message, preview, buttonLabels);
     }
 
     private void BuildStackedLayout(string message, string[] buttonLabels)
@@ -87,6 +108,47 @@ public partial class AppMessageDialog : Window
         panel.Children.Add(text);
         AddButtons(panel, buttonLabels);
 
+        RootGrid.Children.Add(panel);
+    }
+
+    private void BuildPreviewLayout(string message, string preview, string[] buttonLabels)
+    {
+        RootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        RootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        RootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var text = new TextBlock
+        {
+            Text = message,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 14,
+            MaxWidth = 660,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        RootGrid.Children.Add(text);
+
+        var previewBox = new WpfTextBox
+        {
+            Text = preview,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            AcceptsTab = true,
+            FontFamily = new WpfFontFamily("Consolas, Cascadia Mono, Courier New"),
+            FontSize = 12,
+            TextWrapping = TextWrapping.NoWrap,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            MaxWidth = 660,
+            MinWidth = 520,
+            MaxHeight = 240,
+            Margin = new Thickness(0, 0, 0, 18)
+        };
+        Grid.SetRow(previewBox, 1);
+        RootGrid.Children.Add(previewBox);
+
+        var panel = new StackPanel { Orientation = WpfOrientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
+        Grid.SetRow(panel, 2);
+        AddButtons(panel, buttonLabels);
         RootGrid.Children.Add(panel);
     }
 

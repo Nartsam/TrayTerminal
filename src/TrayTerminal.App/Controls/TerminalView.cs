@@ -1,6 +1,8 @@
 using System.IO;
+using System.Windows;
 using System.Text.Json;
 using System.Windows.Controls;
+using TrayTerminal.App.Dialogs;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.Wpf;
 using TrayTerminal.App.Services;
@@ -10,11 +12,14 @@ namespace TrayTerminal.App.Controls;
 
 public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposable
 {
+    private const int MaxPastePreviewCharacters = 1600;
+    private const int MaxPastePreviewLines = 20;
     private readonly PortablePaths _paths;
     private readonly TerminalSession _session;
     private readonly WebView2 _webView = new();
     private int _fontSize;
     private string? _backgroundImagePath;
+    private int _backgroundCover;
     private bool _ready;
     private bool _disposed;
 
@@ -70,7 +75,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         await readyTcs.Task;
         _ready = true;
         await SetFontSizeAsync(_fontSize);
-        await SetBackgroundImageAsync(_backgroundImagePath);
+        await SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
     }
 
     public async Task WriteAsync(byte[] bytes)
@@ -93,12 +98,13 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
-    public void SetBackgroundImage(string? imagePath)
+    public void SetBackgroundImage(string? imagePath, int cover = 0)
     {
         _backgroundImagePath = imagePath;
+        _backgroundCover = Math.Clamp(cover, 0, 100);
         if (_ready && !_disposed)
         {
-            _ = SetBackgroundImageAsync(_backgroundImagePath);
+            _ = SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
         }
     }
 
@@ -136,6 +142,26 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                 }
                 break;
 
+            case "copy":
+                if (root.TryGetProperty("data", out var copyData))
+                {
+                    SetClipboardText(copyData.GetString() ?? string.Empty);
+                }
+                break;
+
+            case "paste":
+                var clipboardText = GetClipboardText();
+                if (!string.IsNullOrEmpty(clipboardText))
+                {
+                    if (IsMultilineText(clipboardText) && !ConfirmMultilinePaste(clipboardText))
+                    {
+                        break;
+                    }
+
+                    await PasteTextAsync(clipboardText);
+                }
+                break;
+
             case "resize":
                 if (root.TryGetProperty("cols", out var cols) && root.TryGetProperty("rows", out var rows))
                 {
@@ -152,10 +178,96 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         await _webView.ExecuteScriptAsync($"window.trayTerminal.setFontSize({fontSize});");
     }
 
-    private async Task SetBackgroundImageAsync(string? imagePath)
+    private async Task SetBackgroundImageAsync(string? imagePath, int cover)
     {
         var uri = string.IsNullOrWhiteSpace(imagePath) ? null : new Uri(imagePath).AbsoluteUri;
         var payload = JsonSerializer.Serialize(uri);
-        await _webView.ExecuteScriptAsync($"window.trayTerminal.setBackground({payload});");
+        await _webView.ExecuteScriptAsync($"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});");
+    }
+
+    private async Task PasteTextAsync(string text)
+    {
+        if (!_ready || _disposed)
+        {
+            return;
+        }
+
+        var payload = JsonSerializer.Serialize(text);
+        await _webView.ExecuteScriptAsync($"window.trayTerminal.pasteText({payload});");
+    }
+
+    private bool ConfirmMultilinePaste(string text)
+    {
+        var owner = Window.GetWindow(this) ?? System.Windows.Application.Current.MainWindow;
+        if (owner is null)
+        {
+            return false;
+        }
+
+        var preview = BuildPastePreview(text, out var truncated);
+        var lineCount = CountLines(text);
+        var message = $"剪贴板内容包含 {lineCount} 行、{text.Length} 个字符，确定要粘贴到当前终端吗？\n预览如下{(truncated ? "（已截断）" : string.Empty)}：";
+        return AppMessageDialog.ConfirmWithPreview(owner, message, preview, "粘贴", "取消");
+    }
+
+    private static bool IsMultilineText(string text)
+    {
+        return text.Contains('\n') || text.Contains('\r');
+    }
+
+    private static string BuildPastePreview(string text, out bool truncated)
+    {
+        var normalized = NormalizeNewlines(text);
+        var lines = normalized.Split('\n');
+        var preview = string.Join(Environment.NewLine, lines.Take(MaxPastePreviewLines));
+        truncated = lines.Length > MaxPastePreviewLines;
+
+        if (preview.Length > MaxPastePreviewCharacters)
+        {
+            preview = preview[..MaxPastePreviewCharacters];
+            truncated = true;
+        }
+
+        return truncated ? preview + Environment.NewLine + "..." : preview;
+    }
+
+    private static int CountLines(string text)
+    {
+        return NormalizeNewlines(text).Split('\n').Length;
+    }
+
+    private static string NormalizeNewlines(string text)
+    {
+        return text.Replace("\r\n", "\n").Replace('\r', '\n');
+    }
+
+    private static string GetClipboardText()
+    {
+        try
+        {
+            return System.Windows.Clipboard.ContainsText(System.Windows.TextDataFormat.UnicodeText)
+                ? System.Windows.Clipboard.GetText(System.Windows.TextDataFormat.UnicodeText)
+                : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static void SetClipboardText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        try
+        {
+            System.Windows.Clipboard.SetText(text, System.Windows.TextDataFormat.UnicodeText);
+        }
+        catch
+        {
+        }
     }
 }

@@ -29,6 +29,10 @@
       margin: 0;
       overflow: hidden;
       background-color: transparent;
+    }
+
+    #terminal,
+    #fallback {
       background-position: left top;
       background-repeat: no-repeat;
       background-size: cover;
@@ -52,7 +56,7 @@
       outline: none;
       caret-color: #20b486;
       line-height: 18px;
-      background: transparent;
+      background-color: transparent;
       color: #d7dde2;
     }
   </style>
@@ -79,6 +83,69 @@
 
       function sendInput(text) {
         post({ type: 'input', data: text });
+      }
+
+      function requestPaste() {
+        post({ type: 'paste' });
+      }
+
+      function requestCopy(text) {
+        if (text) {
+          post({ type: 'copy', data: text });
+        }
+      }
+
+      function isClipboardShortcut(event, key) {
+        return event.ctrlKey &&
+          !event.altKey &&
+          !event.metaKey &&
+          typeof event.key === 'string' &&
+          event.key.toLowerCase() === key;
+      }
+
+      function selectedTextFor(target) {
+        if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
+          return typeof terminal.getSelection === 'function' ? terminal.getSelection() : '';
+        }
+
+        if (target && typeof target.selectionStart === 'number' && typeof target.selectionEnd === 'number') {
+          return target.value.substring(target.selectionStart, target.selectionEnd);
+        }
+
+        const selection = window.getSelection();
+        return selection && !selection.isCollapsed ? selection.toString() : '';
+      }
+
+      function stopShortcut(event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      function handleClipboardShortcut(event, target) {
+        if (isClipboardShortcut(event, 'v')) {
+          stopShortcut(event);
+          requestPaste();
+          return true;
+        }
+
+        if (isClipboardShortcut(event, 'c')) {
+          const selectedText = selectedTextFor(target);
+          if (selectedText) {
+            stopShortcut(event);
+            requestCopy(selectedText);
+            return true;
+          }
+        }
+
+        return false;
+      }
+
+      function handleTerminalKeyEvent(event) {
+        if (event.type !== 'keydown') {
+          return true;
+        }
+
+        return !handleClipboardShortcut(event, terminal);
       }
 
       function estimateSize() {
@@ -158,6 +225,10 @@
 
       function attachInput(target) {
         target.addEventListener('keydown', event => {
+          if (handleClipboardShortcut(event, target)) {
+            return;
+          }
+
           const input = mapKey(event);
           if (input !== null) {
             event.preventDefault();
@@ -194,13 +265,14 @@
           });
           terminal.open(terminalHost);
           terminal.focus();
+          terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
           terminal.onData(sendInput);
         } else {
           terminalHost.hidden = true;
           fallback.hidden = false;
           fallback.focus();
           attachInput(fallback);
-          writeFallback('xterm.js 静态文件未找到，已启用轻量渲染模式。\n');
+          writeFallback('xterm.js 静态文件未找到，已启用轻量渲染模式\n');
         }
 
         estimateSize();
@@ -222,6 +294,17 @@
             writeFallback(text);
           }
         },
+        pasteText(text) {
+          if (!text) {
+            return;
+          }
+
+          if (terminal && typeof terminal.paste === 'function') {
+            terminal.paste(text);
+          } else {
+            sendInput(text);
+          }
+        },
         setFontSize(value) {
           fontSize = Math.max(10, Math.min(32, Number(value) || 16));
           document.body.style.fontSize = `${fontSize}px`;
@@ -233,12 +316,15 @@
           }
           window.requestAnimationFrame(estimateSize);
         },
-        setBackground(uri) {
-          if (uri) {
-            terminalHost.style.backgroundImage = `url("${uri}")`;
-          } else {
-            terminalHost.style.backgroundImage = 'none';
-          }
+        setBackground(uri, cover) {
+          const normalizedCover = Math.max(0, Math.min(100, Number(cover) || 0));
+          const opacity = normalizedCover * 0.0096;
+          const backgroundImage = uri
+            ? `linear-gradient(rgba(0, 0, 0, ${opacity}), rgba(0, 0, 0, ${opacity})), url("${uri}")`
+            : 'none';
+
+          terminalHost.style.backgroundImage = backgroundImage;
+          fallback.style.backgroundImage = backgroundImage;
         }
       };
 

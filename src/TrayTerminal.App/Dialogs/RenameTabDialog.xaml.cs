@@ -20,7 +20,7 @@ public partial class RenameTabDialog : Window
         var title = TitleTextBox.Text.Trim();
         if (string.IsNullOrWhiteSpace(title))
         {
-            ValidationText.Text = "标签名称不能为空。";
+            ValidationText.Text = "标签名称不能为空";
             return;
         }
 

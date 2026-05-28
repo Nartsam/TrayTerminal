@@ -6,7 +6,8 @@ public sealed record TabPreset(
     string? WorkingDirectory,
     string? RunCommand,
     string? FillCommand,
-    string? BackgroundPath);
+    string? BackgroundPath,
+    int Cover);
 
 public static class TabPresetConfig
 {
@@ -24,6 +25,7 @@ public static class TabPresetConfig
         string? run = null;
         string? fill = null;
         string? bg = null;
+        var cover = 0;
 
         foreach (var rawLine in lines)
         {
@@ -33,12 +35,13 @@ public static class TabPresetConfig
             {
                 if (currentName is not null)
                 {
-                    result[currentName] = new TabPreset(cd, run, fill, bg);
+                    result[currentName] = new TabPreset(cd, run, fill, bg, cover);
                     currentName = null;
                     cd = null;
                     run = null;
                     fill = null;
                     bg = null;
+                    cover = 0;
                 }
                 continue;
             }
@@ -47,13 +50,14 @@ public static class TabPresetConfig
             {
                 if (currentName is not null)
                 {
-                    result[currentName] = new TabPreset(cd, run, fill, bg);
+                    result[currentName] = new TabPreset(cd, run, fill, bg, cover);
                 }
                 currentName = line[..^1];
                 cd = null;
                 run = null;
                 fill = null;
                 bg = null;
+                cover = 0;
             }
             else if (currentName is not null)
             {
@@ -87,16 +91,24 @@ public static class TabPresetConfig
                     case "bg":
                         bg = value;
                         break;
+                    case "cover":
+                        cover = ParseCover(value);
+                        break;
                 }
             }
         }
 
         if (currentName is not null)
         {
-            result[currentName] = new TabPreset(cd, run, fill, bg);
+            result[currentName] = new TabPreset(cd, run, fill, bg, cover);
         }
 
         return result;
+    }
+
+    private static int ParseCover(string? value)
+    {
+        return int.TryParse(value, out var cover) && cover is >= 0 and <= 100 ? cover : 0;
     }
 
     private static string Unquote(string value)

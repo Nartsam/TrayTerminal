@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using TrayTerminal.App.Controls;
 using TrayTerminal.App.Dialogs;
 using TrayTerminal.App.Services;
@@ -19,12 +20,15 @@ namespace TrayTerminal.App;
 
 public partial class MainWindow : Window
 {
+    private const string IdleStatusText = "当前暂无新状态";
+    private static readonly TimeSpan StatusIdleDelay = TimeSpan.FromSeconds(60);
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly IReadOnlyList<TerminalProfile> _profiles;
     private readonly Dictionary<string, TabPreset> _presets;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
+    private readonly DispatcherTimer _statusIdleTimer;
     private bool _syncingFontSize;
     private bool _forceClose;
     private int _untitledIndex = 1;
@@ -32,6 +36,13 @@ public partial class MainWindow : Window
     public MainWindow(PortablePaths paths, FileLogger logger)
     {
         InitializeComponent();
+
+        _statusIdleTimer = new DispatcherTimer { Interval = StatusIdleDelay };
+        _statusIdleTimer.Tick += (_, _) =>
+        {
+            _statusIdleTimer.Stop();
+            StatusText.Text = IdleStatusText;
+        };
 
         _paths = paths;
         _logger = logger;
@@ -68,11 +79,15 @@ public partial class MainWindow : Window
             }
         };
         Closing += OnClosing;
-        Closed += (_, _) => _trayIcon.Dispose();
+        Closed += (_, _) =>
+        {
+            _statusIdleTimer.Stop();
+            _trayIcon.Dispose();
+        };
 
-        StatusText.Text = _profiles.Count == 0
-            ? "没有检测到可用终端。"
-            : $"已检测到 {_profiles.Count} 个终端类型。";
+        SetStatusText(_profiles.Count == 0
+            ? "没有检测到可用终端"
+            : $"已检测到 {_profiles.Count} 个终端类型");
     }
 
     private (NotifyIcon Icon, ToolStripMenuItem VisibilityMenuItem) CreateTrayIcon()
@@ -114,7 +129,7 @@ public partial class MainWindow : Window
     {
         if (_profiles.Count == 0)
         {
-            AppMessageDialog.Info(this, "��找到 CMD 或 PowerShell，无法创建终端。");
+            AppMessageDialog.Info(this, "未找到 CMD 或 PowerShell，无法创建终端");
             return;
         }
 
@@ -163,7 +178,7 @@ public partial class MainWindow : Window
         }
 
         var page = new TerminalPage(request, _paths, _logger, GetSelectedFontSize());
-        page.SetBackgroundImage(ResolveBackgroundImage(request.Title, preset));
+        page.SetBackgroundImage(ResolveBackgroundImage(request.Title, preset), preset?.Cover ?? 0);
         var item = new TabItem
         {
             Header = CreateTabHeader(request.Title, page),
@@ -177,7 +192,7 @@ public partial class MainWindow : Window
         {
             Dispatcher.Invoke(() =>
             {
-                StatusText.Text = $"{request.Title} 已退出，代码 {exitCode}。";
+                SetStatusText($"{request.Title} 已退出，代码 {exitCode}");
                 DimTabHeader(page);
             });
         };
@@ -328,7 +343,7 @@ public partial class MainWindow : Window
         var newTitle = dialog.NewTitle.Trim();
         page.SetTitle(newTitle);
         _presets.TryGetValue(newTitle, out var preset);
-        page.SetBackgroundImage(ResolveBackgroundImage(newTitle, preset));
+        page.SetBackgroundImage(ResolveBackgroundImage(newTitle, preset), preset?.Cover ?? 0);
 
         var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
         if (item is not null)
@@ -371,7 +386,7 @@ public partial class MainWindow : Window
     {
         if (page.IsRunning)
         {
-            if (!AppMessageDialog.Confirm(this, "该标签的终端仍在运行。是否强制关闭？", "关闭", "取消"))
+            if (!AppMessageDialog.Confirm(this, "该标签的终端仍在运行，是否强制关闭？", "关闭", "取消"))
             {
                 return;
             }
@@ -420,6 +435,13 @@ public partial class MainWindow : Window
         _trayVisibilityMenuItem.Text = IsVisible && WindowState != WindowState.Minimized ? "隐藏" : "显示";
     }
 
+    private void SetStatusText(string text)
+    {
+        StatusText.Text = text;
+        _statusIdleTimer.Stop();
+        _statusIdleTimer.Start();
+    }
+
     private void OnClosing(object? sender, CancelEventArgs e)
     {
         if (!_forceClose)
@@ -447,7 +469,7 @@ public partial class MainWindow : Window
 
         if (runningPages.Count > 0)
         {
-            if (!AppMessageDialog.Confirm(this, $"仍有 {runningPages.Count} 个终端在运行。是否强制退出？", "退出", "取消"))
+            if (!AppMessageDialog.Confirm(this, $"仍有 {runningPages.Count} 个终端在运行，是否强制退出？", "退出", "取消"))
             {
                 e.Cancel = true;
                 _forceClose = false;

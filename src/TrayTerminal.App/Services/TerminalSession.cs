@@ -79,7 +79,7 @@ public sealed class TerminalSession : IAsyncDisposable
         }
         catch (Win32Exception exception) when (exception.NativeErrorCode == 1223)
         {
-            Failed?.Invoke(this, "已取消管理员授权。");
+            Failed?.Invoke(this, "已取消管理员授权");
             _pipe.Dispose();
             _pipe = null;
         }
