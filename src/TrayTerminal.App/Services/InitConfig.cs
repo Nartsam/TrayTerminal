@@ -12,12 +12,22 @@ public static class InitConfig
     public static List<InitTabEntry> Load(string initPath)
     {
         var entries = new List<InitTabEntry>();
-        if (!File.Exists(initPath))
+        string[] lines;
+        try
+        {
+            if (!File.Exists(initPath))
+            {
+                return entries;
+            }
+
+            lines = File.ReadAllLines(initPath);
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
         {
             return entries;
         }
 
-        foreach (var line in File.ReadAllLines(initPath))
+        foreach (var line in lines)
         {
             if (string.IsNullOrWhiteSpace(line))
             {
@@ -43,5 +53,14 @@ public static class InitConfig
         }
 
         return entries;
+    }
+
+    private static bool IsConfigurationException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PathTooLongException;
     }
 }

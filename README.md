@@ -10,7 +10,7 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 标签排序：拖动顶部标签可以调整终端在界面中的显示顺序。
 - 标签重命名：双击标签标题可以修改名称。
 - 标签背景：在程序运行目录旁手动创建 `Backgrounds` 文件夹，放入与标签名相同的 `.png`、`.jpg`、`.jpeg` 图片，创建或重命名标签时会自动匹配为当前终端背景。匹配顺序为 `.png`、`.jpg`、`.jpeg`。
-- 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令、背景图片和背景遮罩。
+- 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令、背景图片和背景遮罩；创建、关闭、重命名标签等相关操作前会重新加载配置。
 - 启动自动建标签：通过 `Data\Config\init.txt` 指定程序启动时自动创建的标签列表。
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
 - 托盘模式：点击”隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示”显示”或”隐藏”。
@@ -33,13 +33,15 @@ TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文�
 
 ### config.txt
 
-`Data\Config\config.txt` 是标签预设配置文件，YAML 格式。为特定名称的标签指定创建时的预设动作，名称区分大小写。支持的字段：
+`Data\Config\config.txt` 是标签预设配置文件，YAML 格式。为特定名称的标签指定创建时的预设动作，名称区分大小写。程序会在创建、关闭、重命名标签等可能用到预设配置的操作前重新读取此文件，因此保存后不需要重启应用。支持的字段：
 
 - `cd`：创建标签时将终端工作目录切换到指定路径。
 - `run`：终端启动后自动执行的命令（会自动按下回车）。
 - `fill`：终端启动后预填到命令行的内容（不按回车，等待用户手动执行）。`run` 和 `fill` 同时存在时仅 `run` 生效。
 - `bg`：终端背景图片路径，支持相对路径（相对于程序运行目录）和绝对路径。优先级高于 `Backgrounds` 目录的同名图片自动匹配；如果指定的文件不存在则不显示任何背景。
 - `cover`：背景图遮罩强度，合法值是 `0` 到 `100` 的整数。`0` 表示原图，`100` 表示几乎全黑但仍能隐约看到原图。未设置或非法值按 `0` 处理。
+
+配置文件读取会尽量容错：文件不存在、暂时不可读、正在保存导致读取失败时，本次按空配置处理并继续运行；空标签名会被跳过；非法或不存在的 `cd` 会被剔除并使用终端 Profile 的默认工作目录；非法 `bg` 会被忽略；格式不符合字段要求的行会被跳过。
 
 示例：
 
@@ -57,7 +59,7 @@ NapCat:
 
 ### init.txt
 
-`Data\Config\init.txt` 是启动自动建标签配置文件。程序启动时读取此文件，按顺序自动创建标签。每个非空行表示一个标签，格式为：
+`Data\Config\init.txt` 是启动自动建标签配置文件。程序启动时读取此文件，按顺序自动创建标签。它只影响启动时自动创建的标签；应用运行期间修改后，需要下次启动才会改变启动标签列表。每个非空行表示一个标签，格式为：
 
 ```
 管理员标志/终端类型/标签名称
@@ -75,6 +77,8 @@ admin/pwsh/MMSys
 ```
 
 如果 `init.txt` 不存在或为空，程序启动时会按默认方式创建一个终端标签。
+
+`init.txt` 读取同样会容错：文件不存在、暂时不可读或包含非法行时不会导致启动失败；非法行会被跳过。
 
 ## 项目结构
 
@@ -113,7 +117,7 @@ src/
 - `App.xaml`：全局 WPF 资源和暗色控件样式。
 - `App.xaml.cs`：应用启动入口，初始化便携目录、日志、当前工作目录和主窗口。
 - `MainWindow.xaml`：主窗口布局，包含顶部工具栏、字号选择、隐藏按钮和标签容器。
-- `MainWindow.xaml.cs`：标签创建、重命名、背景匹配、托盘行为、关闭确认等主界面逻辑。
+- `MainWindow.xaml.cs`：标签创建、重命名、配置重载、背景匹配、托盘行为、关闭确认等主界面逻辑。
 - `Assets/app.ico`：应用窗口、任务栏和托盘图标。
 - `Assets/terminal.html`：WebView2 加载的终端页面，承载 xterm.js、键盘输入、resize、背景图和轻量 fallback 渲染。
 - `Assets/xterm/xterm.css`：xterm.js 样式文件。
@@ -127,8 +131,8 @@ src/
 - `Dialogs/NewTerminalRequest.cs`：创建终端所需的标题、Profile、管理员标志。
 - `Dialogs/RenameTabDialog.xaml`：重命名标签对话框界面。
 - `Dialogs/RenameTabDialog.xaml.cs`：重命名标签对话框逻辑和空名称校验。
-- `Services/InitConfig.cs`：解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
-- `Services/TabPresetConfig.cs`：解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
+- `Services/InitConfig.cs`：容错解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
+- `Services/TabPresetConfig.cs`：容错解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护命名管道 IPC，发送输入/resize/kill 并接收输出/退出/错误。
 
 ### `src/TrayTerminal.Host`
@@ -241,6 +245,7 @@ publish\TrayTerminal\TrayTerminal.exe
 ## 维护提示
 
 - App 与 Host 必须在同一目录下运行，主程序通过 `PortablePaths.HostExecutablePath` 查找 `TrayTerminal.Host.exe`。
+- `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。
 - App 与 Host 的 IPC 协议在 `TrayTerminal.Shared.Ipc`，改协议时要同时检查 `TerminalSession` 和 `TerminalHostSession`。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。

@@ -33,10 +33,12 @@ public partial class MainWindow : Window
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly IReadOnlyList<TerminalProfile> _profiles;
-    private readonly Dictionary<string, TabPreset> _presets;
+    private readonly string _tabPresetConfigPath;
+    private readonly string _initConfigPath;
     private readonly NotifyIcon _trayIcon;
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
     private readonly DispatcherTimer _statusIdleTimer;
+    private Dictionary<string, TabPreset> _presets = new(StringComparer.Ordinal);
     private WpfPoint? _tabDragStartPoint;
     private TabItem? _draggedTab;
     private bool _syncingFontSize;
@@ -57,7 +59,9 @@ public partial class MainWindow : Window
         _paths = paths;
         _logger = logger;
         _profiles = TerminalProfileCatalog.Detect(paths);
-        _presets = TabPresetConfig.Load(Path.Combine(paths.ConfigDirectory, "config.txt"));
+        _tabPresetConfigPath = Path.Combine(paths.ConfigDirectory, "config.txt");
+        _initConfigPath = Path.Combine(paths.ConfigDirectory, "init.txt");
+        ReloadTabPresets();
         (_trayIcon, _trayVisibilityMenuItem) = CreateTrayIcon();
 
         FontSizeComboBox.ItemsSource = new[] { 12, 14, 16, 18, 20, 22, 24 };
@@ -75,7 +79,7 @@ public partial class MainWindow : Window
         };
         Loaded += async (_, _) =>
         {
-            var initEntries = InitConfig.Load(Path.Combine(paths.ConfigDirectory, "init.txt"));
+            var initEntries = LoadInitEntries();
             if (initEntries.Count > 0)
             {
                 foreach (var entry in initEntries)
@@ -178,6 +182,7 @@ public partial class MainWindow : Window
 
     private async Task CreateTabCoreAsync(NewTerminalRequest request)
     {
+        ReloadTabPresets();
         _presets.TryGetValue(request.Title, out var preset);
 
         var profile = request.Profile;
@@ -247,12 +252,20 @@ public partial class MainWindow : Window
     {
         if (preset?.BackgroundPath is not null)
         {
-            var bgPath = preset.BackgroundPath;
-            if (!Path.IsPathRooted(bgPath))
+            try
             {
-                bgPath = Path.GetFullPath(Path.Combine(_paths.BaseDirectory, bgPath));
+                var bgPath = preset.BackgroundPath;
+                if (!Path.IsPathRooted(bgPath))
+                {
+                    bgPath = Path.GetFullPath(Path.Combine(_paths.BaseDirectory, bgPath));
+                }
+                return File.Exists(bgPath) ? bgPath : null;
             }
-            return File.Exists(bgPath) ? bgPath : null;
+            catch (Exception exception) when (IsConfigurationException(exception))
+            {
+                _logger.Warn($"Ignored invalid background path for tab '{title}': {preset.BackgroundPath}");
+                return null;
+            }
         }
 
         return FindBackgroundImagePath(title);
@@ -441,6 +454,7 @@ public partial class MainWindow : Window
 
     private async Task RenameTabAsync(TerminalPage page)
     {
+        ReloadTabPresets();
         var dialog = new RenameTabDialog(page.Title) { Owner = this };
         if (dialog.ShowDialog() != true || string.IsNullOrWhiteSpace(dialog.NewTitle))
         {
@@ -491,6 +505,7 @@ public partial class MainWindow : Window
 
     private async Task CloseTabAsync(TerminalPage page)
     {
+        ReloadTabPresets();
         if (page.IsRunning)
         {
             if (!AppMessageDialog.Confirm(this, "该标签的终端仍在运行，是否强制关闭？", "关闭", "取消"))
@@ -505,6 +520,114 @@ public partial class MainWindow : Window
         {
             Tabs.Items.Remove(item);
         }
+    }
+
+    private List<InitTabEntry> LoadInitEntries()
+    {
+        try
+        {
+            return InitConfig.Load(_initConfigPath);
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
+            _logger.Warn($"Ignored invalid init config '{_initConfigPath}': {exception.Message}");
+            return [];
+        }
+    }
+
+    private void ReloadTabPresets()
+    {
+        try
+        {
+            _presets = SanitizePresets(TabPresetConfig.Load(_tabPresetConfigPath));
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
+            _logger.Warn($"Ignored invalid tab preset config '{_tabPresetConfigPath}': {exception.Message}");
+            _presets = new Dictionary<string, TabPreset>(StringComparer.Ordinal);
+        }
+    }
+
+    private Dictionary<string, TabPreset> SanitizePresets(Dictionary<string, TabPreset> loadedPresets)
+    {
+        var sanitized = new Dictionary<string, TabPreset>(StringComparer.Ordinal);
+        foreach (var (name, preset) in loadedPresets)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                _logger.Warn("Ignored a tab preset with an empty name.");
+                continue;
+            }
+
+            var workingDirectory = ResolveConfiguredWorkingDirectory(name, preset.WorkingDirectory);
+            var backgroundPath = IsPathSyntaxValid(preset.BackgroundPath)
+                ? preset.BackgroundPath
+                : null;
+            if (preset.BackgroundPath is not null && backgroundPath is null)
+            {
+                _logger.Warn($"Ignored invalid background path for tab '{name}': {preset.BackgroundPath}");
+            }
+
+            sanitized[name] = preset with
+            {
+                WorkingDirectory = workingDirectory,
+                BackgroundPath = backgroundPath
+            };
+        }
+
+        return sanitized;
+    }
+
+    private string? ResolveConfiguredWorkingDirectory(string presetName, string? configuredPath)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var fullPath = Path.IsPathRooted(configuredPath)
+                ? Path.GetFullPath(configuredPath)
+                : Path.GetFullPath(Path.Combine(_paths.BaseDirectory, configuredPath));
+            if (Directory.Exists(fullPath))
+            {
+                return fullPath;
+            }
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
+        }
+
+        _logger.Warn($"Ignored invalid working directory for tab '{presetName}': {configuredPath}");
+        return null;
+    }
+
+    private static bool IsPathSyntaxValid(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            _ = Path.GetFullPath(path);
+            return true;
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
+            return false;
+        }
+    }
+
+    private static bool IsConfigurationException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PathTooLongException;
     }
 
     private void HideToTray()

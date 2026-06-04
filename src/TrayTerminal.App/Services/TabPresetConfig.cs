@@ -14,12 +14,21 @@ public static class TabPresetConfig
     public static Dictionary<string, TabPreset> Load(string configPath)
     {
         var result = new Dictionary<string, TabPreset>(StringComparer.Ordinal);
-        if (!File.Exists(configPath))
+        string[] lines;
+        try
+        {
+            if (!File.Exists(configPath))
+            {
+                return result;
+            }
+
+            lines = File.ReadAllLines(configPath);
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
         {
             return result;
         }
 
-        var lines = File.ReadAllLines(configPath);
         string? currentName = null;
         string? cd = null;
         string? run = null;
@@ -52,7 +61,13 @@ public static class TabPresetConfig
                 {
                     result[currentName] = new TabPreset(cd, run, fill, bg, cover);
                 }
-                currentName = line[..^1];
+                currentName = line[..^1].Trim();
+                if (string.IsNullOrWhiteSpace(currentName))
+                {
+                    currentName = null;
+                    continue;
+                }
+
                 cd = null;
                 run = null;
                 fill = null;
@@ -104,6 +119,15 @@ public static class TabPresetConfig
         }
 
         return result;
+    }
+
+    private static bool IsConfigurationException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException
+            or PathTooLongException;
     }
 
     private static int ParseCover(string? value)
