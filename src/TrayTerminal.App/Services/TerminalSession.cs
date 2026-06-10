@@ -12,16 +12,22 @@ namespace TrayTerminal.App.Services;
 
 public sealed class TerminalSession : IAsyncDisposable
 {
+    private const int InputChunkSize = 64 * 1024;
+    private static readonly TimeSpan KillSendTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ReaderStopTimeout = TimeSpan.FromSeconds(3);
+
     private readonly NewTerminalRequest _request;
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly object _subscribeLock = new();
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private NamedPipeServerStream? _pipe;
     private Process? _hostProcess;
     private CancellationTokenSource? _cts;
     private Task? _readerTask;
     private bool _disposed;
+    private int _terminated;
 
     public TerminalSession(NewTerminalRequest request, PortablePaths paths, FileLogger logger)
     {
@@ -36,9 +42,13 @@ public sealed class TerminalSession : IAsyncDisposable
 
     public event EventHandler<string>? Failed;
 
+    public event EventHandler? Terminated;
+
     public bool IsRunning { get; private set; }
 
     public bool IsAdministrator => _request.RunAsAdministrator;
+
+    public Task Completion => _completion.Task;
 
     /// <summary>
     /// Thread-safe subscribe to output events. The returned token must be disposed
@@ -120,19 +130,39 @@ public sealed class TerminalSession : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            CleanupAfterFailedStart(killHost: true);
+            CompleteTermination();
             throw new TimeoutException("Timed out waiting for terminal host to connect.");
         }
         catch (Win32Exception exception) when (exception.NativeErrorCode == 1223)
         {
             Failed?.Invoke(this, "已取消管理员授权");
-            _pipe.Dispose();
-            _pipe = null;
+            CleanupAfterFailedStart(killHost: false);
+            CompleteTermination();
+        }
+        catch
+        {
+            CleanupAfterFailedStart(killHost: true);
+            CompleteTermination();
+            throw;
         }
     }
 
-    public Task SendInputAsync(string text)
+    public async Task SendInputAsync(string text)
     {
-        return SendAsync(new IpcMessage(IpcMessageType.Input, Encoding.UTF8.GetBytes(text)));
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        var bytes = Encoding.UTF8.GetBytes(text);
+        for (var offset = 0; offset < bytes.Length; offset += InputChunkSize)
+        {
+            var length = Math.Min(InputChunkSize, bytes.Length - offset);
+            var chunk = new byte[length];
+            Buffer.BlockCopy(bytes, offset, chunk, 0, length);
+            await SendAsync(new IpcMessage(IpcMessageType.Input, chunk));
+        }
     }
 
     public Task ResizeAsync(int columns, int rows)
@@ -156,7 +186,8 @@ public sealed class TerminalSession : IAsyncDisposable
 
         try
         {
-            await SendAsync(IpcMessage.Empty(IpcMessageType.Kill));
+            using var killCts = new CancellationTokenSource(KillSendTimeout);
+            await SendAsync(IpcMessage.Empty(IpcMessageType.Kill), killCts.Token);
         }
         catch
         {
@@ -164,16 +195,6 @@ public sealed class TerminalSession : IAsyncDisposable
 
         _disposed = true;
         _cts?.Cancel();
-        if (_readerTask is not null)
-        {
-            try
-            {
-                await _readerTask;
-            }
-            catch
-            {
-            }
-        }
 
         try
         {
@@ -186,10 +207,29 @@ public sealed class TerminalSession : IAsyncDisposable
         {
         }
 
+        try
+        {
+            _pipe?.Dispose();
+        }
+        catch
+        {
+        }
+
+        if (_readerTask is not null)
+        {
+            try
+            {
+                await _readerTask.WaitAsync(ReaderStopTimeout);
+            }
+            catch
+            {
+            }
+        }
+
         _hostProcess?.Dispose();
-        _pipe?.Dispose();
         _cts?.Dispose();
         _sendGate.Dispose();
+        CompleteTermination();
     }
 
     public void KillForShutdown()
@@ -202,10 +242,43 @@ public sealed class TerminalSession : IAsyncDisposable
             {
                 _hostProcess.Kill(entireProcessTree: true);
             }
+
+            _pipe?.Dispose();
         }
         catch
         {
         }
+
+        CompleteTermination();
+    }
+
+    private void CleanupAfterFailedStart(bool killHost)
+    {
+        try
+        {
+            _cts?.Cancel();
+            if (killHost && _hostProcess is not null && !_hostProcess.HasExited)
+            {
+                _hostProcess.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _pipe?.Dispose();
+        }
+        catch
+        {
+        }
+
+        _hostProcess?.Dispose();
+        _hostProcess = null;
+        _pipe = null;
+        _cts?.Dispose();
+        _cts = null;
     }
 
     private void StartHostProcess(string pipeName, string nonce, int columns, int rows)
@@ -297,25 +370,40 @@ public sealed class TerminalSession : IAsyncDisposable
         }
         catch (Exception exception)
         {
-            _logger.Error(exception, "Terminal session read loop failed.");
-            Failed?.Invoke(this, exception.Message);
+            if (!_disposed)
+            {
+                _logger.Error(exception, "Terminal session read loop failed.");
+                Failed?.Invoke(this, exception.Message);
+            }
         }
         finally
         {
             IsRunning = false;
+            CompleteTermination();
         }
     }
 
-    private async Task SendAsync(IpcMessage message)
+    private async Task SendAsync(IpcMessage message, CancellationToken cancellationToken = default)
     {
         if (_disposed || _pipe is null || !_pipe.IsConnected)
         {
             return;
         }
 
+        using var linkedCts = CreateLinkedSessionToken(cancellationToken);
+        var effectiveToken = linkedCts?.Token
+            ?? (cancellationToken.CanBeCanceled ? cancellationToken : GetSessionToken());
+
         try
         {
-            await _sendGate.WaitAsync();
+            // Wait with the session token so DisposeAsync's Cancel releases queued
+            // senders — SemaphoreSlim.Dispose alone never wakes pending waiters and
+            // would leak them (and their captured payloads) forever.
+            await _sendGate.WaitAsync(effectiveToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
         }
         catch (ObjectDisposedException)
         {
@@ -324,13 +412,17 @@ public sealed class TerminalSession : IAsyncDisposable
 
         try
         {
-            await IpcProtocol.WriteAsync(_pipe, message, _cts?.Token ?? CancellationToken.None);
+            await IpcProtocol.WriteAsync(_pipe, message, effectiveToken);
         }
         catch (OperationCanceledException)
         {
         }
         catch (IOException)
         {
+        }
+        catch (InvalidDataException exception)
+        {
+            _logger.Error(exception, "IPC send was rejected.");
         }
         catch (ObjectDisposedException)
         {
@@ -343,6 +435,57 @@ public sealed class TerminalSession : IAsyncDisposable
             }
             catch (ObjectDisposedException)
             {
+            }
+        }
+    }
+
+    private CancellationTokenSource? CreateLinkedSessionToken(CancellationToken cancellationToken)
+    {
+        var sessionToken = GetSessionToken();
+        if (sessionToken.CanBeCanceled && cancellationToken.CanBeCanceled)
+        {
+            return CancellationTokenSource.CreateLinkedTokenSource(sessionToken, cancellationToken);
+        }
+
+        return null;
+    }
+
+    private CancellationToken GetSessionToken()
+    {
+        try
+        {
+            return _cts?.Token ?? CancellationToken.None;
+        }
+        catch (ObjectDisposedException)
+        {
+            return CancellationToken.None;
+        }
+    }
+
+    private void CompleteTermination()
+    {
+        if (Interlocked.Exchange(ref _terminated, 1) != 0)
+        {
+            return;
+        }
+
+        _completion.TrySetResult();
+
+        var handler = Terminated;
+        if (handler is null)
+        {
+            return;
+        }
+
+        foreach (EventHandler callback in handler.GetInvocationList())
+        {
+            try
+            {
+                callback(this, EventArgs.Empty);
+            }
+            catch (Exception exception)
+            {
+                _logger.Error(exception, "Terminal termination event handler failed.");
             }
         }
     }

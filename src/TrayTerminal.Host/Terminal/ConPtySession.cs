@@ -44,19 +44,30 @@ internal sealed class ConPtySession : IDisposable
 
         Directory.CreateDirectory(workingDirectory);
 
-        ThrowIfFalse(NativeMethods.CreatePipe(out var inputRead, out var inputWrite, IntPtr.Zero, 0), "Create input pipe");
-        ThrowIfFalse(NativeMethods.CreatePipe(out var outputRead, out var outputWrite, IntPtr.Zero, 0), "Create output pipe");
-
-        var size = new NativeMethods.COORD((short)columns, (short)rows);
-        ThrowIfFailed(NativeMethods.CreatePseudoConsole(size, inputRead, outputWrite, 0, out var pseudoConsole), "CreatePseudoConsole");
-
-        inputRead.Dispose();
-        outputWrite.Dispose();
-
+        SafeFileHandle? inputRead = null;
+        SafeFileHandle? inputWrite = null;
+        SafeFileHandle? outputRead = null;
+        SafeFileHandle? outputWrite = null;
+        SafeFileHandle? jobHandle = null;
+        Stream? inputStream = null;
+        Stream? outputStream = null;
+        var pseudoConsole = IntPtr.Zero;
         var attributeList = IntPtr.Zero;
         var processInfo = default(NativeMethods.PROCESS_INFORMATION);
+        var success = false;
         try
         {
+            ThrowIfFalse(NativeMethods.CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 0), "Create input pipe");
+            ThrowIfFalse(NativeMethods.CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 0), "Create output pipe");
+
+            var size = new NativeMethods.COORD((short)columns, (short)rows);
+            ThrowIfFailed(NativeMethods.CreatePseudoConsole(size, inputRead, outputWrite, 0, out pseudoConsole), "CreatePseudoConsole");
+
+            inputRead.Dispose();
+            inputRead = null;
+            outputWrite.Dispose();
+            outputWrite = null;
+
             var startupInfo = new NativeMethods.STARTUPINFOEX();
             startupInfo.StartupInfo.cb = Marshal.SizeOf<NativeMethods.STARTUPINFOEX>();
 
@@ -95,31 +106,55 @@ internal sealed class ConPtySession : IDisposable
                     out processInfo),
                 "CreateProcess");
 
-            var jobHandle = NativeMethods.TryCreateKillOnCloseJob();
+            jobHandle = NativeMethods.TryCreateKillOnCloseJob();
             if (jobHandle is not null)
             {
                 NativeMethods.AssignProcessToJobObject(jobHandle, processInfo.hProcess);
             }
 
+            // CreatePipe returns synchronous handles. Passing isAsync:false avoids
+            // FileStream's overlapped-I/O requirement for asynchronous operations.
+            inputStream = new FileStream(inputWrite, FileAccess.Write, 4096, false);
+            inputWrite = null;
+            outputStream = new FileStream(outputRead, FileAccess.Read, 4096, false);
+            outputRead = null;
+
             var process = Process.GetProcessById((int)processInfo.dwProcessId);
-            return new ConPtySession(
+            var session = new ConPtySession(
                 pseudoConsole,
-                // CreatePipe returns synchronous handles. Passing isAsync:false avoids
-                // FileStream's overlapped-I/O requirement for asynchronous operations.
-                new FileStream(inputWrite, FileAccess.Write, 4096, false),
-                new FileStream(outputRead, FileAccess.Read, 4096, false),
+                inputStream,
+                outputStream,
                 process,
                 jobHandle);
+            pseudoConsole = IntPtr.Zero;
+            inputStream = null;
+            outputStream = null;
+            jobHandle = null;
+            success = true;
+            return session;
         }
         catch
         {
-            NativeMethods.ClosePseudoConsole(pseudoConsole);
-            inputWrite.Dispose();
-            outputRead.Dispose();
+            inputStream?.Dispose();
+            outputStream?.Dispose();
+            jobHandle?.Dispose();
+            if (pseudoConsole != IntPtr.Zero)
+            {
+                NativeMethods.ClosePseudoConsole(pseudoConsole);
+            }
+
             throw;
         }
         finally
         {
+            if (!success)
+            {
+                inputRead?.Dispose();
+                inputWrite?.Dispose();
+                outputRead?.Dispose();
+                outputWrite?.Dispose();
+            }
+
             if (attributeList != IntPtr.Zero)
             {
                 NativeMethods.DeleteProcThreadAttributeList(attributeList);

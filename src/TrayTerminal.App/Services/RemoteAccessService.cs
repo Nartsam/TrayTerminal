@@ -176,7 +176,14 @@ public sealed class RemoteAccessService : IAsyncDisposable
         WebSocket webSocket;
         try
         {
-            webSocket = await context.WebSockets.AcceptWebSocketAsync();
+            // KeepAliveTimeout makes the server abort connections whose peer stops
+            // answering pings (dead device, half-open TCP). Without it a dead client
+            // would hold the bridge open forever.
+            webSocket = await context.WebSockets.AcceptWebSocketAsync(new WebSocketAcceptContext
+            {
+                KeepAliveInterval = TimeSpan.FromSeconds(30),
+                KeepAliveTimeout = TimeSpan.FromSeconds(20)
+            });
         }
         catch
         {
@@ -209,11 +216,11 @@ public sealed class RemoteAccessService : IAsyncDisposable
 
         _disposed = true;
 
-        // Dispose all active bridges first so they gracefully close their WebSockets.
-        foreach (var bridge in _bridges.Keys)
-        {
-            await bridge.DisposeAsync();
-        }
+        // Dispose active bridges first so they gracefully close their WebSockets.
+        // Do it concurrently; each bridge has its own close timeout, and shutdown
+        // should not take N * timeout when many browsers are connected.
+        var bridges = _bridges.Keys.ToArray();
+        await Task.WhenAll(bridges.Select(bridge => bridge.DisposeAsync().AsTask()));
 
         _bridges.Clear();
 

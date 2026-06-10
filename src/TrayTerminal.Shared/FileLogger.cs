@@ -66,7 +66,19 @@ public sealed class FileLogger
         var line = $"{now:O} [{level}] {message}{Environment.NewLine}";
         lock (_gate)
         {
-            File.AppendAllText(_filePath, line);
+            // Logging must never take the app down or alter control flow. A full
+            // disk or a file locked by a scanner shows up here as IOException —
+            // drop the line and keep running.
+            try
+            {
+                File.AppendAllText(_filePath, line);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
     }
 

@@ -21,7 +21,7 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         Title = request.Title;
         TerminalFontSize = fontSize;
         _session = new TerminalSession(request, paths, logger);
-        _terminalView = new TerminalView(paths, _session, fontSize);
+        _terminalView = new TerminalView(paths, _session, logger, fontSize);
         _status = new TextBlock
         {
             Text = request.RunAsAdministrator ? "准备启动管理员终端..." : "准备启动终端...",
@@ -44,7 +44,9 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         root.Children.Add(border);
         Content = root;
 
-        _session.OutputReceived += (_, bytes) => Dispatcher.Invoke(() => _ = _terminalView.WriteAsync(bytes));
+        // EnqueueOutput is thread-safe and non-blocking, so the session read loop
+        // never waits on the UI thread or the WebView2 renderer.
+        _session.OutputReceived += (_, bytes) => _terminalView.EnqueueOutput(bytes);
         _session.Exited += (_, exitCode) =>
         {
             Dispatcher.Invoke(() => _status.Text = $"进程已退出，代码 {exitCode}");

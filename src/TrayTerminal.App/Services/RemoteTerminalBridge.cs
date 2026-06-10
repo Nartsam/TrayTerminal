@@ -2,24 +2,42 @@ using System.IO;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using TrayTerminal.Shared;
+using TrayTerminal.Shared.Ipc;
 
 namespace TrayTerminal.App.Services;
 
 /// <summary>
 /// Bridges a single remote browser WebSocket connection to one TerminalSession.
 /// Each instance is independent — multiple bridges can connect to the same terminal.
+/// Terminal output flows through a bounded queue drained by a single send loop, so a
+/// slow or dead client can never make the app buffer output without limit.
 /// </summary>
 public sealed class RemoteTerminalBridge : IAsyncDisposable
 {
+    // The terminal host emits chunks of at most 8 KB, so 512 queued chunks cap the
+    // per-client backlog at roughly 4 MB before the client is considered too slow.
+    private const int OutputQueueCapacity = 512;
+    private const int MaxClientMessageBytes = IpcProtocol.MaxPayloadLength;
+    private static readonly TimeSpan SendTimeout = TimeSpan.FromSeconds(30);
+
     private readonly WebSocket _webSocket;
     private readonly TerminalSession _session;
     private readonly string _terminalName;
     private readonly FileLogger _logger;
-    private readonly SemaphoreSlim _sendGate = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
+    private readonly Channel<byte[]> _outputQueue = Channel.CreateBounded<byte[]>(
+        new BoundedChannelOptions(OutputQueueCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            // Producers use TryWrite, so Wait never actually blocks; a full queue
+            // surfaces as TryWrite returning false and the bridge disconnecting.
+            FullMode = BoundedChannelFullMode.Wait
+        });
     private IDisposable? _outputSubscription;
-    private bool _disposed;
+    private int _disposed;
 
     public RemoteTerminalBridge(WebSocket webSocket, TerminalSession session, string terminalName, FileLogger logger)
     {
@@ -32,8 +50,8 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
     public string TerminalName => _terminalName;
 
     /// <summary>
-    /// Subscribes to terminal output and begins the WebSocket receive loop.
-    /// Returns when the WebSocket closes or the terminal exits.
+    /// Subscribes to terminal output and begins the WebSocket receive and send loops.
+    /// Returns when the WebSocket closes, the terminal exits, or the client stalls.
     /// </summary>
     public async Task RunAsync()
     {
@@ -42,7 +60,16 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             return;
         }
 
+        _session.Terminated += OnSessionTerminated;
         _outputSubscription = _session.SubscribeOutput(OnOutputReceived);
+        if (_session.Completion.IsCompleted)
+        {
+            Abort();
+            await DisposeAsync();
+            return;
+        }
+
+        var sendTask = SendLoopAsync();
 
         try
         {
@@ -60,19 +87,108 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
         finally
         {
+            // Stop the send loop before closing the socket so CloseAsync does not
+            // race an in-flight SendAsync on the same WebSocket.
+            try
+            {
+                _cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+
+            _outputQueue.Writer.TryComplete();
+            try
+            {
+                await sendTask;
+            }
+            catch
+            {
+            }
+
             await DisposeAsync();
         }
     }
 
     private void OnOutputReceived(object? sender, byte[] bytes)
     {
-        if (_disposed || _cts.IsCancellationRequested)
+        if (Volatile.Read(ref _disposed) != 0 || _cts.IsCancellationRequested)
         {
             return;
         }
 
-        // Fire-and-forget: output dispatch must not block the terminal's read loop.
-        _ = SendTextAsync(Convert.ToBase64String(bytes));
+        if (!_outputQueue.Writer.TryWrite(bytes) && !_cts.IsCancellationRequested)
+        {
+            // The bounded queue is full: the client has fallen ~4 MB behind the
+            // terminal. Drop the connection instead of buffering without limit;
+            // the browser will reconnect on its own.
+            _logger.Info($"Remote client for '{_terminalName}' cannot keep up with terminal output; disconnecting it.");
+            Abort();
+        }
+    }
+
+    private void OnSessionTerminated(object? sender, EventArgs e)
+    {
+        _logger.Info($"Terminal '{_terminalName}' ended; disconnecting remote client.");
+        Abort();
+    }
+
+    private async Task SendLoopAsync()
+    {
+        try
+        {
+            while (await _outputQueue.Reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            {
+                while (_outputQueue.Reader.TryRead(out var chunk))
+                {
+                    var bytes = Encoding.UTF8.GetBytes(Convert.ToBase64String(chunk));
+                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+                    timeoutCts.CancelAfter(SendTimeout);
+                    await _webSocket.SendAsync(
+                        new ArraySegment<byte>(bytes),
+                        WebSocketMessageType.Text,
+                        endOfMessage: true,
+                        timeoutCts.Token).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (!_cts.IsCancellationRequested)
+            {
+                // The per-send timeout fired: the socket still reports Open but the
+                // peer is not reading (suspended tab, half-open connection). The
+                // cancelled SendAsync has already aborted the socket; finish tearing
+                // the bridge down so the receive loop exits too.
+                _logger.Info($"Remote client for '{_terminalName}' stalled for {SendTimeout.TotalSeconds:0}s during send; disconnecting it.");
+                Abort();
+            }
+        }
+        catch (WebSocketException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private void Abort()
+    {
+        try
+        {
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        try
+        {
+            _webSocket.Abort();
+        }
+        catch
+        {
+        }
     }
 
     private async Task ReceiveLoopAsync(CancellationToken ct)
@@ -85,6 +201,13 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             do
             {
                 result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+                if (message.Length + result.Count > MaxClientMessageBytes)
+                {
+                    _logger.Info($"Remote client for '{_terminalName}' sent a message larger than {MaxClientMessageBytes} bytes; disconnecting it.");
+                    Abort();
+                    return;
+                }
+
                 message.Write(buffer, 0, result.Count);
             } while (!result.EndOfMessage);
 
@@ -141,80 +264,32 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
     }
 
-    private async Task SendTextAsync(string text)
-    {
-        if (_disposed || _webSocket.State != WebSocketState.Open)
-        {
-            return;
-        }
-
-        try
-        {
-            await _sendGate.WaitAsync(_cts.Token);
-        }
-        catch (ObjectDisposedException)
-        {
-            return;
-        }
-
-        try
-        {
-            if (_webSocket.State == WebSocketState.Open)
-            {
-                var bytes = Encoding.UTF8.GetBytes(text);
-                await _webSocket.SendAsync(
-                    new ArraySegment<byte>(bytes),
-                    WebSocketMessageType.Text,
-                    endOfMessage: true,
-                    _cts.Token);
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (WebSocketException)
-        {
-        }
-        catch (ObjectDisposedException)
-        {
-        }
-        finally
-        {
-            try
-            {
-                _sendGate.Release();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        }
-    }
-
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
             return;
         }
 
-        _disposed = true;
-
-        // Unsubscribe from terminal output first so no more fire-and-forget
-        // writes are queued.
+        // Unsubscribe from terminal output first so no more chunks are queued,
+        // then stop both loops.
+        _session.Terminated -= OnSessionTerminated;
         _outputSubscription?.Dispose();
         _outputSubscription = null;
-
+        _outputQueue.Writer.TryComplete();
         _cts.Cancel();
 
-        // Close the WebSocket gracefully if it's still open.
+        // Close the WebSocket gracefully if it's still open, with a hard cap so
+        // shutdown can never hang on an unresponsive peer.
         try
         {
             if (_webSocket.State == WebSocketState.Open)
             {
+                using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 await _webSocket.CloseAsync(
                     WebSocketCloseStatus.NormalClosure,
                     "Bridge disposed",
-                    CancellationToken.None);
+                    closeCts.Token);
             }
         }
         catch
@@ -222,7 +297,6 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
 
         _webSocket.Dispose();
-        _sendGate.Dispose();
         _cts.Dispose();
     }
 }

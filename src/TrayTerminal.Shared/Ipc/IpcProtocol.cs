@@ -7,10 +7,15 @@ namespace TrayTerminal.Shared.Ipc;
 public static class IpcProtocol
 {
     private const int HeaderLength = 5;
-    private const int MaxPayloadLength = 16 * 1024 * 1024;
+    public const int MaxPayloadLength = 16 * 1024 * 1024;
 
     public static async Task WriteAsync(PipeStream stream, IpcMessage message, CancellationToken cancellationToken)
     {
+        if (message.Payload.Length > MaxPayloadLength)
+        {
+            throw new InvalidDataException($"IPC payload length exceeds the limit: {message.Payload.Length}");
+        }
+
         // Frame format: 1 byte message type + 4 byte little-endian payload length + payload.
         // Keeping the protocol binary lets terminal output pass through without text escaping.
         var header = new byte[HeaderLength];

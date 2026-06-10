@@ -142,6 +142,9 @@ http://192.168.1.100:8443/ttyd?token=my_secret_token
 
 - **无历史输出**：远程浏览器只能看到连接建立之后的新输出，看不到连接前的终端历史。这是设计决定，不是 bug
 - **无输入冲突处理**：本地和远程可以同时在同一个终端中输入，等价于两个键盘同时插在一台电脑上。若需协调操作，请自行约定
+- **慢速/失联客户端会被自动断开**：服务端为每个远程连接维护约 4 MB 的输出缓冲并限制单次发送 30 秒超时，同时启用 WebSocket 心跳检测（每 30 秒 ping，20 秒内未收到 pong 即断开）。跟不上输出速度或已失联的浏览器连接会被服务端主动断开，以保证主程序长期运行时内存不会无界增长；浏览器页面会自动尝试重连（最多 5 次，刷新页面可重置）
+- **终端结束会断开远程连接**：终端进程退出、标签被关闭或应用正在退出时，服务端会主动关闭对应的远程 WebSocket，避免浏览器窗口继续持有已经结束的终端会话
+- **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的 IPC 层按块发送，避免单次大粘贴超过 IPC 帧上限导致终端会话异常结束；远程浏览器单条 WebSocket 消息仍有 16 MB 上限，超过时该连接会被断开
 - **不显示背景图**：远程浏览器无法访问本机的 `Backgrounds` 目录，因此不会显示终端背景图
 - **HTTP 明文传输**：所有数据（包括令牌）通过 HTTP 明文传输。该功能设计用于可信局域网环境，不建议暴露到公网
 - **浏览器依赖**：需要浏览器支持 WebSocket。所有现代浏览器均支持
@@ -318,8 +321,15 @@ publish\TrayTerminal\TrayTerminal.exe
 - `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。解析器以 section header（顶格、以 `:` 结尾的行）和缩进属性（`key: value`）为单位组织配置；section 内部的空行会被忽略，不会截断后续属性，但属性行必须保持缩进，否则会被误判为新 section。
 - App 与 Host 的 IPC 协议在 `TrayTerminal.Shared.Ipc`，改协议时要同时检查 `TerminalSession` 和 `TerminalHostSession`。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
+- `ConPtySession.Start` 在每个 Win32 创建步骤之间都必须保持失败路径可释放：管道句柄、伪控制台、attribute list、Job Object 和 FileStream 的所有权转移不要简化，否则反复创建失败的终端可能泄漏句柄。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。
 - `terminal.html` 同时支持 xterm.js 和 fallback 渲染；如果 xterm 静态文件缺失，仍能看到输出并测试 IPC。
 - 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
+- 终端输出到 WebView2 的写入经过 `TerminalView` 内部的有界队列（约 8 MB 上限），由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`。渲染进程卡死时丢弃最旧输出而不是无限排队，也不会阻塞会话读取循环（远程桥接共享该循环）。不要把输出改回逐块 fire-and-forget 的 `ExecuteScriptAsync`，那会在渲染端变慢时无界堆积。
+- `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）时自动 `Reload` 恢复，页面重新发出 `ready` 消息后会自动重新应用字号和背景（滚动缓冲区会丢失）。首次初始化等待 `ready` 有 30 秒超时，避免 WebView2 页面异常时新建标签永久挂起；其他失败类型只记日志。
 - 远程访问功能通过嵌入的 Kestrel（ASP.NET Core）实现。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
-- `RemoteAccessService` 在 `MainWindow.Closed` 时逐个关闭所有活跃的 WebSocket 桥接再停止 Kestrel。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
+- `TerminalSession` 暴露 `Completion`/`Terminated` 用于终端生命周期收口。正常退出、读循环结束、关闭标签、应用退出和启动失败清理都必须触发完成信号；远程桥接依赖它断开浏览器连接，避免旧 WebSocket 持有已结束的 session。
+- 本地和远程输入会在 `TerminalSession.SendInputAsync` 中按 64 KB 分片写入 IPC。不要绕过这里直接发送超大 `Input` 帧；`IpcProtocol.MaxPayloadLength` 是单帧硬上限，用于防止异常输入造成内存尖峰或 Host 会话中止。
+- `RemoteTerminalBridge` 把终端输出写入有界队列（512 块 ≈ 4 MB），由单一发送循环串行发送，单次发送超时 30 秒；队列写满、发送超时、终端结束或远程单条消息超过 16 MB 都会主动断开该连接。WebSocket 接受时设置了 `KeepAliveTimeout`，对端不回 pong 会被自动断开。不要把发送改回每块输出 fire-and-forget 的模式，那是慢速客户端导致内存无界增长的根源。
+- `RemoteAccessService` 在 `MainWindow.Closed` 时并发关闭所有活跃的 WebSocket 桥接再停止 Kestrel，避免大量远程连接让退出时间按连接数线性增长。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
+- `FileLogger.Write` 会静默吞掉写盘失败（磁盘满、文件被占用），日志失败永远不影响业务逻辑。`App.OnStartup` 注册了 `AppDomain.UnhandledException` 和 `TaskScheduler.UnobservedTaskException` 兜底记录，便于长期挂机后排查崩溃原因。
