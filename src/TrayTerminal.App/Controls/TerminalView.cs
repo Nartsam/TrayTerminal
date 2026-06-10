@@ -75,7 +75,15 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         await readyTcs.Task;
         _ready = true;
         await SetFontSizeAsync(_fontSize);
-        await SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
+        try
+        {
+            await SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            System.Diagnostics.Debug.WriteLine(
+                $"TerminalView: failed to load background image '{_backgroundImagePath}': {ex.Message}");
+        }
     }
 
     public async Task WriteAsync(byte[] bytes)
@@ -104,7 +112,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         _backgroundCover = Math.Clamp(cover, 0, 100);
         if (_ready && !_disposed)
         {
-            _ = SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
+            _ = SetBackgroundImageWithErrorHandlingAsync(_backgroundImagePath, _backgroundCover);
         }
     }
 
@@ -180,9 +188,44 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
 
     private async Task SetBackgroundImageAsync(string? imagePath, int cover)
     {
-        var uri = string.IsNullOrWhiteSpace(imagePath) ? null : new Uri(imagePath).AbsoluteUri;
-        var payload = JsonSerializer.Serialize(uri);
-        await _webView.ExecuteScriptAsync($"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});");
+        // Read the image file and convert to a data: URL so the WebView2 engine does
+        // not cache the image across tab creations or config changes.
+        string? dataUri;
+        if (string.IsNullOrWhiteSpace(imagePath))
+        {
+            dataUri = null;
+        }
+        else
+        {
+            var bytes = await File.ReadAllBytesAsync(imagePath);
+            var base64 = Convert.ToBase64String(bytes);
+            var mime = Path.GetExtension(imagePath).ToLowerInvariant() switch
+            {
+                ".png" => "image/png",
+                ".jpg" => "image/jpeg",
+                ".jpeg" => "image/jpeg",
+                _ => "image/png"
+            };
+            dataUri = $"data:{mime};base64,{base64}";
+        }
+
+        var payload = JsonSerializer.Serialize(dataUri);
+        await _webView.ExecuteScriptAsync(
+            $"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});");
+    }
+
+    private async Task SetBackgroundImageWithErrorHandlingAsync(string? imagePath, int cover)
+    {
+        try
+        {
+            await SetBackgroundImageAsync(imagePath, cover);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Fire-and-forget path — log the error but don't crash.
+            System.Diagnostics.Debug.WriteLine(
+                $"TerminalView: failed to set background image '{imagePath}': {ex.Message}");
+        }
     }
 
     private async Task PasteTextAsync(string text)

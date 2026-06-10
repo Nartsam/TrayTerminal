@@ -13,6 +13,7 @@ internal static class Program
         paths.EnsureCreated();
         Directory.SetCurrentDirectory(paths.BaseDirectory);
 
+        FileLogger.LoadSettings(paths);
         var logger = new FileLogger(paths, "host");
 
         try

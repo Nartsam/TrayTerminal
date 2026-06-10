@@ -65,6 +65,8 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
 
     public bool IsRunning => _session.IsRunning;
 
+    public TerminalSession Session => _session;
+
     public async Task StartAsync()
     {
         await _terminalView.InitializeAsync();

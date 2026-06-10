@@ -40,18 +40,11 @@ public static class TabPresetConfig
         {
             var line = rawLine.TrimEnd();
 
+            // Blank lines are ignored — sections are committed when the next section
+            // header appears or at end of file. This way blank lines inside a
+            // section do not silently drop the remaining properties.
             if (string.IsNullOrWhiteSpace(line))
             {
-                if (currentName is not null)
-                {
-                    result[currentName] = new TabPreset(cd, run, fill, bg, cover);
-                    currentName = null;
-                    cd = null;
-                    run = null;
-                    fill = null;
-                    bg = null;
-                    cover = 0;
-                }
                 continue;
             }
 

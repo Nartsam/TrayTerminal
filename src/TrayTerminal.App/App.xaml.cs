@@ -17,6 +17,7 @@ public partial class App : System.Windows.Application
         paths.EnsureCreated();
         Directory.SetCurrentDirectory(paths.BaseDirectory);
 
+        FileLogger.LoadSettings(paths);
         _logger = new FileLogger(paths, "app");
         DispatcherUnhandledException += (_, args) =>
         {

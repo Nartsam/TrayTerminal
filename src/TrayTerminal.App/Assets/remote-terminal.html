@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="./xterm/xterm.css" />
+  <script src="./xterm/xterm.js"></script>
+  <title>TrayTerminal Remote</title>
+  <style>
+    html, body {
+      width: 100%; height: 100%; margin: 0; overflow: hidden;
+      background: #050607;
+    }
+    body {
+      color: #d7dde2;
+      font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+      font-size: 13px;
+    }
+    #terminal {
+      width: 100%; height: 100%; margin: 0; overflow: hidden;
+      background-color: transparent;
+    }
+    .xterm, .xterm-screen, .xterm-viewport {
+      background: transparent !important;
+    }
+    #fallback {
+      box-sizing: border-box;
+      width: 100%; height: 100%; margin: 0; padding: 10px;
+      overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+      outline: none; caret-color: #20b486; line-height: 18px;
+      background-color: transparent; color: #d7dde2;
+    }
+    #status-bar {
+      position: fixed; bottom: 0; left: 0; right: 0;
+      background: #1a1d21; color: #8a9096; font-size: 11px;
+      padding: 2px 8px; display: none; z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <pre id="fallback" tabindex="0" hidden></pre>
+  <div id="status-bar"></div>
+
+  <script>
+    (() => {
+      const decoder = new TextDecoder();
+      const terminalHost = document.getElementById('terminal');
+      const fallback = document.getElementById('fallback');
+      const statusBar = document.getElementById('status-bar');
+      let terminal = null;
+      let ws = null;
+      let reconnectTimer = null;
+      let reconnectAttempts = 0;
+      const maxReconnectAttempts = 5;
+
+      // Parse terminal name from path: /NapCat → NapCat
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      const terminalName = pathParts.length > 0 ? pathParts[0] : '';
+
+      // Parse token from query string
+      const params = new URLSearchParams(window.location.search);
+      const token = params.get('token') || '';
+
+      if (!terminalName) {
+        fallback.hidden = false;
+        fallback.textContent = '错误：URL 中未指定终端名称。请使用 http://&lt;ip&gt;:&lt;port&gt;/&lt;终端名称&gt;?token=&lt;令牌&gt;';
+        return;
+      }
+
+      document.title = terminalName + ' — TrayTerminal Remote';
+
+      function showStatus(text, isError) {
+        statusBar.textContent = text;
+        statusBar.style.display = 'block';
+        statusBar.style.color = isError ? '#e06c6c' : '#8a9096';
+      }
+
+      function hideStatus() {
+        statusBar.style.display = 'none';
+      }
+
+      function post(message) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(message));
+        }
+      }
+
+      function sendInput(text) {
+        post({ type: 'input', data: text });
+      }
+
+      function isClipboardShortcut(event, key) {
+        return event.ctrlKey && !event.altKey && !event.metaKey &&
+          typeof event.key === 'string' && event.key.toLowerCase() === key;
+      }
+
+      function stopShortcut(event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      function hasTextSelection() {
+        if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
+          return true;
+        }
+        var sel = window.getSelection();
+        return sel !== null && !sel.isCollapsed;
+      }
+
+      function getSelectedText() {
+        if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
+          return typeof terminal.getSelection === 'function' ? terminal.getSelection() : '';
+        }
+        var sel = window.getSelection();
+        return sel !== null && !sel.isCollapsed ? sel.toString() : '';
+      }
+
+      function isMultiline(text) {
+        return text.indexOf('\n') >= 0 || text.indexOf('\r') >= 0;
+      }
+
+      function buildPastePreview(text) {
+        var normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        var lines = normalized.split('\n');
+        var maxLines = 20;
+        var maxChars = 1600;
+        var previewLines = lines.slice(0, maxLines);
+        var preview = previewLines.join('\n');
+        if (preview.length > maxChars) {
+          preview = preview.slice(0, maxChars);
+        }
+        var truncated = lines.length > maxLines || text.length > maxChars;
+        return { preview: preview, truncated: truncated, lineCount: lines.length, charCount: text.length };
+      }
+
+      function handleClipboardShortcut(event) {
+        if (isClipboardShortcut(event, 'v')) {
+          stopShortcut(event);
+          navigator.clipboard.readText()
+            .then(function(text) {
+              if (!text) return;
+              if (isMultiline(text)) {
+                var info = buildPastePreview(text);
+                var msg = '剪贴板内容包含 ' + info.lineCount + ' 行、' + info.charCount
+                  + ' 个字符，确定要粘贴到当前终端吗？\n预览如下'
+                  + (info.truncated ? '（已截断）' : '') + '：\n\n' + info.preview;
+                if (!window.confirm(msg)) return;
+              }
+              sendInput(text);
+            })
+            .catch(function() {});
+          return true;
+        }
+
+        if (isClipboardShortcut(event, 'c')) {
+          var selectedText = getSelectedText();
+          if (selectedText) {
+            stopShortcut(event);
+            navigator.clipboard.writeText(selectedText).catch(function() {});
+            return true;
+          }
+          // No selection — let xterm.js handle Ctrl+C (sends \x03)
+          return false;
+        }
+
+        return false;
+      }
+
+      function handleTerminalKeyEvent(event) {
+        if (event.type !== 'keydown') return true;
+        return !handleClipboardShortcut(event);
+      }
+
+      function mapKey(event) {
+        if (event.ctrlKey && !event.altKey && event.key.length === 1) {
+          const code = event.key.toUpperCase().charCodeAt(0);
+          if (code >= 65 && code <= 90) return String.fromCharCode(code - 64);
+        }
+        switch (event.key) {
+          case 'Enter': return '\r';
+          case 'Backspace': return '\x7f';
+          case 'Tab': return '\t';
+          case 'Escape': return '\x1b';
+          case 'ArrowUp': return '\x1b[A';
+          case 'ArrowDown': return '\x1b[B';
+          case 'ArrowRight': return '\x1b[C';
+          case 'ArrowLeft': return '\x1b[D';
+          case 'Home': return '\x1b[H';
+          case 'End': return '\x1b[F';
+          case 'Insert': return '\x1b[2~';
+          case 'Delete': return '\x1b[3~';
+          case 'PageUp': return '\x1b[5~';
+          case 'PageDown': return '\x1b[6~';
+          default:
+            return event.key.length === 1 && !event.ctrlKey && !event.metaKey ? event.key : null;
+        }
+      }
+
+      function estimateSize() {
+        let cols, rows;
+        if (terminal && terminal._core && terminal._core._renderService) {
+          try {
+            const dims = terminal._core._renderService.dimensions;
+            if (dims && dims.css && dims.css.cell.width > 0 && dims.css.cell.height > 0) {
+              const cellW = dims.css.cell.width;
+              const cellH = dims.css.cell.height;
+              cols = Math.max(20, Math.floor((terminalHost.clientWidth || document.body.clientWidth || 900) / cellW));
+              rows = Math.max(5, Math.floor((terminalHost.clientHeight || document.body.clientHeight || 500) / cellH));
+            }
+          } catch (e) {}
+        }
+        if (!cols || !rows) {
+          cols = Math.max(20, Math.floor((document.body.clientWidth || 900) / 9));
+          rows = Math.max(5, Math.floor((document.body.clientHeight || 500) / 19));
+        }
+        post({ type: 'resize', cols, rows });
+        if (terminal) {
+          try { terminal.resize(cols, rows); } catch (e) {}
+        }
+      }
+
+      function stripAnsi(text) {
+        return text
+          .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+          .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '')
+          .replace(/\x1b[>=c78]/g, '');
+      }
+
+      function writeFallback(text) {
+        const clean = stripAnsi(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        fallback.textContent += clean;
+        if (fallback.textContent.length > 800000) {
+          fallback.textContent = fallback.textContent.slice(-600000);
+        }
+        fallback.scrollTop = fallback.scrollHeight;
+      }
+
+      function connect() {
+        // Build WebSocket URL: ws://host:port/terminalName?token=xxx
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = wsProtocol + '//' + window.location.host + '/' + terminalName +
+          (token ? '?token=' + encodeURIComponent(token) : '');
+
+        showStatus('正在连接...', false);
+
+        try {
+          ws = new WebSocket(wsUrl);
+        } catch (e) {
+          showStatus('WebSocket 连接失败', true);
+          return;
+        }
+
+        ws.onopen = function() {
+          reconnectAttempts = 0;
+          hideStatus();
+          if (terminal) {
+            terminal.focus();
+          }
+        };
+
+        ws.onmessage = function(event) {
+          if (typeof event.data !== 'string') return;
+          try {
+            const binary = atob(event.data);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            const text = decoder.decode(bytes, { stream: true });
+            if (terminal) {
+              terminal.write(text);
+            } else {
+              writeFallback(text);
+            }
+          } catch (e) {
+            // Non-base64 message, ignore
+          }
+        };
+
+        ws.onclose = function(event) {
+          if (event.code === 4001) {
+            // Server rejected — terminal not available or access denied
+            showStatus('连接被拒绝：终端不可用或访问被拒绝', true);
+            return;
+          }
+          if (reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++;
+            showStatus('连接断开，' + reconnectAttempts + '/' + maxReconnectAttempts + ' 次重连...', false);
+            reconnectTimer = setTimeout(connect, 2000 * reconnectAttempts);
+          } else {
+            showStatus('连接断开，已达到最大重连次数', true);
+          }
+        };
+
+        ws.onerror = function() {
+          // onclose will fire after this
+        };
+      }
+
+      function initTerminal() {
+        if (window.Terminal) {
+          terminal = new window.Terminal({
+            cursorBlink: true,
+            convertEol: true,
+            scrollback: 5000,
+            fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
+            fontSize: 14,
+            lineHeight: 1.2,
+            cursorStyle: 'block',
+            allowTransparency: true,
+            theme: {
+              background: 'rgba(0, 0, 0, 0)',
+              foreground: '#d7dde2',
+              cursor: '#20b486',
+              selectionBackground: '#264f78'
+            }
+          });
+          terminal.open(terminalHost);
+          terminal.focus();
+          terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
+          terminal.onData(sendInput);
+        } else {
+          terminalHost.hidden = true;
+          fallback.hidden = false;
+          fallback.focus();
+          // Attach basic keyboard input for fallback mode
+          fallback.addEventListener('keydown', function(event) {
+            if (handleClipboardShortcut(event)) return;
+            const input = mapKey(event);
+            if (input !== null) {
+              event.preventDefault();
+              sendInput(input);
+            }
+          });
+          fallback.addEventListener('paste', function(event) {
+            const text = event.clipboardData.getData('text/plain');
+            if (!text) return;
+            event.preventDefault();
+            if (isMultiline(text)) {
+              const info = buildPastePreview(text);
+              const msg = '剪贴板内容包含 ' + info.lineCount + ' 行、' + info.charCount
+                + ' 个字符，确定要粘贴到当前终端吗？\n预览如下'
+                + (info.truncated ? '（已截断）' : '') + '：\n\n' + info.preview;
+              if (!window.confirm(msg)) return;
+            }
+            sendInput(text);
+          });
+          writeFallback('xterm.js 静态文件未找到，已启用轻量渲染模式\n');
+        }
+
+        window.addEventListener('resize', function() {
+          window.requestAnimationFrame(estimateSize);
+        });
+        setTimeout(estimateSize, 500);
+
+        connect();
+      }
+
+      document.addEventListener('DOMContentLoaded', initTerminal);
+    })();
+  </script>
+</body>
+</html>

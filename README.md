@@ -15,13 +15,14 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
 - 托盘模式：点击”隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示”显示”或”隐藏”。
 - 关闭行为：点击窗口关闭按钮时会询问是退出程序还是隐藏到托盘；托盘右键”退出”则直接退出。关闭仍在运行的标签或退出程序时会提示确认，确认后会强制结束该终端及子进程。
+- 远程访问：可通过浏览器在同一局域网内的另一台设备上查看和操作指定的终端标签。需在 `settings.txt` 中配置端口、令牌和允许的终端名称后启用。
 
 ## 运行时数据
 
 TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文件夹中：
 
-- `Data\Config`：配置目录，存放 `config.txt`（标签预设配置）和 `init.txt`（启动自动建标签）。
-- `Data\Logs`：应用和 Host 日志，例如 `app-20260517.log`、`host-20260517.log`。
+- `Data\Config`：配置目录，存放 `settings.txt`（全局设置）、`config.txt`（标签预设配置）和 `init.txt`（启动自动建标签）。
+- `Data\Logs`：应用和 Host 日志，例如 `app-20260517.log`、`host-20260517.log`。每天生成一个新文件，程序启动时及跨天滚动时自动清理过期旧日志（默认保留 **30 天**，可在 `settings.txt` 中配置）。
 - `Data\Temp`：预留的临时文件目录。
 - `Data\WebView2`：WebView2 用户数据目录，包括缓存、Local State、GPUCache 等浏览器运行数据。
 
@@ -41,7 +42,7 @@ TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文�
 - `bg`：终端背景图片路径，支持相对路径（相对于程序运行目录）和绝对路径。优先级高于 `Backgrounds` 目录的同名图片自动匹配；如果指定的文件不存在则不显示任何背景。
 - `cover`：背景图遮罩强度，合法值是 `0` 到 `100` 的整数。`0` 表示原图，`100` 表示几乎全黑但仍能隐约看到原图。未设置或非法值按 `0` 处理。
 
-配置文件读取会尽量容错：文件不存在、暂时不可读、正在保存导致读取失败时，本次按空配置处理并继续运行；空标签名会被跳过；非法或不存在的 `cd` 会被剔除并使用终端 Profile 的默认工作目录；非法 `bg` 会被忽略；格式不符合字段要求的行会被跳过。
+配置文件读取会尽量容错：文件不存在、暂时不可读、正在保存导致读取失败时，本次按空配置处理并继续运行；空标签名会被跳过；非法或不存在的 `cd` 会被剔除并使用终端 Profile 的默认工作目录；非法 `bg` 会被忽略；格式不符合字段要求的行会被跳过；section 内部的空行会被安全忽略，不会截断后续属性。
 
 示例：
 
@@ -79,6 +80,71 @@ admin/pwsh/MMSys
 如果 `init.txt` 不存在或为空，程序启动时会按默认方式创建一个终端标签。
 
 `init.txt` 读取同样会容错：文件不存在、暂时不可读或包含非法行时不会导致启动失败；非法行会被跳过。
+
+### settings.txt
+
+`Data\Config\settings.txt` 是全局设置配置文件。程序启动时读取一次，运行期间不再重读（修改后需重启应用生效）。文件不存在时所有设置使用默认值。格式为简单的 `key: value`，每行一项，支持 `#` 开头的注释行。
+
+支持的设置项：
+
+- `log_retention_days`：日志保留天数，必须是正整数。未设置或非法值时使用默认值 `30`。
+- `remote_port`：远程访问 HTTP 服务端口，必须是正整数。默认值 `8848`，程序启动时始终监听该端口。
+- `remote_token`：远程访问令牌（可选）。设置后浏览器必须在 URL 中提供 `?token=<值>` 才能访问；不设置或为空时无需令牌即可访问。
+- `remote_allowed_tabs`：允许远程访问的终端名称列表，用竖线 `|` 分隔，名称前后空白会被去除。不设置或为空时不允许任何终端被远程访问。名称匹配区分大小写（与 `config.txt` 的 section 名称一致）。
+
+示例：
+
+```
+# TrayTerminal 全局设置
+log_retention_days: 60
+remote_port: 8443
+remote_token: my_secret_token
+remote_allowed_tabs: ttyd | mmsys |
+```
+
+## 远程访问
+
+TrayTerminal 支持通过浏览器在同一局域网内远程查看和操作指定的终端标签。
+
+### 启用
+
+在 `Data\Config\settings.txt` 中配置以下三项并重启应用：
+
+- `remote_port`：监听端口（如 `8443`）
+- `remote_token`：访问令牌（可选，留空则不验证令牌）
+- `remote_allowed_tabs`：允许远程访问的终端名称，用 `|` 分隔（如 `ttyd | mmsys |`）
+
+配置示例已在上方 settings.txt 文档中给出。
+
+应用启动时会在配置的端口上启动 HTTP 服务。如果端口被占用，应用会提示错误并退出。
+
+### 访问
+
+在局域网内另一台设备的浏览器中输入：
+
+```
+http://<本机IP>:<端口>/<终端名称>?token=<令牌>
+```
+
+例如：
+
+```
+http://192.168.1.100:8443/ttyd?token=my_secret_token
+```
+
+- 终端名称必须已存在于应用的标签栏中且正在运行，大小写敏感
+- 如果未配置令牌，可省略 `?token=` 部分，直接访问 `http://192.168.1.100:8443/ttyd`
+- 令牌错误或终端不在允许列表中会返回 403
+- 终端未运行会返回 404
+- 同时支持多个浏览器窗口连接到同一终端
+
+### 限制
+
+- **无历史输出**：远程浏览器只能看到连接建立之后的新输出，看不到连接前的终端历史。这是设计决定，不是 bug
+- **无输入冲突处理**：本地和远程可以同时在同一个终端中输入，等价于两个键盘同时插在一台电脑上。若需协调操作，请自行约定
+- **不显示背景图**：远程浏览器无法访问本机的 `Backgrounds` 目录，因此不会显示终端背景图
+- **HTTP 明文传输**：所有数据（包括令牌）通过 HTTP 明文传输。该功能设计用于可信局域网环境，不建议暴露到公网
+- **浏览器依赖**：需要浏览器支持 WebSocket。所有现代浏览器均支持
 
 ## 项目结构
 
@@ -133,7 +199,11 @@ src/
 - `Dialogs/RenameTabDialog.xaml.cs`：重命名标签对话框逻辑和空名称校验。
 - `Services/InitConfig.cs`：容错解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
 - `Services/TabPresetConfig.cs`：容错解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
+- `Services/RemoteSettings.cs`：读取 `settings.txt` 中的远程访问配置（端口、令牌、允许列表）。
+- `Services/RemoteAccessService.cs`：嵌入式 Kestrel HTTP + WebSocket 服务器，管理远程访问生命周期。
+- `Services/RemoteTerminalBridge.cs`：单个远程浏览器 WebSocket 连接到终端会话的桥接器。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护命名管道 IPC，发送输入/resize/kill 并接收输出/退出/错误。
+- `Assets/remote-terminal.html`：远程浏览器加载的 xterm.js 终端页面，通过 WebSocket 通信。
 
 ### `src/TrayTerminal.Host`
 
@@ -245,8 +315,11 @@ publish\TrayTerminal\TrayTerminal.exe
 ## 维护提示
 
 - App 与 Host 必须在同一目录下运行，主程序通过 `PortablePaths.HostExecutablePath` 查找 `TrayTerminal.Host.exe`。
-- `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。
+- `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。解析器以 section header（顶格、以 `:` 结尾的行）和缩进属性（`key: value`）为单位组织配置；section 内部的空行会被忽略，不会截断后续属性，但属性行必须保持缩进，否则会被误判为新 section。
 - App 与 Host 的 IPC 协议在 `TrayTerminal.Shared.Ipc`，改协议时要同时检查 `TerminalSession` 和 `TerminalHostSession`。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。
 - `terminal.html` 同时支持 xterm.js 和 fallback 渲染；如果 xterm 静态文件缺失，仍能看到输出并测试 IPC。
+- 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
+- 远程访问功能通过嵌入的 Kestrel（ASP.NET Core）实现。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
+- `RemoteAccessService` 在 `MainWindow.Closed` 时逐个关闭所有活跃的 WebSocket 桥接再停止 Kestrel。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。

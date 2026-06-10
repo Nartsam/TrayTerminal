@@ -42,6 +42,7 @@ public partial class MainWindow : Window
     private WpfPoint? _tabDragStartPoint;
     private TabItem? _draggedTab;
     private bool _syncingFontSize;
+    private RemoteAccessService? _remoteAccess;
     private bool _forceClose;
     private int _untitledIndex = 1;
 
@@ -62,6 +63,7 @@ public partial class MainWindow : Window
         _tabPresetConfigPath = Path.Combine(paths.ConfigDirectory, "config.txt");
         _initConfigPath = Path.Combine(paths.ConfigDirectory, "init.txt");
         ReloadTabPresets();
+        RemoteSettings.Load(paths);
         (_trayIcon, _trayVisibilityMenuItem) = CreateTrayIcon();
 
         FontSizeComboBox.ItemsSource = new[] { 12, 14, 16, 18, 20, 22, 24 };
@@ -91,11 +93,48 @@ public partial class MainWindow : Window
             {
                 await CreateTabFromDialogAsync(useDefaults: true);
             }
+
+            if (RemoteSettings.Port > 0)
+            {
+                try
+                {
+                    _remoteAccess = new RemoteAccessService(
+                        FindTerminalPage,
+                        _logger,
+                        RemoteSettings.Port,
+                        RemoteSettings.Token,
+                        RemoteSettings.AllowedTabs);
+                    await _remoteAccess.StartAsync();
+                    _logger.Info(
+                        $"Remote access started on port {RemoteSettings.Port}"
+                        + (RemoteSettings.Token is not null ? " (token required)" : " (no token)")
+                        + (RemoteSettings.AllowedTabs.Count > 0
+                            ? $", allowed tabs: {string.Join(", ", RemoteSettings.AllowedTabs)}"
+                            : ", no tabs allowed"));
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error(ex, $"Failed to start remote access service on port {RemoteSettings.Port}.");
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        AppMessageDialog.Info(
+                            this,
+                            $"无法在端口 {RemoteSettings.Port} 启动远程访问服务（端口可能被占用），程序将退出。");
+                        _forceClose = true;
+                        Close();
+                    });
+                }
+            }
         };
         Closing += OnClosing;
-        Closed += (_, _) =>
+        Closed += async (_, _) =>
         {
             _statusIdleTimer.Stop();
+            if (_remoteAccess is not null)
+            {
+                await _remoteAccess.DisposeAsync();
+            }
+
             _trayIcon.Dispose();
         };
 
@@ -137,6 +176,19 @@ public partial class MainWindow : Window
         menu.Opening += (_, _) => UpdateTrayVisibilityMenuText();
         icon.DoubleClick += (_, _) => ToggleWindowVisibility();
         return (icon, visibilityMenuItem);
+    }
+
+    /// <summary>
+    /// Looks up a running terminal page by its display title.
+    /// Must be called on the UI thread — it accesses <see cref="Tabs"/>.
+    /// </summary>
+    private TerminalPage? FindTerminalPage(string name)
+    {
+        return Tabs.Items
+            .Cast<TabItem>()
+            .Select(tab => tab.Content)
+            .OfType<TerminalPage>()
+            .FirstOrDefault(page => page.Title == name);
     }
 
     private async Task CreateTabFromDialogAsync(bool useDefaults = false)
@@ -259,7 +311,16 @@ public partial class MainWindow : Window
                 {
                     bgPath = Path.GetFullPath(Path.Combine(_paths.BaseDirectory, bgPath));
                 }
-                return File.Exists(bgPath) ? bgPath : null;
+
+                if (File.Exists(bgPath))
+                {
+                    return bgPath;
+                }
+
+                _logger.Warn(
+                    $"Configured background for tab '{title}' not found at '{bgPath}' "
+                    + $"(raw config value: '{preset.BackgroundPath}'). No background will be shown.");
+                return null;
             }
             catch (Exception exception) when (IsConfigurationException(exception))
             {
@@ -540,6 +601,20 @@ public partial class MainWindow : Window
         try
         {
             _presets = SanitizePresets(TabPresetConfig.Load(_tabPresetConfigPath));
+            if (_presets.Count == 0)
+            {
+                _logger.Info($"Tab presets reloaded: 0 entries (file may be empty or missing).");
+            }
+            else
+            {
+                foreach (var (name, preset) in _presets)
+                {
+                    _logger.Info(
+                        $"Tab preset loaded: '{name}' "
+                        + $"(bg={preset.BackgroundPath ?? "<none>"}, cover={preset.Cover}, "
+                        + $"cd={preset.WorkingDirectory ?? "<none>"}, run={preset.RunCommand ?? "<none>"}, fill={preset.FillCommand ?? "<none>"})");
+                }
+            }
         }
         catch (Exception exception) when (IsConfigurationException(exception))
         {

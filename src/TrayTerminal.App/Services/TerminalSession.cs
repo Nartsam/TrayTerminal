@@ -16,6 +16,7 @@ public sealed class TerminalSession : IAsyncDisposable
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly object _subscribeLock = new();
     private NamedPipeServerStream? _pipe;
     private Process? _hostProcess;
     private CancellationTokenSource? _cts;
@@ -38,6 +39,50 @@ public sealed class TerminalSession : IAsyncDisposable
     public bool IsRunning { get; private set; }
 
     public bool IsAdministrator => _request.RunAsAdministrator;
+
+    /// <summary>
+    /// Thread-safe subscribe to output events. The returned token must be disposed
+    /// to unsubscribe; otherwise the handler keeps the session alive.
+    /// </summary>
+    public IDisposable SubscribeOutput(EventHandler<byte[]> handler)
+    {
+        lock (_subscribeLock)
+        {
+            OutputReceived += handler;
+        }
+
+        return new OutputSubscription(this, handler);
+    }
+
+    private void UnsubscribeOutput(EventHandler<byte[]> handler)
+    {
+        lock (_subscribeLock)
+        {
+            OutputReceived -= handler;
+        }
+    }
+
+    private sealed class OutputSubscription : IDisposable
+    {
+        private TerminalSession? _session;
+        private EventHandler<byte[]>? _handler;
+
+        public OutputSubscription(TerminalSession session, EventHandler<byte[]> handler)
+        {
+            _session = session;
+            _handler = handler;
+        }
+
+        public void Dispose()
+        {
+            var handler = _handler;
+            _handler = null;
+            if (handler is not null)
+            {
+                Interlocked.Exchange(ref _session, null)?.UnsubscribeOutput(handler);
+            }
+        }
+    }
 
     public async Task StartAsync(int columns, int rows)
     {
@@ -228,8 +273,13 @@ public sealed class TerminalSession : IAsyncDisposable
                 switch (message.Value.Type)
                 {
                     case IpcMessageType.Output:
-                        OutputReceived?.Invoke(this, message.Value.Payload);
+                    {
+                        // Snapshot the delegate to avoid a null reference if handlers
+                        // are added/removed concurrently.
+                        var handler = OutputReceived;
+                        handler?.Invoke(this, message.Value.Payload);
                         break;
+                    }
 
                     case IpcMessageType.Exit:
                         IsRunning = false;
