@@ -226,8 +226,8 @@ public sealed class RemoteAccessService : IAsyncDisposable
 
         if (_app is not null)
         {
-            await _app.StopAsync(CancellationToken.None);
-            await _app.DisposeAsync();
+            try { await _app.StopAsync(CancellationToken.None); } catch { }
+            try { await _app.DisposeAsync(); } catch { }
         }
     }
 

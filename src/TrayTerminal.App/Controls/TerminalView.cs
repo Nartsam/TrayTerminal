@@ -34,12 +34,16 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             // remote-access bridges share that loop and must keep flowing.
             FullMode = BoundedChannelFullMode.DropOldest
         });
+    private const int MaxRenderCrashRetries = 5;
+    private static readonly TimeSpan RenderCrashResetWindow = TimeSpan.FromMinutes(5);
     private int _fontSize;
     private string? _backgroundImagePath;
     private int _backgroundCover;
     private bool _ready;
     private bool _disposed;
     private bool _scriptWriteFailing;
+    private int _renderCrashCount;
+    private long _lastRenderCrashTicks;
 
     public TerminalView(PortablePaths paths, TerminalSession session, FileLogger logger, int fontSize)
     {
@@ -49,6 +53,8 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         _fontSize = Math.Clamp(fontSize, 10, 32);
         Content = _webView;
     }
+
+    public event Action? OutputPumpStopped;
 
     public int Columns { get; private set; } = 120;
 
@@ -197,6 +203,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             if (!_disposed)
             {
                 _logger.Error(exception, "Terminal view output pump stopped unexpectedly.");
+                OutputPumpStopped?.Invoke();
             }
         }
     }
@@ -243,78 +250,90 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         _logger.Error($"WebView2 process failed for a terminal view: kind={e.ProcessFailedKind}, reason={e.Reason}, exitCode={e.ExitCode}.");
         if (!_disposed && e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited)
         {
-            // Reload restarts the crashed renderer; terminal.html posts "ready" again
-            // and OnWebMessageReceived reapplies the font size and background.
-            _webView.Reload();
+            var now = Environment.TickCount64;
+            if (now - _lastRenderCrashTicks > (long)RenderCrashResetWindow.TotalMilliseconds)
+                _renderCrashCount = 0;
+            _lastRenderCrashTicks = now;
+
+            if (++_renderCrashCount <= MaxRenderCrashRetries)
+            {
+                _webView.Reload();
+            }
+            else
+            {
+                _logger.Error("WebView2 renderer crash limit reached; giving up reload.");
+            }
         }
     }
 
     private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
-        using var document = JsonDocument.Parse(e.WebMessageAsJson);
-        var root = document.RootElement;
-        if (!root.TryGetProperty("type", out var typeProperty))
+        try
         {
-            return;
+            using var document = JsonDocument.Parse(e.WebMessageAsJson);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("type", out var typeProperty))
+            {
+                return;
+            }
+
+            switch (typeProperty.GetString())
+            {
+                case "ready":
+                    if (_ready)
+                    {
+                        try
+                        {
+                            await SetFontSizeAsync(_fontSize);
+                            await SetBackgroundImageWithErrorHandlingAsync(_backgroundImagePath, _backgroundCover);
+                        }
+                        catch (Exception exception)
+                        {
+                            _logger.Error(exception, "Failed to reapply terminal appearance after a WebView2 reload.");
+                        }
+                    }
+                    break;
+
+                case "input":
+                    if (root.TryGetProperty("data", out var data))
+                    {
+                        await _session.SendInputAsync(data.GetString() ?? string.Empty);
+                    }
+                    break;
+
+                case "copy":
+                    if (root.TryGetProperty("data", out var copyData))
+                    {
+                        SetClipboardText(copyData.GetString() ?? string.Empty);
+                    }
+                    break;
+
+                case "paste":
+                    var clipboardText = GetClipboardText();
+                    if (!string.IsNullOrEmpty(clipboardText))
+                    {
+                        if (IsMultilineText(clipboardText) && !ConfirmMultilinePaste(clipboardText))
+                        {
+                            break;
+                        }
+
+                        await PasteTextAsync(clipboardText);
+                    }
+                    break;
+
+                case "resize":
+                    if (root.TryGetProperty("cols", out var cols) && root.TryGetProperty("rows", out var rows))
+                    {
+                        Columns = Math.Clamp(cols.GetInt32(), 20, 500);
+                        Rows = Math.Clamp(rows.GetInt32(), 5, 200);
+                        await _session.ResizeAsync(Columns, Rows);
+                    }
+                    break;
+            }
         }
-
-        switch (typeProperty.GetString())
+        catch (Exception exception)
         {
-            case "ready":
-                // The first load is handled by InitializeAsync (where _ready is still
-                // false). A later "ready" means the renderer was reloaded after a
-                // crash — reapply per-tab appearance.
-                if (_ready)
-                {
-                    try
-                    {
-                        await SetFontSizeAsync(_fontSize);
-                        await SetBackgroundImageWithErrorHandlingAsync(_backgroundImagePath, _backgroundCover);
-                    }
-                    catch (Exception exception)
-                    {
-                        // The renderer may have died again mid-reapply; never let this
-                        // bubble into the dispatcher on an unattended machine.
-                        _logger.Error(exception, "Failed to reapply terminal appearance after a WebView2 reload.");
-                    }
-                }
-                break;
-
-            case "input":
-                if (root.TryGetProperty("data", out var data))
-                {
-                    await _session.SendInputAsync(data.GetString() ?? string.Empty);
-                }
-                break;
-
-            case "copy":
-                if (root.TryGetProperty("data", out var copyData))
-                {
-                    SetClipboardText(copyData.GetString() ?? string.Empty);
-                }
-                break;
-
-            case "paste":
-                var clipboardText = GetClipboardText();
-                if (!string.IsNullOrEmpty(clipboardText))
-                {
-                    if (IsMultilineText(clipboardText) && !ConfirmMultilinePaste(clipboardText))
-                    {
-                        break;
-                    }
-
-                    await PasteTextAsync(clipboardText);
-                }
-                break;
-
-            case "resize":
-                if (root.TryGetProperty("cols", out var cols) && root.TryGetProperty("rows", out var rows))
-                {
-                    Columns = Math.Clamp(cols.GetInt32(), 20, 500);
-                    Rows = Math.Clamp(rows.GetInt32(), 5, 200);
-                    await _session.ResizeAsync(Columns, Rows);
-                }
-                break;
+            _logger.Error(exception, "Failed to process WebView2 message.");
         }
     }
 

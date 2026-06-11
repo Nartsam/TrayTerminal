@@ -49,10 +49,11 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         _session.OutputReceived += (_, bytes) => _terminalView.EnqueueOutput(bytes);
         _session.Exited += (_, exitCode) =>
         {
-            Dispatcher.Invoke(() => _status.Text = $"进程已退出，代码 {exitCode}");
+            Dispatcher.BeginInvoke(() => _status.Text = $"进程已退出，代码 {exitCode}");
             Exited?.Invoke(this, exitCode);
         };
-        _session.Failed += (_, message) => Dispatcher.Invoke(() => _status.Text = message);
+        _session.Failed += (_, message) => Dispatcher.BeginInvoke(() => _status.Text = message);
+        _terminalView.OutputPumpStopped += () => Dispatcher.BeginInvoke(() => _status.Text = "终端输出已中断，建议重建标签页");
     }
 
     public event EventHandler<int>? Exited;

@@ -1,5 +1,6 @@
 using System.IO;
 using System.Windows;
+using System.Windows.Threading;
 using TrayTerminal.App.Dialogs;
 using TrayTerminal.Shared;
 
@@ -8,6 +9,7 @@ namespace TrayTerminal.App;
 public partial class App : System.Windows.Application
 {
     private FileLogger? _logger;
+    private Window? _errorDialog;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -43,8 +45,26 @@ public partial class App : System.Windows.Application
         DispatcherUnhandledException += (_, args) =>
         {
             _logger.Error(args.Exception, "Unhandled UI exception.");
-            AppMessageDialog.Info(MainWindow as Window ?? new Window(), args.Exception.Message);
             args.Handled = true;
+
+            var owner = MainWindow as Window;
+            if (owner is null) return;
+
+            _errorDialog?.Close();
+            _errorDialog = null;
+
+            var dialog = new AppMessageDialog(args.Exception.Message, ["确定"], owner);
+            _errorDialog = dialog;
+            dialog.Closed += (_, _) => { if (_errorDialog == dialog) _errorDialog = null; };
+            dialog.Show();
+
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(15) };
+            timer.Tick += (_, _) =>
+            {
+                timer.Stop();
+                try { dialog.Close(); } catch { }
+            };
+            timer.Start();
         };
 
         MainWindow = new MainWindow(paths, _logger);

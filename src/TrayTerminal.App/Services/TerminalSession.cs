@@ -15,6 +15,9 @@ public sealed class TerminalSession : IAsyncDisposable
     private const int InputChunkSize = 64 * 1024;
     private static readonly TimeSpan KillSendTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan ReaderStopTimeout = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(30);
+    private const int MaxMissedHeartbeats = 3;
 
     private readonly NewTerminalRequest _request;
     private readonly PortablePaths _paths;
@@ -26,8 +29,10 @@ public sealed class TerminalSession : IAsyncDisposable
     private Process? _hostProcess;
     private CancellationTokenSource? _cts;
     private Task? _readerTask;
+    private Task? _heartbeatTask;
     private bool _disposed;
     private int _terminated;
+    private long _lastResponseTicks;
 
     public TerminalSession(NewTerminalRequest request, PortablePaths paths, FileLogger logger)
     {
@@ -126,7 +131,9 @@ public sealed class TerminalSession : IAsyncDisposable
             _cts.Dispose();
             _cts = new CancellationTokenSource();
             IsRunning = true;
+            _lastResponseTicks = Environment.TickCount64;
             _readerTask = Task.Run(() => ReadLoopAsync(_cts.Token));
+            _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
         }
         catch (OperationCanceledException)
         {
@@ -220,6 +227,17 @@ public sealed class TerminalSession : IAsyncDisposable
             try
             {
                 await _readerTask.WaitAsync(ReaderStopTimeout);
+            }
+            catch
+            {
+            }
+        }
+
+        if (_heartbeatTask is not null)
+        {
+            try
+            {
+                await _heartbeatTask.WaitAsync(ReaderStopTimeout);
             }
             catch
             {
@@ -343,12 +361,12 @@ public sealed class TerminalSession : IAsyncDisposable
                     break;
                 }
 
+                Interlocked.Exchange(ref _lastResponseTicks, Environment.TickCount64);
+
                 switch (message.Value.Type)
                 {
                     case IpcMessageType.Output:
                     {
-                        // Snapshot the delegate to avoid a null reference if handlers
-                        // are added/removed concurrently.
                         var handler = OutputReceived;
                         handler?.Invoke(this, message.Value.Payload);
                         break;
@@ -361,6 +379,9 @@ public sealed class TerminalSession : IAsyncDisposable
 
                     case IpcMessageType.Error:
                         Failed?.Invoke(this, IpcProtocol.DecodeText(message.Value.Payload));
+                        break;
+
+                    case IpcMessageType.Heartbeat:
                         break;
                 }
             }
@@ -380,6 +401,54 @@ public sealed class TerminalSession : IAsyncDisposable
         {
             IsRunning = false;
             CompleteTermination();
+        }
+    }
+
+    private async Task HeartbeatLoopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var missed = 0;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(HeartbeatInterval, cancellationToken);
+                if (!IsRunning) break;
+
+                var before = Interlocked.Read(ref _lastResponseTicks);
+                await SendAsync(IpcMessage.Empty(IpcMessageType.Heartbeat), cancellationToken);
+
+                await Task.Delay(HeartbeatTimeout, cancellationToken);
+
+                var after = Interlocked.Read(ref _lastResponseTicks);
+                if (after > before)
+                {
+                    missed = 0;
+                    continue;
+                }
+
+                missed++;
+                _logger.Error($"Host missed heartbeat ({missed}/{MaxMissedHeartbeats}).");
+                if (missed >= MaxMissedHeartbeats)
+                {
+                    _logger.Error("Host unresponsive, terminating session.");
+                    IsRunning = false;
+                    Failed?.Invoke(this, "终端宿主进程无响应，已终止会话");
+                    _cts?.Cancel();
+                    try
+                    {
+                        if (_hostProcess is not null && !_hostProcess.HasExited)
+                            _hostProcess.Kill(entireProcessTree: true);
+                    }
+                    catch { }
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception exception)
+        {
+            if (!_disposed)
+                _logger.Error(exception, "Heartbeat loop failed.");
         }
     }
 
