@@ -94,7 +94,7 @@ public partial class MainWindow : Window
                 await CreateTabFromDialogAsync(useDefaults: true);
             }
 
-            if (RemoteSettings.Port > 0)
+            if (RemoteSettings.Port > 0 && RemoteSettings.AllowedTabs.Count > 0)
             {
                 try
                 {
@@ -124,6 +124,10 @@ public partial class MainWindow : Window
                         Close();
                     });
                 }
+            }
+            else
+            {
+                _logger.Info("Remote access is disabled because no tabs are allowed.");
             }
         };
         Closing += OnClosing;
