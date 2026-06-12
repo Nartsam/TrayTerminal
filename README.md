@@ -203,7 +203,7 @@ src/
 - `Services/InitConfig.cs`：容错解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
 - `Services/TabPresetConfig.cs`：容错解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
 - `Services/RemoteSettings.cs`：读取 `settings.txt` 中的远程访问配置（端口、令牌、允许列表）。
-- `Services/RemoteAccessService.cs`：嵌入式 Kestrel HTTP + WebSocket 服务器，管理远程访问生命周期。
+- `Services/RemoteAccessService.cs`：内置轻量 HTTP + WebSocket 服务器，管理远程访问生命周期；只依赖 .NET 桌面运行时，不依赖 ASP.NET Core Runtime。
 - `Services/RemoteTerminalBridge.cs`：单个远程浏览器 WebSocket 连接到终端会话的桥接器。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护命名管道 IPC，发送输入/resize/kill 并接收输出/退出/错误。
 - `Assets/remote-terminal.html`：远程浏览器加载的 xterm.js 终端页面，通过 WebSocket 通信。
@@ -311,6 +311,7 @@ publish\TrayTerminal\TrayTerminal.exe
 如果缺少运行时：
 
 - 缺少 .NET：启动时通常会提示需要安装 `.NET Desktop Runtime`，安装 .NET 10 Desktop Runtime x64 后重试。
+- 反复提示安装 .NET：先确认安装的是 **x64** 的 .NET 10 Desktop Runtime，而不是仅安装 SDK、普通 Runtime 或 x86 Runtime；可在目标机器运行 `dotnet --list-runtimes`，应能看到 `Microsoft.WindowsDesktop.App 10.x.x [C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App]`。TrayTerminal 的发布产物不应要求 `Microsoft.AspNetCore.App`，发布脚本会检查这一点。
 - 缺少 WebView2：WebView2 初始化会失败或窗口无法显示终端页面，安装 Microsoft Edge WebView2 Runtime 后重试。
 - 缺少 PowerShell 7：软件仍可使用 CMD/Windows PowerShell；安装 PowerShell 7 后重启软件即可自动检测。
 - 管理员终端无法启动：检查 UAC 是否被取消、Host 是否被安全软件拦截，以及 `Data\Logs\host-*.log` 中的错误信息。
@@ -327,9 +328,10 @@ publish\TrayTerminal\TrayTerminal.exe
 - 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
 - 终端输出到 WebView2 的写入经过 `TerminalView` 内部的有界队列（约 8 MB 上限），由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`。渲染进程卡死时丢弃最旧输出而不是无限排队，也不会阻塞会话读取循环（远程桥接共享该循环）。不要把输出改回逐块 fire-and-forget 的 `ExecuteScriptAsync`，那会在渲染端变慢时无界堆积。
 - `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）时自动 `Reload` 恢复，页面重新发出 `ready` 消息后会自动重新应用字号和背景（滚动缓冲区会丢失）。首次初始化等待 `ready` 有 30 秒超时，避免 WebView2 页面异常时新建标签永久挂起；其他失败类型只记日志。
-- 远程访问功能通过嵌入的 Kestrel（ASP.NET Core）实现。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
+- 远程访问功能通过 `RemoteAccessService` 内置的轻量 TCP HTTP/WebSocket 服务实现，避免把 `Microsoft.AspNetCore.App` 变成目标机器的额外运行时依赖。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
 - `TerminalSession` 暴露 `Completion`/`Terminated` 用于终端生命周期收口。正常退出、读循环结束、关闭标签、应用退出和启动失败清理都必须触发完成信号；远程桥接依赖它断开浏览器连接，避免旧 WebSocket 持有已结束的 session。
 - 本地和远程输入会在 `TerminalSession.SendInputAsync` 中按 64 KB 分片写入 IPC。不要绕过这里直接发送超大 `Input` 帧；`IpcProtocol.MaxPayloadLength` 是单帧硬上限，用于防止异常输入造成内存尖峰或 Host 会话中止。
 - `RemoteTerminalBridge` 把终端输出写入有界队列（512 块 ≈ 4 MB），由单一发送循环串行发送，单次发送超时 30 秒；队列写满、发送超时、终端结束或远程单条消息超过 16 MB 都会主动断开该连接。WebSocket 接受时设置了 `KeepAliveTimeout`，对端不回 pong 会被自动断开。不要把发送改回每块输出 fire-and-forget 的模式，那是慢速客户端导致内存无界增长的根源。
-- `RemoteAccessService` 在 `MainWindow.Closed` 时并发关闭所有活跃的 WebSocket 桥接再停止 Kestrel，避免大量远程连接让退出时间按连接数线性增长。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
+- `RemoteAccessService` 在 `MainWindow.Closed` 时先停止监听新连接，再并发关闭所有活跃的 WebSocket 桥接，并等待请求任务在固定超时内收口，避免大量远程连接让退出时间按连接数线性增长。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
+- `scripts/publish-portable.ps1` 发布后会检查 `TrayTerminal.runtimeconfig.json`，如果产物重新声明了 `Microsoft.AspNetCore.App` 依赖会直接失败。保持框架依赖发布即可，不要改成自包含发布。
 - `FileLogger.Write` 会静默吞掉写盘失败（磁盘满、文件被占用），日志失败永远不影响业务逻辑。`App.OnStartup` 注册了 `AppDomain.UnhandledException` 和 `TaskScheduler.UnobservedTaskException` 兜底记录，便于长期挂机后排查崩溃原因。

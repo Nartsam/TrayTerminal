@@ -42,4 +42,20 @@ dotnet publish (Join-Path $repoRoot "src\TrayTerminal.App\TrayTerminal.App.cspro
 
 Copy-Item -Path (Join-Path $hostPublish "*") -Destination $appPublish -Recurse -Force
 
+$runtimeConfigPath = Join-Path $appPublish "TrayTerminal.runtimeconfig.json"
+$runtimeConfig = Get-Content -Raw $runtimeConfigPath | ConvertFrom-Json
+$frameworks = @()
+if ($runtimeConfig.runtimeOptions.framework) {
+    $frameworks += $runtimeConfig.runtimeOptions.framework
+}
+if ($runtimeConfig.runtimeOptions.frameworks) {
+    $frameworks += $runtimeConfig.runtimeOptions.frameworks
+}
+
+$frameworkNames = @($frameworks | ForEach-Object { $_.name })
+if ($frameworkNames -contains "Microsoft.AspNetCore.App") {
+    throw "Unexpected Microsoft.AspNetCore.App runtime dependency in $runtimeConfigPath. TrayTerminal should only require the .NET Desktop Runtime."
+}
+
 Write-Host "Portable build written to $appPublish"
+Write-Host "Runtime dependencies: $($frameworkNames -join ', ')"
