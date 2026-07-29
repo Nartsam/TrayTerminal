@@ -16,12 +16,22 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     private readonly TextBlock _status;
     private bool _disposed;
 
-    public TerminalPage(NewTerminalRequest request, PortablePaths paths, FileLogger logger, int fontSize)
+    public TerminalPage(
+        NewTerminalRequest request,
+        PortablePaths paths,
+        FileLogger logger,
+        WebView2EnvironmentManager webView2EnvironmentManager,
+        int fontSize)
     {
         Title = request.Title;
         TerminalFontSize = fontSize;
         _session = new TerminalSession(request, paths, logger);
-        _terminalView = new TerminalView(paths, _session, logger, fontSize);
+        _terminalView = new TerminalView(
+            paths,
+            _session,
+            logger,
+            webView2EnvironmentManager,
+            fontSize);
         _status = new TextBlock
         {
             Text = request.RunAsAdministrator ? "准备启动管理员终端..." : "准备启动终端...",

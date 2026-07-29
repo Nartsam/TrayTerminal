@@ -53,6 +53,8 @@
       let ws = null;
       let reconnectTimer = null;
       let reconnectAttempts = 0;
+      let confirmNextKeyboardPaste = false;
+      const confirmedKeyboardPasteEvents = new WeakSet();
       const maxReconnectAttempts = 5;
 
       // Parse terminal name from path: /NapCat → NapCat
@@ -96,11 +98,6 @@
           typeof event.key === 'string' && event.key.toLowerCase() === key;
       }
 
-      function stopShortcut(event) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-
       function hasTextSelection() {
         if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
           return true;
@@ -137,28 +134,24 @@
 
       function handleClipboardShortcut(event) {
         if (isClipboardShortcut(event, 'v')) {
-          stopShortcut(event);
-          navigator.clipboard.readText()
-            .then(function(text) {
-              if (!text) return;
-              if (isMultiline(text)) {
-                var info = buildPastePreview(text);
-                var msg = '剪贴板内容包含 ' + info.lineCount + ' 行、' + info.charCount
-                  + ' 个字符，确定要粘贴到当前终端吗？\n预览如下'
-                  + (info.truncated ? '（已截断）' : '') + '：\n\n' + info.preview;
-                if (!window.confirm(msg)) return;
-              }
-              sendInput(text);
-            })
-            .catch(function() {});
+          confirmNextKeyboardPaste = true;
+          window.setTimeout(function() {
+            confirmNextKeyboardPaste = false;
+          }, 0);
+
+          // Returning false from xterm's custom key handler stops xterm from
+          // translating Ctrl+V into \x16, while leaving the DOM event untouched.
+          // The browser can then emit its trusted paste event even on LAN HTTP,
+          // where navigator.clipboard.readText() is unavailable.
           return true;
         }
 
         if (isClipboardShortcut(event, 'c')) {
           var selectedText = getSelectedText();
           if (selectedText) {
-            stopShortcut(event);
-            navigator.clipboard.writeText(selectedText).catch(function() {});
+            // xterm's hidden textarea handles the native copy event and places
+            // its canvas selection on the clipboard. Do not preventDefault here:
+            // programmatic Clipboard API access is blocked on plain HTTP.
             return true;
           }
           // No selection — let xterm.js handle Ctrl+C (sends \x03)
@@ -171,6 +164,31 @@
       function handleTerminalKeyEvent(event) {
         if (event.type !== 'keydown') return true;
         return !handleClipboardShortcut(event);
+      }
+
+      function confirmKeyboardPaste(event) {
+        if (!confirmNextKeyboardPaste) return;
+        confirmNextKeyboardPaste = false;
+
+        var text = event.clipboardData
+          ? event.clipboardData.getData('text/plain')
+          : '';
+        if (!text || !isMultiline(text)) return;
+
+        var info = buildPastePreview(text);
+        var msg = '剪贴板内容包含 ' + info.lineCount + ' 行、' + info.charCount
+          + ' 个字符，确定要粘贴到当前终端吗？\n预览如下'
+          + (info.truncated ? '（已截断）' : '') + '：\n\n' + info.preview;
+        if (window.confirm(msg)) {
+          confirmedKeyboardPasteEvents.add(event);
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+          event.stopImmediatePropagation();
+        }
       }
 
       function mapKey(event) {
@@ -338,7 +356,7 @@
             const text = event.clipboardData.getData('text/plain');
             if (!text) return;
             event.preventDefault();
-            if (isMultiline(text)) {
+            if (isMultiline(text) && !confirmedKeyboardPasteEvents.has(event)) {
               const info = buildPastePreview(text);
               const msg = '剪贴板内容包含 ' + info.lineCount + ' 行、' + info.charCount
                 + ' 个字符，确定要粘贴到当前终端吗？\n预览如下'
@@ -358,6 +376,9 @@
         connect();
       }
 
+      // Capture before xterm's textarea receives the paste so a rejected
+      // multiline keyboard paste never reaches the terminal session.
+      document.addEventListener('paste', confirmKeyboardPaste, true);
       document.addEventListener('DOMContentLoaded', initTerminal);
     })();
   </script>

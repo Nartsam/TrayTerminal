@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly IReadOnlyList<TerminalProfile> _profiles;
+    private readonly WebView2EnvironmentManager _webView2EnvironmentManager;
     private readonly string _tabPresetConfigPath;
     private readonly string _initConfigPath;
     private readonly NotifyIcon _trayIcon;
@@ -60,6 +61,7 @@ public partial class MainWindow : Window
         _paths = paths;
         _logger = logger;
         _profiles = TerminalProfileCatalog.Detect(paths);
+        _webView2EnvironmentManager = new WebView2EnvironmentManager(paths, logger);
         _tabPresetConfigPath = Path.Combine(paths.ConfigDirectory, "config.txt");
         _initConfigPath = Path.Combine(paths.ConfigDirectory, "init.txt");
         ReloadTabPresets();
@@ -248,7 +250,12 @@ public partial class MainWindow : Window
             request = request with { Profile = profile };
         }
 
-        var page = new TerminalPage(request, _paths, _logger, GetSelectedFontSize());
+        var page = new TerminalPage(
+            request,
+            _paths,
+            _logger,
+            _webView2EnvironmentManager,
+            GetSelectedFontSize());
         page.SetBackgroundImage(ResolveBackgroundImage(request.Title, preset), preset?.Cover ?? 0);
         var item = new TabItem
         {

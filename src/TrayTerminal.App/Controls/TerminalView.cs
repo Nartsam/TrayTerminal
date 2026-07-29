@@ -15,7 +15,10 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
 {
     private const int MaxPastePreviewCharacters = 1600;
     private const int MaxPastePreviewLines = 20;
+    private const int RpcEDisconnected = unchecked((int)0x80010108);
+    private const int WebViewInitializationAttempts = 3;
     private static readonly TimeSpan InitializationTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan InitializationRetryDelay = TimeSpan.FromMilliseconds(300);
     // The terminal host emits chunks of at most 8 KB, so 1024 queued chunks cap the
     // backlog at roughly 8 MB if the WebView2 renderer ever stalls.
     private const int OutputQueueCapacity = 1024;
@@ -23,7 +26,9 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     private readonly PortablePaths _paths;
     private readonly TerminalSession _session;
     private readonly FileLogger _logger;
-    private readonly WebView2 _webView = new();
+    private readonly WebView2EnvironmentManager _webView2EnvironmentManager;
+    private readonly SemaphoreSlim _webViewGate = new(1, 1);
+    private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly Channel<byte[]> _outputQueue = Channel.CreateBounded<byte[]>(
         new BoundedChannelOptions(OutputQueueCapacity)
         {
@@ -37,21 +42,34 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     private const int MaxRenderCrashRetries = 5;
     private static readonly TimeSpan RenderCrashResetWindow = TimeSpan.FromMinutes(5);
     private int _fontSize;
+    private WebView2? _webView;
+    private CoreWebView2? _coreWebView2;
+    private CoreWebView2Environment? _environment;
+    private TaskCompletionSource<WebView2> _webViewReady = CreateWebViewReadySource();
     private string? _backgroundImagePath;
+    private string? _pendingRecoveryReason;
     private int _backgroundCover;
     private bool _ready;
+    private bool _outputPumpStarted;
     private bool _disposed;
     private bool _scriptWriteFailing;
     private int _renderCrashCount;
+    private int _recoveryFailed;
     private long _lastRenderCrashTicks;
 
-    public TerminalView(PortablePaths paths, TerminalSession session, FileLogger logger, int fontSize)
+    public TerminalView(
+        PortablePaths paths,
+        TerminalSession session,
+        FileLogger logger,
+        WebView2EnvironmentManager webView2EnvironmentManager,
+        int fontSize)
     {
         _paths = paths;
         _session = session;
         _logger = logger;
+        _webView2EnvironmentManager = webView2EnvironmentManager;
         _fontSize = Math.Clamp(fontSize, 10, 32);
-        Content = _webView;
+        IsVisibleChanged += OnIsVisibleChanged;
     }
 
     public event Action? OutputPumpStopped;
@@ -67,15 +85,90 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             return;
         }
 
-        // WebView2 must use a fixed user-data folder to preserve the app's portable
-        // data policy; otherwise Edge would create profile data in the user's profile.
-        var environment = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDirectory);
-        await _webView.EnsureCoreWebView2Async(environment);
+        await _webViewGate.WaitAsync(_lifetimeCts.Token);
+        try
+        {
+            if (_ready)
+            {
+                return;
+            }
 
-        _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
-        _webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
-        _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-        _webView.CoreWebView2.ProcessFailed += OnProcessFailed;
+            await CreateAndInitializeWebViewAsync("initial terminal view initialization");
+            if (!_outputPumpStarted)
+            {
+                _outputPumpStarted = true;
+                // Started on the UI thread so every continuation resumes on the
+                // dispatcher, which WebView2 requires.
+                _ = PumpOutputAsync();
+            }
+        }
+        finally
+        {
+            _webViewGate.Release();
+        }
+    }
+
+    private async Task CreateAndInitializeWebViewAsync(string reason)
+    {
+        for (var attempt = 1; attempt <= WebViewInitializationAttempts; attempt++)
+        {
+            _lifetimeCts.Token.ThrowIfCancellationRequested();
+            MarkWebViewNotReady();
+
+            var webView = ReplaceCurrentWebView();
+            CoreWebView2Environment? environment = null;
+            try
+            {
+                // All tabs intentionally share this portable user-data folder and
+                // therefore one browser process. The manager invalidates that
+                // environment when the browser process exits.
+                environment = await _webView2EnvironmentManager.GetEnvironmentAsync();
+                _environment = environment;
+                await InitializeWebViewCoreAsync(webView, environment);
+                MarkWebViewReady(webView);
+                Interlocked.Exchange(ref _recoveryFailed, 0);
+
+                _logger.Info(
+                    $"Terminal WebView2 initialized on browser process "
+                    + $"{webView.CoreWebView2.BrowserProcessId} ({reason}).");
+                return;
+            }
+            catch (Exception exception)
+                when (IsBrowserDisconnected(exception) && attempt < WebViewInitializationAttempts)
+            {
+                if (environment is not null)
+                {
+                    _webView2EnvironmentManager.Invalidate(
+                        environment,
+                        $"initialization attempt {attempt} was disconnected");
+                }
+
+                _logger.Warn(
+                    $"WebView2 disconnected during {reason}; retrying with a new "
+                    + $"control and environment ({attempt}/{WebViewInitializationAttempts}).");
+                await Task.Delay(InitializationRetryDelay, _lifetimeCts.Token);
+            }
+        }
+
+        throw new InvalidOperationException("WebView2 initialization retry loop ended unexpectedly.");
+    }
+
+    private async Task InitializeWebViewCoreAsync(
+        WebView2 webView,
+        CoreWebView2Environment environment)
+    {
+        await webView.EnsureCoreWebView2Async(environment);
+        if (!ReferenceEquals(webView, _webView))
+        {
+            throw new OperationCanceledException("The WebView2 control was replaced during initialization.");
+        }
+
+        var coreWebView2 = webView.CoreWebView2;
+        _coreWebView2 = coreWebView2;
+        coreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+        coreWebView2.Settings.AreDevToolsEnabled = false;
+        coreWebView2.WebMessageReceived += OnWebMessageReceived;
+        coreWebView2.ProcessFailed += OnProcessFailed;
 
         var htmlPath = _paths.TerminalHtmlPath;
         if (!File.Exists(htmlPath))
@@ -84,14 +177,15 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
 
         var readyTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        // terminal.html posts a ready message after xterm/fallback input handlers exist.
-        // Starting ConPTY before this point can lose the first burst of shell output.
+        // terminal.html posts a ready message after xterm/fallback input handlers
+        // exist. Starting ConPTY before this point can lose initial shell output.
         void ReadyHandler(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
         {
             try
             {
                 using var document = JsonDocument.Parse(args.WebMessageAsJson);
-                if (document.RootElement.TryGetProperty("type", out var type) && type.GetString() == "ready")
+                if (document.RootElement.TryGetProperty("type", out var type)
+                    && type.GetString() == "ready")
                 {
                     readyTcs.TrySetResult();
                 }
@@ -103,37 +197,110 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
 
         try
         {
-            _webView.CoreWebView2.WebMessageReceived += ReadyHandler;
-            _webView.Source = new Uri(htmlPath);
-            await readyTcs.Task.WaitAsync(InitializationTimeout);
+            coreWebView2.WebMessageReceived += ReadyHandler;
+            webView.Source = new Uri(htmlPath);
+            await readyTcs.Task.WaitAsync(InitializationTimeout, _lifetimeCts.Token);
         }
-        catch (TimeoutException ex)
+        catch (TimeoutException exception)
         {
-            throw new TimeoutException("Timed out waiting for the terminal page to become ready.", ex);
+            throw new TimeoutException("Timed out waiting for the terminal page to become ready.", exception);
         }
         finally
         {
-            if (_webView.CoreWebView2 is not null)
+            coreWebView2.WebMessageReceived -= ReadyHandler;
+        }
+
+        await SetFontSizeAsync(webView, _fontSize);
+        await SetBackgroundImageWithErrorHandlingAsync(
+            webView,
+            _backgroundImagePath,
+            _backgroundCover);
+    }
+
+    private WebView2 ReplaceCurrentWebView()
+    {
+        DisposeCurrentWebView();
+
+        var webView = new WebView2();
+        _webView = webView;
+        Content = webView;
+        return webView;
+    }
+
+    private void DisposeCurrentWebView()
+    {
+        var webView = _webView;
+        var coreWebView2 = _coreWebView2;
+        _webView = null;
+        _coreWebView2 = null;
+        _environment = null;
+
+        if (coreWebView2 is not null)
+        {
+            try
             {
-                _webView.CoreWebView2.WebMessageReceived -= ReadyHandler;
+                coreWebView2.WebMessageReceived -= OnWebMessageReceived;
+                coreWebView2.ProcessFailed -= OnProcessFailed;
+            }
+            catch (Exception exception) when (IsBrowserDisconnected(exception))
+            {
+                // The closed COM proxy cannot retain live callbacks after its
+                // browser process has exited.
             }
         }
 
-        _ready = true;
-        // Started on the UI thread so every continuation resumes on the dispatcher,
-        // which WebView2 requires. The pump never throws (all failures are handled
-        // inside), so fire-and-forget is safe here.
-        _ = PumpOutputAsync();
-        await SetFontSizeAsync(_fontSize);
+        if (webView is null)
+        {
+            return;
+        }
+
+        if (ReferenceEquals(Content, webView))
+        {
+            Content = null;
+        }
+
         try
         {
-            await SetBackgroundImageAsync(_backgroundImagePath, _backgroundCover);
+            webView.Dispose();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (IsBrowserDisconnected(exception))
         {
-            System.Diagnostics.Debug.WriteLine(
-                $"TerminalView: failed to load background image '{_backgroundImagePath}': {ex.Message}");
+            // A browser-process crash already closed the controller. Disposal is
+            // still logically complete even if the COM proxy has disconnected.
         }
+    }
+
+    private void MarkWebViewNotReady()
+    {
+        _ready = false;
+        if (_webViewReady.Task.IsCompleted)
+        {
+            _webViewReady = CreateWebViewReadySource();
+        }
+    }
+
+    private void MarkWebViewReady(WebView2 webView)
+    {
+        _ready = true;
+        _webViewReady.TrySetResult(webView);
+    }
+
+    private static TaskCompletionSource<WebView2> CreateWebViewReadySource()
+    {
+        return new TaskCompletionSource<WebView2>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private static bool IsBrowserDisconnected(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current.HResult == RpcEDisconnected)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -175,25 +342,52 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                 }
 
                 var payload = JsonSerializer.Serialize(Convert.ToBase64String(batch.GetBuffer(), 0, (int)batch.Length));
-                try
+                var recoveryAttempts = 0;
+                while (!_disposed)
                 {
-                    await _webView.ExecuteScriptAsync($"window.trayTerminal.writeBase64({payload});");
-                    _scriptWriteFailing = false;
-                }
-                catch (Exception exception)
-                {
-                    if (_disposed)
+                    var webView = await WaitForReadyWebViewAsync();
+                    if (webView is null)
                     {
                         return;
                     }
 
-                    // The renderer may be gone (crash, reload in progress). Drop this
-                    // batch and keep pumping so output resumes once the view recovers;
-                    // log only the first failure of a streak to avoid log spam.
-                    if (!_scriptWriteFailing)
+                    try
                     {
-                        _scriptWriteFailing = true;
-                        _logger.Error(exception, "Terminal view failed to deliver output to WebView2; dropping output until the view recovers.");
+                        await webView.ExecuteScriptAsync($"window.trayTerminal.writeBase64({payload});");
+                        _scriptWriteFailing = false;
+                        break;
+                    }
+                    catch (Exception exception) when (IsBrowserDisconnected(exception))
+                    {
+                        if (++recoveryAttempts > WebViewInitializationAttempts
+                            || !await RecoverWebViewAsync(
+                                webView,
+                                "terminal output delivery was disconnected",
+                                exception))
+                        {
+                            return;
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        if (_disposed)
+                        {
+                            return;
+                        }
+
+                        // A renderer reload can reject an in-flight script without
+                        // closing the browser process. Drop only this batch and keep
+                        // the bounded output pump alive for the recovered page.
+                        if (!_scriptWriteFailing)
+                        {
+                            _scriptWriteFailing = true;
+                            _logger.Error(
+                                exception,
+                                "Terminal view failed to deliver output to WebView2; "
+                                + "dropping output until the view recovers.");
+                        }
+
+                        break;
                     }
                 }
             }
@@ -208,12 +402,128 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
+    private async Task<WebView2?> WaitForReadyWebViewAsync()
+    {
+        try
+        {
+            return await _webViewReady.Task.WaitAsync(_lifetimeCts.Token);
+        }
+        catch (OperationCanceledException) when (_disposed)
+        {
+            return null;
+        }
+    }
+
+    private async Task<bool> RecoverWebViewAsync(
+        WebView2 failedWebView,
+        string reason,
+        Exception? triggeringException = null)
+    {
+        try
+        {
+            await _webViewGate.WaitAsync(_lifetimeCts.Token);
+        }
+        catch (OperationCanceledException) when (_disposed)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (_disposed)
+            {
+                return false;
+            }
+
+            // Another ProcessFailed callback or script operation may already have
+            // recovered the shared view while this caller waited for the gate.
+            if (!ReferenceEquals(_webView, failedWebView))
+            {
+                return _ready;
+            }
+
+            var failedEnvironment = _environment;
+            MarkWebViewNotReady();
+            if (failedEnvironment is not null)
+            {
+                _webView2EnvironmentManager.Invalidate(failedEnvironment, reason);
+            }
+
+            // A TabControl removes non-selected content from its visible tree.
+            // Navigating a replacement WebView2 there can wait indefinitely for
+            // the page's ready message, so keep the terminal session and bounded
+            // output queue alive and recreate the view when the tab is selected.
+            if (!IsVisible)
+            {
+                if (_pendingRecoveryReason is null)
+                {
+                    _logger.Warn(
+                        $"Deferring terminal WebView2 recovery until its tab is visible: {reason}.");
+                }
+
+                _pendingRecoveryReason = reason;
+                return true;
+            }
+
+            _pendingRecoveryReason = null;
+            if (triggeringException is null)
+            {
+                _logger.Warn($"Recreating terminal WebView2 because {reason}.");
+            }
+            else
+            {
+                _logger.Warn(
+                    $"Recreating terminal WebView2 because {reason}: "
+                    + $"{triggeringException.Message}");
+            }
+
+            await CreateAndInitializeWebViewAsync($"recovery after {reason}");
+            _logger.Info("Terminal WebView2 recovery completed.");
+            return true;
+        }
+        catch (OperationCanceledException) when (_disposed)
+        {
+            return false;
+        }
+        catch (Exception exception)
+        {
+            _logger.Error(exception, $"Terminal WebView2 recovery failed after {reason}.");
+            if (Interlocked.Exchange(ref _recoveryFailed, 1) == 0)
+            {
+                OutputPumpStopped?.Invoke();
+            }
+
+            return false;
+        }
+        finally
+        {
+            _webViewGate.Release();
+        }
+    }
+
+    private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs args)
+    {
+        if (_disposed
+            || !IsVisible
+            || _pendingRecoveryReason is not { } reason
+            || _webView is not { } failedWebView)
+        {
+            return;
+        }
+
+        _pendingRecoveryReason = null;
+        _ = RecoverWebViewAsync(
+            failedWebView,
+            $"deferred recovery after {reason}");
+    }
+
     public void SetFontSize(int fontSize)
     {
         _fontSize = Math.Clamp(fontSize, 10, 32);
-        if (_ready && !_disposed)
+        var webView = _webView;
+        if (_ready && !_disposed && webView is not null)
         {
-            _ = SetFontSizeAsync(_fontSize);
+            _ = UpdateFontSizeAsync(webView, _fontSize);
         }
     }
 
@@ -221,9 +531,13 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     {
         _backgroundImagePath = imagePath;
         _backgroundCover = Math.Clamp(cover, 0, 100);
-        if (_ready && !_disposed)
+        var webView = _webView;
+        if (_ready && !_disposed && webView is not null)
         {
-            _ = SetBackgroundImageWithErrorHandlingAsync(_backgroundImagePath, _backgroundCover);
+            _ = UpdateBackgroundImageAsync(
+                webView,
+                _backgroundImagePath,
+                _backgroundCover);
         }
     }
 
@@ -235,20 +549,30 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
 
         _disposed = true;
+        IsVisibleChanged -= OnIsVisibleChanged;
+        _lifetimeCts.Cancel();
         _outputQueue.Writer.TryComplete();
-        if (_webView.CoreWebView2 is not null)
-        {
-            _webView.CoreWebView2.WebMessageReceived -= OnWebMessageReceived;
-            _webView.CoreWebView2.ProcessFailed -= OnProcessFailed;
-        }
-
-        _webView.Dispose();
+        DisposeCurrentWebView();
     }
 
     private void OnProcessFailed(object? sender, CoreWebView2ProcessFailedEventArgs e)
     {
+        var webView = _webView;
+        if (_disposed || webView is null || !ReferenceEquals(sender, _coreWebView2))
+        {
+            return;
+        }
+
         _logger.Error($"WebView2 process failed for a terminal view: kind={e.ProcessFailedKind}, reason={e.Reason}, exitCode={e.ExitCode}.");
-        if (!_disposed && e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited)
+        if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.BrowserProcessExited)
+        {
+            _ = RecoverWebViewAsync(
+                webView,
+                $"browser process exited ({e.Reason}, exit code {e.ExitCode})");
+            return;
+        }
+
+        if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited)
         {
             var now = Environment.TickCount64;
             if (now - _lastRenderCrashTicks > (long)RenderCrashResetWindow.TotalMilliseconds)
@@ -257,7 +581,17 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
 
             if (++_renderCrashCount <= MaxRenderCrashRetries)
             {
-                _webView.Reload();
+                try
+                {
+                    _coreWebView2?.Reload();
+                }
+                catch (Exception exception) when (IsBrowserDisconnected(exception))
+                {
+                    _ = RecoverWebViewAsync(
+                        webView,
+                        "renderer reload found a disconnected browser process",
+                        exception);
+                }
             }
             else
             {
@@ -270,6 +604,12 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     {
         try
         {
+            var webView = _webView;
+            if (webView is null || !ReferenceEquals(sender, _coreWebView2))
+            {
+                return;
+            }
+
             using var document = JsonDocument.Parse(e.WebMessageAsJson);
             var root = document.RootElement;
             if (!root.TryGetProperty("type", out var typeProperty))
@@ -284,8 +624,18 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                     {
                         try
                         {
-                            await SetFontSizeAsync(_fontSize);
-                            await SetBackgroundImageWithErrorHandlingAsync(_backgroundImagePath, _backgroundCover);
+                            await SetFontSizeAsync(webView, _fontSize);
+                            await SetBackgroundImageWithErrorHandlingAsync(
+                                webView,
+                                _backgroundImagePath,
+                                _backgroundCover);
+                        }
+                        catch (Exception exception) when (IsBrowserDisconnected(exception))
+                        {
+                            await RecoverWebViewAsync(
+                                webView,
+                                "appearance restore after reload was disconnected",
+                                exception);
                         }
                         catch (Exception exception)
                         {
@@ -337,12 +687,62 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
-    private async Task SetFontSizeAsync(int fontSize)
+    private async Task UpdateFontSizeAsync(WebView2 webView, int fontSize)
     {
-        await _webView.ExecuteScriptAsync($"window.trayTerminal.setFontSize({fontSize});");
+        try
+        {
+            await SetFontSizeAsync(webView, fontSize);
+        }
+        catch (Exception exception) when (IsBrowserDisconnected(exception))
+        {
+            await RecoverWebViewAsync(
+                webView,
+                "font-size update was disconnected",
+                exception);
+        }
+        catch (Exception exception)
+        {
+            if (!_disposed)
+            {
+                _logger.Error(exception, "Failed to update terminal font size.");
+            }
+        }
     }
 
-    private async Task SetBackgroundImageAsync(string? imagePath, int cover)
+    private async Task UpdateBackgroundImageAsync(
+        WebView2 webView,
+        string? imagePath,
+        int cover)
+    {
+        try
+        {
+            await SetBackgroundImageWithErrorHandlingAsync(webView, imagePath, cover);
+        }
+        catch (Exception exception) when (IsBrowserDisconnected(exception))
+        {
+            await RecoverWebViewAsync(
+                webView,
+                "background update was disconnected",
+                exception);
+        }
+        catch (Exception exception)
+        {
+            if (!_disposed)
+            {
+                _logger.Error(exception, "Failed to update terminal background.");
+            }
+        }
+    }
+
+    private static async Task SetFontSizeAsync(WebView2 webView, int fontSize)
+    {
+        await webView.ExecuteScriptAsync($"window.trayTerminal.setFontSize({fontSize});");
+    }
+
+    private static async Task SetBackgroundImageAsync(
+        WebView2 webView,
+        string? imagePath,
+        int cover)
     {
         // Read the image file and convert to a data: URL so the WebView2 engine does
         // not cache the image across tab creations or config changes.
@@ -366,15 +766,18 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
 
         var payload = JsonSerializer.Serialize(dataUri);
-        await _webView.ExecuteScriptAsync(
+        await webView.ExecuteScriptAsync(
             $"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});");
     }
 
-    private async Task SetBackgroundImageWithErrorHandlingAsync(string? imagePath, int cover)
+    private static async Task SetBackgroundImageWithErrorHandlingAsync(
+        WebView2 webView,
+        string? imagePath,
+        int cover)
     {
         try
         {
-            await SetBackgroundImageAsync(imagePath, cover);
+            await SetBackgroundImageAsync(webView, imagePath, cover);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -391,8 +794,29 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             return;
         }
 
+        var webView = _webView;
+        if (webView is null)
+        {
+            return;
+        }
+
         var payload = JsonSerializer.Serialize(text);
-        await _webView.ExecuteScriptAsync($"window.trayTerminal.pasteText({payload});");
+        try
+        {
+            await webView.ExecuteScriptAsync($"window.trayTerminal.pasteText({payload});");
+        }
+        catch (Exception exception) when (IsBrowserDisconnected(exception))
+        {
+            if (await RecoverWebViewAsync(
+                    webView,
+                    "paste operation was disconnected",
+                    exception)
+                && _webView is { } recoveredWebView)
+            {
+                await recoveredWebView.ExecuteScriptAsync(
+                    $"window.trayTerminal.pasteText({payload});");
+            }
+        }
     }
 
     private bool ConfirmMultilinePaste(string text)

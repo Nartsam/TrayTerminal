@@ -137,6 +137,7 @@ http://192.168.1.100:8443/ttyd?token=my_secret_token
 - 令牌错误或终端不在允许列表中会返回 403
 - 终端未运行会返回 404
 - 同时支持多个浏览器窗口连接到同一终端
+- 远程页面支持 `Ctrl+C` / `Ctrl+V`：有选区时 `Ctrl+C` 复制，无选区时仍向终端发送中断信号；`Ctrl+V` 使用浏览器原生粘贴事件，因此在局域网 HTTP 页面中不依赖受限的 Clipboard API
 
 ### 限制
 
@@ -203,6 +204,7 @@ src/
 - `Services/InitConfig.cs`：容错解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
 - `Services/TabPresetConfig.cs`：容错解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
 - `Services/RemoteSettings.cs`：读取 `settings.txt` 中的远程访问配置（端口、令牌、允许列表）。
+- `Services/WebView2EnvironmentManager.cs`：复用进程级 WebView2 环境，在共享浏览器进程退出后使旧环境失效，供终端视图重建恢复。
 - `Services/RemoteAccessService.cs`：内置轻量 HTTP + WebSocket 服务器，管理远程访问生命周期；只依赖 .NET 桌面运行时，不依赖 ASP.NET Core Runtime。
 - `Services/RemoteTerminalBridge.cs`：单个远程浏览器 WebSocket 连接到终端会话的桥接器。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护命名管道 IPC，发送输入/resize/kill 并接收输出/退出/错误。
@@ -327,7 +329,7 @@ publish\TrayTerminal\TrayTerminal.exe
 - `terminal.html` 同时支持 xterm.js 和 fallback 渲染；如果 xterm 静态文件缺失，仍能看到输出并测试 IPC。
 - 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
 - 终端输出到 WebView2 的写入经过 `TerminalView` 内部的有界队列（约 8 MB 上限），由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`。渲染进程卡死时丢弃最旧输出而不是无限排队，也不会阻塞会话读取循环（远程桥接共享该循环）。不要把输出改回逐块 fire-and-forget 的 `ExecuteScriptAsync`，那会在渲染端变慢时无界堆积。
-- `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）时自动 `Reload` 恢复，页面重新发出 `ready` 消息后会自动重新应用字号和背景（滚动缓冲区会丢失）。首次初始化等待 `ready` 有 30 秒超时，避免 WebView2 页面异常时新建标签永久挂起；其他失败类型只记日志。
+- `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）时自动 `Reload` 恢复；共享的主浏览器进程退出（`BrowserProcessExited`）或脚本调用返回 `RPC_E_DISCONNECTED` 时，会通过 `WebView2EnvironmentManager` 使旧环境失效并重建控件。不可见标签会把重建延迟到再次选中，期间终端会话和有界输出队列继续运行。页面重新发出 `ready` 消息后会自动应用字号和背景（滚动缓冲区会丢失）。首次初始化及断连重试仍有 30 秒 `ready` 超时，避免页面异常时永久挂起。
 - 远程访问功能通过 `RemoteAccessService` 内置的轻量 TCP HTTP/WebSocket 服务实现，避免把 `Microsoft.AspNetCore.App` 变成目标机器的额外运行时依赖。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
 - `TerminalSession` 暴露 `Completion`/`Terminated` 用于终端生命周期收口。正常退出、读循环结束、关闭标签、应用退出和启动失败清理都必须触发完成信号；远程桥接依赖它断开浏览器连接，避免旧 WebSocket 持有已结束的 session。
 - 本地和远程输入会在 `TerminalSession.SendInputAsync` 中按 64 KB 分片写入 IPC。不要绕过这里直接发送超大 `Input` 帧；`IpcProtocol.MaxPayloadLength` 是单帧硬上限，用于防止异常输入造成内存尖峰或 Host 会话中止。
