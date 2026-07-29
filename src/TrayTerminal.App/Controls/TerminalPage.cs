@@ -56,7 +56,7 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
 
         // EnqueueOutput is thread-safe and non-blocking, so the session read loop
         // never waits on the UI thread or the WebView2 renderer.
-        _session.OutputReceived += (_, bytes) => _terminalView.EnqueueOutput(bytes);
+        _session.OutputReceived += (_, output) => _terminalView.EnqueueOutput(output);
         _session.Exited += (_, exitCode) =>
         {
             Dispatcher.BeginInvoke(() => _status.Text = $"进程已退出，代码 {exitCode}");
@@ -83,7 +83,8 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     public async Task StartAsync()
     {
         await _terminalView.InitializeAsync();
-        await _session.StartAsync(_terminalView.Columns, _terminalView.Rows);
+        var size = _session.CurrentSize;
+        await _session.StartAsync(size.Columns, size.Rows);
         if (_session.IsRunning)
         {
             _status.Text = _session.IsAdministrator ? "管理员终端运行中" : "终端运行中";
@@ -121,8 +122,8 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         }
 
         _disposed = true;
-        await _session.DisposeAsync();
         _terminalView.Dispose();
+        await _session.DisposeAsync();
     }
 
     public void KillForShutdown()

@@ -61,6 +61,48 @@ public static class IpcProtocol
 
     public static string DecodeText(byte[] payload) => Encoding.UTF8.GetString(payload);
 
+    public static byte[] EncodeInput(long requestId, ReadOnlySpan<byte> data)
+    {
+        if (data.Length > MaxPayloadLength - sizeof(long))
+        {
+            throw new InvalidDataException($"Input payload length exceeds the limit: {data.Length}");
+        }
+
+        var payload = new byte[sizeof(long) + data.Length];
+        BinaryPrimitives.WriteInt64LittleEndian(payload, requestId);
+        data.CopyTo(payload.AsSpan(sizeof(long)));
+        return payload;
+    }
+
+    public static (long RequestId, ReadOnlyMemory<byte> Data) DecodeInput(byte[] payload)
+    {
+        if (payload.Length < sizeof(long))
+        {
+            throw new InvalidDataException($"Input payload must be at least 8 bytes, got {payload.Length}.");
+        }
+
+        return (
+            BinaryPrimitives.ReadInt64LittleEndian(payload),
+            payload.AsMemory(sizeof(long)));
+    }
+
+    public static byte[] EncodeRequestId(long requestId)
+    {
+        var payload = new byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64LittleEndian(payload, requestId);
+        return payload;
+    }
+
+    public static long DecodeRequestId(byte[] payload)
+    {
+        if (payload.Length != sizeof(long))
+        {
+            throw new InvalidDataException($"Request ID payload must be 8 bytes, got {payload.Length}.");
+        }
+
+        return BinaryPrimitives.ReadInt64LittleEndian(payload);
+    }
+
     public static byte[] EncodeResize(int columns, int rows)
     {
         var payload = new byte[8];

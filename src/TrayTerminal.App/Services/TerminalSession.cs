@@ -7,32 +7,49 @@ using System.Text;
 using TrayTerminal.App.Dialogs;
 using TrayTerminal.Shared;
 using TrayTerminal.Shared.Ipc;
+using TrayTerminal.Shared.Terminal;
 
 namespace TrayTerminal.App.Services;
 
 public sealed class TerminalSession : IAsyncDisposable
 {
     private const int InputChunkSize = 64 * 1024;
+    private const int MaxQueuedInputOperations = 64;
+    private const int MaxInputOperationBytes = 4 * 1024 * 1024;
+    private const int MaxQueuedInputBytes = 16 * 1024 * 1024;
     private static readonly TimeSpan KillSendTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan ReaderStopTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan InputAckTimeout = TimeSpan.FromSeconds(30);
     private const int MaxMissedHeartbeats = 3;
 
     private readonly NewTerminalRequest _request;
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly SemaphoreSlim _inputGate = new(1, 1);
+    private readonly SemaphoreSlim _resizeGate = new(1, 1);
     private readonly object _subscribeLock = new();
+    private readonly object _sizeLock = new();
+    private readonly object _inputQueueLock = new();
     private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TerminalStateHub _stateHub = new();
+    private readonly TerminalSizeCoordinator _sizeCoordinator = new();
+    private readonly InputAckRegistry _pendingInputs = new();
     private NamedPipeServerStream? _pipe;
     private Process? _hostProcess;
     private CancellationTokenSource? _cts;
     private Task? _readerTask;
     private Task? _heartbeatTask;
     private bool _disposed;
+    private int _disposeStarted;
     private int _terminated;
     private long _lastResponseTicks;
+    private long _nextInputRequestId;
+    private long _latestSizeRevision;
+    private int _queuedInputOperations;
+    private int _queuedInputBytes;
 
     public TerminalSession(NewTerminalRequest request, PortablePaths paths, FileLogger logger)
     {
@@ -41,7 +58,9 @@ public sealed class TerminalSession : IAsyncDisposable
         _logger = logger;
     }
 
-    public event EventHandler<byte[]>? OutputReceived;
+    public event EventHandler<TerminalOutput>? OutputReceived;
+
+    public event EventHandler<TerminalSizeUpdate>? SizeChanged;
 
     public event EventHandler<int>? Exited;
 
@@ -59,7 +78,7 @@ public sealed class TerminalSession : IAsyncDisposable
     /// Thread-safe subscribe to output events. The returned token must be disposed
     /// to unsubscribe; otherwise the handler keeps the session alive.
     /// </summary>
-    public IDisposable SubscribeOutput(EventHandler<byte[]> handler)
+    public IDisposable SubscribeOutput(EventHandler<TerminalOutput> handler)
     {
         lock (_subscribeLock)
         {
@@ -69,7 +88,7 @@ public sealed class TerminalSession : IAsyncDisposable
         return new OutputSubscription(this, handler);
     }
 
-    private void UnsubscribeOutput(EventHandler<byte[]> handler)
+    private void UnsubscribeOutput(EventHandler<TerminalOutput> handler)
     {
         lock (_subscribeLock)
         {
@@ -80,9 +99,9 @@ public sealed class TerminalSession : IAsyncDisposable
     private sealed class OutputSubscription : IDisposable
     {
         private TerminalSession? _session;
-        private EventHandler<byte[]>? _handler;
+        private EventHandler<TerminalOutput>? _handler;
 
-        public OutputSubscription(TerminalSession session, EventHandler<byte[]> handler)
+        public OutputSubscription(TerminalSession session, EventHandler<TerminalOutput> handler)
         {
             _session = session;
             _handler = handler;
@@ -134,6 +153,17 @@ public sealed class TerminalSession : IAsyncDisposable
             _lastResponseTicks = Environment.TickCount64;
             _readerTask = Task.Run(() => ReadLoopAsync(_cts.Token));
             _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
+            var currentSize = CurrentSize;
+            if (currentSize.Columns != columns || currentSize.Rows != rows)
+            {
+                await SendAsync(
+                    new IpcMessage(
+                        IpcMessageType.Resize,
+                        IpcProtocol.EncodeResize(
+                            currentSize.Columns,
+                            currentSize.Rows)),
+                    _cts.Token);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -157,34 +187,341 @@ public sealed class TerminalSession : IAsyncDisposable
 
     public async Task SendInputAsync(string text)
     {
+        await TrySendInputAsync(text);
+    }
+
+    public async Task<bool> TrySendInputAsync(string text)
+    {
         if (string.IsNullOrEmpty(text))
+        {
+            return true;
+        }
+
+        var inputByteCount = Encoding.UTF8.GetByteCount(text);
+        if (inputByteCount > MaxInputOperationBytes)
+        {
+            return false;
+        }
+
+        lock (_inputQueueLock)
+        {
+            if (_queuedInputOperations >= MaxQueuedInputOperations
+                || _queuedInputBytes > MaxQueuedInputBytes - inputByteCount)
+            {
+                return false;
+            }
+
+            _queuedInputOperations++;
+            _queuedInputBytes += inputByteCount;
+        }
+
+        var gateEntered = false;
+        try
+        {
+            await _inputGate.WaitAsync(GetSessionToken());
+            gateEntered = true;
+
+            var bytes = Encoding.UTF8.GetBytes(text);
+            for (var offset = 0; offset < bytes.Length; offset += InputChunkSize)
+            {
+                var length = Math.Min(InputChunkSize, bytes.Length - offset);
+                var requestId = Interlocked.Increment(ref _nextInputRequestId);
+                if (requestId <= 0)
+                {
+                    return false;
+                }
+
+                if (!_pendingInputs.TryRegister(requestId, out var completion))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    var payload = IpcProtocol.EncodeInput(
+                        requestId,
+                        bytes.AsSpan(offset, length));
+                    if (!await SendAsync(new IpcMessage(IpcMessageType.Input, payload)))
+                    {
+                        return false;
+                    }
+
+                    using var ackCts = CancellationTokenSource.CreateLinkedTokenSource(
+                        GetSessionToken());
+                    ackCts.CancelAfter(InputAckTimeout);
+                    if (!await completion.WaitAsync(ackCts.Token))
+                    {
+                        return false;
+                    }
+                }
+                finally
+                {
+                    _pendingInputs.Remove(requestId);
+                }
+            }
+
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                try
+                {
+                    _inputGate.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+
+            lock (_inputQueueLock)
+            {
+                _queuedInputOperations--;
+                _queuedInputBytes -= inputByteCount;
+            }
+        }
+    }
+
+    public TerminalSize CurrentSize
+    {
+        get
+        {
+            lock (_sizeLock)
+            {
+                return _sizeCoordinator.CurrentSize;
+            }
+        }
+    }
+
+    public bool HasRecoverableState => _stateHub.HasRecoverableState;
+
+    public Guid RegisterTerminalClient(
+        TerminalClientKind kind,
+        bool isVisible,
+        int columns,
+        int rows)
+    {
+        var clientId = Guid.NewGuid();
+        TerminalSizeUpdate update;
+        lock (_sizeLock)
+        {
+            update = _sizeCoordinator.Register(
+                clientId,
+                kind,
+                isVisible,
+                columns,
+                rows);
+            _latestSizeRevision = update.Revision;
+        }
+
+        _ = ApplySizeUpdateAsync(update);
+        return clientId;
+    }
+
+    public Task RequestResizeAsync(Guid clientId, int columns, int rows)
+    {
+        TerminalSizeUpdate update;
+        lock (_sizeLock)
+        {
+            update = _sizeCoordinator.RequestResize(clientId, columns, rows);
+            _latestSizeRevision = update.Revision;
+        }
+
+        return ApplySizeUpdateAsync(update);
+    }
+
+    public Task SetLocalClientVisibilityAsync(
+        Guid clientId,
+        bool isVisible,
+        int columns,
+        int rows)
+    {
+        TerminalSizeUpdate update;
+        lock (_sizeLock)
+        {
+            update = _sizeCoordinator.SetLocalVisibility(
+                clientId,
+                isVisible,
+                columns,
+                rows);
+            _latestSizeRevision = update.Revision;
+        }
+
+        return ApplySizeUpdateAsync(update);
+    }
+
+    public Task UnregisterTerminalClientAsync(Guid clientId)
+    {
+        TerminalSizeUpdate update;
+        lock (_sizeLock)
+        {
+            update = _sizeCoordinator.Unregister(clientId);
+            _latestSizeRevision = update.Revision;
+        }
+
+        return ApplySizeUpdateAsync(update);
+    }
+
+    public bool IsSizeOwner(Guid clientId)
+    {
+        lock (_sizeLock)
+        {
+            return _sizeCoordinator.OwnerId == clientId;
+        }
+    }
+
+    public TerminalSizeUpdate GetCurrentSizeUpdate()
+    {
+        lock (_sizeLock)
+        {
+            return new TerminalSizeUpdate(
+                _sizeCoordinator.CurrentSize,
+                _sizeCoordinator.OwnerId,
+                SizeChanged: false,
+                OwnerChanged: false,
+                Revision: _sizeCoordinator.Revision);
+        }
+    }
+
+    public bool TryOpenRemoteStream(out TerminalStateSubscription? subscription)
+    {
+        lock (_sizeLock)
+        {
+            if (!_stateHub.TrySubscribe(out subscription)
+                || subscription is null)
+            {
+                return false;
+            }
+
+            if (subscription.InitialState.Snapshot.Size
+                == _sizeCoordinator.CurrentSize)
+            {
+                return true;
+            }
+
+            subscription.Dispose();
+            subscription = null;
+            return false;
+        }
+    }
+
+    public bool TryGetRecoveryState(out TerminalInitialState? state)
+    {
+        lock (_sizeLock)
+        {
+            if (!_stateHub.TryGetRecoveryState(out state)
+                || state is null
+                || state.Snapshot.Size != _sizeCoordinator.CurrentSize)
+            {
+                state = null;
+                return false;
+            }
+
+            return true;
+        }
+    }
+
+    public bool TryAcceptSnapshot(
+        long sequence,
+        byte[] snapshot,
+        int columns,
+        int rows)
+    {
+        var snapshotSize = TerminalSize.Clamp(columns, rows);
+        lock (_sizeLock)
+        {
+            if (snapshotSize != _sizeCoordinator.CurrentSize)
+            {
+                return false;
+            }
+
+            return _stateHub.TryAcceptSnapshot(
+                sequence,
+                snapshot,
+                snapshotSize);
+        }
+    }
+
+    private async Task ApplySizeUpdateAsync(TerminalSizeUpdate update)
+    {
+        if (!update.ShouldBroadcast)
         {
             return;
         }
 
-        var bytes = Encoding.UTF8.GetBytes(text);
-        for (var offset = 0; offset < bytes.Length; offset += InputChunkSize)
+        try
         {
-            var length = Math.Min(InputChunkSize, bytes.Length - offset);
-            var chunk = new byte[length];
-            Buffer.BlockCopy(bytes, offset, chunk, 0, length);
-            await SendAsync(new IpcMessage(IpcMessageType.Input, chunk));
+            await _resizeGate.WaitAsync(GetSessionToken());
         }
-    }
-
-    public Task ResizeAsync(int columns, int rows)
-    {
-        if (!IsRunning)
+        catch (OperationCanceledException)
         {
-            return Task.CompletedTask;
+            return;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
         }
 
-        return SendAsync(new IpcMessage(IpcMessageType.Resize, IpcProtocol.EncodeResize(columns, rows)));
+        try
+        {
+            if (update.Revision != Volatile.Read(ref _latestSizeRevision))
+            {
+                return;
+            }
+
+            if (update.SizeChanged)
+            {
+                _stateHub.InvalidateCheckpoint();
+            }
+
+            if (IsRunning)
+            {
+                var sent = await SendAsync(
+                    new IpcMessage(
+                        IpcMessageType.Resize,
+                        IpcProtocol.EncodeResize(
+                            update.Size.Columns,
+                            update.Size.Rows)));
+                if (!sent)
+                {
+                    return;
+                }
+            }
+
+            var handler = SizeChanged;
+            handler?.Invoke(this, update);
+        }
+        catch (Exception exception)
+        {
+            if (!_disposed)
+            {
+                _logger.Error(exception, "Failed to apply terminal size ownership update.");
+            }
+        }
+        finally
+        {
+            try
+            {
+                _resizeGate.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
         {
             return;
         }
@@ -245,8 +582,11 @@ public sealed class TerminalSession : IAsyncDisposable
         }
 
         _hostProcess?.Dispose();
+        _stateHub.Dispose();
         _cts?.Dispose();
         _sendGate.Dispose();
+        _inputGate.Dispose();
+        _resizeGate.Dispose();
         CompleteTermination();
     }
 
@@ -367,8 +707,9 @@ public sealed class TerminalSession : IAsyncDisposable
                 {
                     case IpcMessageType.Output:
                     {
+                        var output = _stateHub.Publish(message.Value.Payload);
                         var handler = OutputReceived;
-                        handler?.Invoke(this, message.Value.Payload);
+                        handler?.Invoke(this, output);
                         break;
                     }
 
@@ -383,6 +724,13 @@ public sealed class TerminalSession : IAsyncDisposable
 
                     case IpcMessageType.Heartbeat:
                         break;
+
+                    case IpcMessageType.InputAck:
+                    {
+                        var requestId = IpcProtocol.DecodeRequestId(message.Value.Payload);
+                        _pendingInputs.TryAcknowledge(requestId);
+                        break;
+                    }
                 }
             }
         }
@@ -452,11 +800,11 @@ public sealed class TerminalSession : IAsyncDisposable
         }
     }
 
-    private async Task SendAsync(IpcMessage message, CancellationToken cancellationToken = default)
+    private async Task<bool> SendAsync(IpcMessage message, CancellationToken cancellationToken = default)
     {
         if (_disposed || _pipe is null || !_pipe.IsConnected)
         {
-            return;
+            return false;
         }
 
         using var linkedCts = CreateLinkedSessionToken(cancellationToken);
@@ -472,29 +820,34 @@ public sealed class TerminalSession : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            return;
+            return false;
         }
         catch (ObjectDisposedException)
         {
-            return;
+            return false;
         }
 
         try
         {
             await IpcProtocol.WriteAsync(_pipe, message, effectiveToken);
+            return true;
         }
         catch (OperationCanceledException)
         {
+            return false;
         }
         catch (IOException)
         {
+            return false;
         }
         catch (InvalidDataException exception)
         {
             _logger.Error(exception, "IPC send was rejected.");
+            return false;
         }
         catch (ObjectDisposedException)
         {
+            return false;
         }
         finally
         {
@@ -537,6 +890,8 @@ public sealed class TerminalSession : IAsyncDisposable
         {
             return;
         }
+
+        _pendingInputs.FailAll();
 
         _completion.TrySetResult();
 

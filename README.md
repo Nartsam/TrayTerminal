@@ -136,16 +136,21 @@ http://192.168.1.100:8443/ttyd?token=my_secret_token
 - 如果未配置令牌，可省略 `?token=` 部分，直接访问 `http://192.168.1.100:8443/ttyd`
 - 令牌错误或终端不在允许列表中会返回 403
 - 终端未运行会返回 404
-- 同时支持多个浏览器窗口连接到同一终端
+- 同一终端最多同时连接 8 个浏览器窗口，整个应用最多 32 个远程连接
 - 远程页面支持 `Ctrl+C` / `Ctrl+V`：有选区时 `Ctrl+C` 复制，无选区时仍向终端发送中断信号；`Ctrl+V` 使用浏览器原生粘贴事件，因此在局域网 HTTP 页面中不依赖受限的 Clipboard API
+- 新连接和重连会先恢复权威 xterm.js 状态快照，再按单调输出序列衔接快照后的输出与实时输出；浏览器会校验每个序列号，发现缺口时主动断开重连，不会继续显示一个悄悄损坏的终端状态
+- 浏览器输入带有 `inputId`。只有 Host 已把对应字节写入 ConPTY 输入管道后，页面才会收到成功确认；如果前台程序暂时不读取输入，页面会明确提示“已写入但屏幕尚无变化”，不会在浏览器中伪造本地回显
 
 ### 限制
 
-- **无历史输出**：远程浏览器只能看到连接建立之后的新输出，看不到连接前的终端历史。这是设计决定，不是 bug
+- **快照历史有界**：远程连接会恢复当前屏幕、终端模式及最近最多 256 行滚动历史，而不是保存进程启动以来的无限原始输出。本地终端仍保留 5000 行滚动缓冲
+- **灾难性恢复失败需要重建标签页**：每个会话最多保留 8 MB 快照，以及最多 8 MB、4096 块的快照后输出。WebView2 正常崩溃时会从有效快照和完整尾流自动重建；但如果标签不可见期间权威渲染器崩溃，且尾流在它恢复前超过任一硬上限，旧快照会被原子标记为无效。此时已经没有任何组件持有可证明连续的 VT 状态，本地会提示“终端输出已中断，建议重建标签页”，远程页面会停止重连并提示在主程序中重建该标签页，绝不会从空白或有缺口的状态继续
+- **尺寸只有一个 owner**：本地终端可见时由本地窗口决定 ConPTY 尺寸；应用隐藏到托盘或标签不可见时，由最早连接的远程浏览器持有尺寸租约。owner 断开后租约按连接顺序移交，接受的尺寸会广播给本地和所有远程渲染器，非 owner 的 resize 请求只作为其将来接管时的候选尺寸
 - **无输入冲突处理**：本地和远程可以同时在同一个终端中输入，等价于两个键盘同时插在一台电脑上。若需协调操作，请自行约定
-- **慢速/失联客户端会被自动断开**：服务端为每个远程连接维护约 4 MB 的输出缓冲并限制单次发送 30 秒超时，同时启用 WebSocket 心跳检测（每 30 秒 ping，20 秒内未收到 pong 即断开）。跟不上输出速度或已失联的浏览器连接会被服务端主动断开，以保证主程序长期运行时内存不会无界增长；浏览器页面会自动尝试重连（最多 5 次，刷新页面可重置）
+- **慢速/失联客户端会被自动断开**：每个远程状态订阅和 WebSocket 发送队列都是 512 块的硬上限，单次发送超时 30 秒，同时启用 WebSocket 心跳检测（每 30 秒 ping，20 秒内未收到 pong 即断开）。任一队列写满、序列不连续或连接失联都会主动断开，以保证主程序长期运行时内存不会无界增长；普通断线时浏览器页面会自动尝试重连（最多 5 次，刷新页面可重置）
+- **HTTP 请求总数有硬上限**：从 TCP 接受开始计算，整个服务最多同时处理 64 个请求（其中 WebSocket 仍受 32 个连接上限约束）；请求头必须在 10 秒内读完，超限的新连接立即关闭，慢速请求不会形成无界任务或长期占满服务
 - **终端结束会断开远程连接**：终端进程退出、标签被关闭或应用正在退出时，服务端会主动关闭对应的远程 WebSocket，避免浏览器窗口继续持有已经结束的终端会话
-- **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的 IPC 层按块发送，避免单次大粘贴超过 IPC 帧上限导致终端会话异常结束；远程浏览器单条 WebSocket 消息仍有 16 MB 上限，超过时该连接会被断开
+- **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的 IPC 层按 64 KB 分片并逐块等待 ConPTY 写入确认；单个远程输入限制为 1 MB，任一输入操作限制为 4 MB，远程单条 WebSocket 消息限制为 16 MB。每个会话最多保留 64 个、合计 16 MB 的等待输入操作，超限会立即失败而不是继续占用内存
 - **不显示背景图**：远程浏览器无法访问本机的 `Backgrounds` 目录，因此不会显示终端背景图
 - **HTTP 明文传输**：所有数据（包括令牌）通过 HTTP 明文传输。该功能设计用于可信局域网环境，不建议暴露到公网
 - **浏览器依赖**：需要浏览器支持 WebSocket。所有现代浏览器均支持
@@ -179,6 +184,7 @@ src/
 ### `scripts`
 
 - `scripts/publish-portable.ps1`：发布脚本。先发布 Host，再发布 App，最后把 Host 输出复制到 `publish\TrayTerminal`，形成可直接运行的便携目录。
+- `scripts/test-remote-protocol.cjs`：使用 Node.js 验证远程浏览器必须等待 xterm 写入回调，才能依次处理 size 和 `syncComplete`。
 
 ### `src/TrayTerminal.App`
 
@@ -190,8 +196,9 @@ src/
 - `MainWindow.xaml.cs`：标签创建、重命名、配置重载、背景匹配、托盘行为、关闭确认等主界面逻辑。
 - `Assets/app.ico`：应用窗口、任务栏和托盘图标。
 - `Assets/terminal.html`：WebView2 加载的终端页面，承载 xterm.js、键盘输入、resize、背景图和轻量 fallback 渲染。
-- `Assets/xterm/xterm.css`：xterm.js 样式文件。
-- `Assets/xterm/xterm.js`：xterm.js 脚本文件。
+- `Assets/remote-protocol.js`：远程页面的逐连接串行消息处理器，保证异步 xterm 写入不会被后续协议消息越过。
+- `Assets/xterm/xterm.css`、`xterm.js`：锁定的 `@xterm/xterm` 5.5.0 官方静态文件。
+- `Assets/xterm/addon-serialize.js`：锁定的 `@xterm/addon-serialize` 0.13.0，用于生成可恢复 VT 快照；具体来源、SHA-256 和 MIT 许可证见同目录 `THIRD-PARTY-NOTICES.md`、`LICENSE`。
 - `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、状态栏、TerminalSession 和 TerminalView。
 - `Controls/TerminalView.cs`：WebView2 终端控件，负责加载 `terminal.html`，把前端输入/resize 转给后端，把后端输出写回 xterm.js。
 - `Dialogs/AppMessageDialog.xaml`：自定义消息对话框界面，替代系统 MessageBox（无系统音效）。
@@ -326,14 +333,14 @@ publish\TrayTerminal\TrayTerminal.exe
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
 - `ConPtySession.Start` 在每个 Win32 创建步骤之间都必须保持失败路径可释放：管道句柄、伪控制台、attribute list、Job Object 和 FileStream 的所有权转移不要简化，否则反复创建失败的终端可能泄漏句柄。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。
-- `terminal.html` 同时支持 xterm.js 和 fallback 渲染；如果 xterm 静态文件缺失，仍能看到输出并测试 IPC。
+- `terminal.html` 保留轻量 fallback 用于显示静态加载错误，但可恢复状态依赖锁定版本的 xterm.js + SerializeAddon；这两个静态文件缺失或不兼容时终端初始化必须失败，不能让不完整的 fallback 状态冒充权威状态。
 - 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
-- 终端输出到 WebView2 的写入经过 `TerminalView` 内部的有界队列（约 8 MB 上限），由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`。渲染进程卡死时丢弃最旧输出而不是无限排队，也不会阻塞会话读取循环（远程桥接共享该循环）。不要把输出改回逐块 fire-and-forget 的 `ExecuteScriptAsync`，那会在渲染端变慢时无界堆积。
-- `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）时自动 `Reload` 恢复；共享的主浏览器进程退出（`BrowserProcessExited`）或脚本调用返回 `RPC_E_DISCONNECTED` 时，会通过 `WebView2EnvironmentManager` 使旧环境失效并重建控件。不可见标签会把重建延迟到再次选中，期间终端会话和有界输出队列继续运行。页面重新发出 `ready` 消息后会自动应用字号和背景（滚动缓冲区会丢失）。首次初始化及断连重试仍有 30 秒 `ready` 超时，避免页面异常时永久挂起。
-- 远程访问功能通过 `RemoteAccessService` 内置的轻量 TCP HTTP/WebSocket 服务实现，避免把 `Microsoft.AspNetCore.App` 变成目标机器的额外运行时依赖。`TerminalSession` 的 `SubscribeOutput` 方法提供线程安全的输出订阅，`RemoteTerminalBridge` 在断开时必须取消订阅以避免内存泄漏和崩溃。
+- 终端输出由 `TerminalStateHub` 分配单调序列，并保存最多 8 MB 的最新 xterm.js SerializeAddon 快照，以及最多 8 MB、4096 块的快照后尾流；双重上限避免极端细碎输出的对象开销突破内存边界。`TerminalView` 的 1024 块有界队列由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`；队列满时后续序列检查会强制从快照重建，不能使用 `DropOldest` 静默跳过 VT 字节。快照生成至少间隔 2 秒，并仅序列化最近 256 行滚动历史，单个快照硬限制 8 MB。
+- `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）和本地逻辑序列缺口会重建当前控件，并从有效快照+完整尾流恢复，但不会错误地使所有标签共享的浏览器环境失效；只有主浏览器进程退出（`BrowserProcessExited`）或脚本调用返回 `RPC_E_DISCONNECTED` 时才会使旧环境失效。不可见标签仍会把 WebView2 重建延迟到再次选中；若此期间尾流超过硬上限，状态已经不可重建，必须明确提示用户重建标签页，不能无限重试或从空状态冒充权威状态。首次初始化及断连重试仍有 30 秒 `ready` 超时，避免页面异常时永久挂起。
+- 远程访问功能通过 `RemoteAccessService` 内置的轻量 TCP HTTP/WebSocket 服务实现，避免把 `Microsoft.AspNetCore.App` 变成目标机器的额外运行时依赖。远程协议版本为 2：按 `syncStart → snapshot → replay/output → syncComplete → 当前权威尺寸` 建立状态，之后每个 `output` 必须连续；浏览器按 WebSocket 世代串行处理消息，并等待 xterm `write` 回调后才推进序列或处理 size/`syncComplete`，旧连接回调不能污染重连后的状态。`TerminalStateSubscription` 在断开时必须释放，以免会话继续持有浏览器客户端。
 - `TerminalSession` 暴露 `Completion`/`Terminated` 用于终端生命周期收口。正常退出、读循环结束、关闭标签、应用退出和启动失败清理都必须触发完成信号；远程桥接依赖它断开浏览器连接，避免旧 WebSocket 持有已结束的 session。
-- 本地和远程输入会在 `TerminalSession.SendInputAsync` 中按 64 KB 分片写入 IPC。不要绕过这里直接发送超大 `Input` 帧；`IpcProtocol.MaxPayloadLength` 是单帧硬上限，用于防止异常输入造成内存尖峰或 Host 会话中止。
-- `RemoteTerminalBridge` 把终端输出写入有界队列（512 块 ≈ 4 MB），由单一发送循环串行发送，单次发送超时 30 秒；队列写满、发送超时、终端结束或远程单条消息超过 16 MB 都会主动断开该连接。WebSocket 接受时设置了 `KeepAliveTimeout`，对端不回 pong 会被自动断开。不要把发送改回每块输出 fire-and-forget 的模式，那是慢速客户端导致内存无界增长的根源。
-- `RemoteAccessService` 在 `MainWindow.Closed` 时先停止监听新连接，再并发关闭所有活跃的 WebSocket 桥接，并等待请求任务在固定超时内收口，避免大量远程连接让退出时间按连接数线性增长。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
+- 本地和远程输入会在 `TerminalSession.SendInputAsync` 中按 64 KB 分片，每帧携带 App 生成的请求 ID；Host 只有在 `ConPtySession.Input.WriteAsync` 和 `FlushAsync` 成功后才返回 `InputAck`。不要在 App 写入命名管道后提前确认，否则浏览器会把“Host 尚未写入 ConPTY”误报为成功。等待输入操作和 ack 注册表都有硬上限或超时，终端结束时统一失败并释放。
+- `RemoteTerminalBridge` 的状态订阅和统一发送队列各有 512 块硬上限，由单一发送循环串行发送，单次发送超时 30 秒；任一队列写满、发送超时、终端结束、协议版本/序列不合法或远程单条消息超过 16 MB 都会主动断开。每会话最多 8 个状态订阅，全局最多 32 个桥接。WebSocket 接受时设置了 `KeepAliveTimeout`，对端不回 pong 会被自动断开。不要把发送改回每块输出 fire-and-forget 的模式。
+- `RemoteAccessService` 从接受 TCP 连接开始就占用一个请求槽：总共 64 个请求槽、10 秒请求头读取超时，WebSocket 升级后继续占槽且另受 32 个桥接上限约束。`MainWindow.Closed` 时先停止监听新连接，再并发关闭所有活跃桥接，并等待请求任务在固定超时内收口，避免慢速请求或大量远程连接造成无界任务和线性退出时间。如果直接杀死进程，浏览器端会在 WebSocket 超时后自动断开。
 - `scripts/publish-portable.ps1` 发布后会检查 `TrayTerminal.runtimeconfig.json`，如果产物重新声明了 `Microsoft.AspNetCore.App` 依赖会直接失败。保持框架依赖发布即可，不要改成自包含发布。
 - `FileLogger.Write` 会静默吞掉写盘失败（磁盘满、文件被占用），日志失败永远不影响业务逻辑。`App.OnStartup` 注册了 `AppDomain.UnhandledException` 和 `TaskScheduler.UnobservedTaskException` 兜底记录，便于长期挂机后排查崩溃原因。

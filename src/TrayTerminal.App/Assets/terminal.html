@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./xterm/xterm.css" />
   <script src="./xterm/xterm.js"></script>
+  <script src="./xterm/addon-serialize.js"></script>
   <title>TrayTerminal</title>
   <style>
     html,
@@ -67,13 +68,23 @@
 
   <script>
     (() => {
-      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
       const terminalHost = document.getElementById('terminal');
       const fallback = document.getElementById('fallback');
+      const maxSnapshotBytes = 8 * 1024 * 1024;
+      const checkpointIntervalMs = 2000;
       let terminal = null;
+      let serializeAddon = null;
       let fontSize = 16;
       let lastCols = 120;
       let lastRows = 30;
+      let queuedSequence = 0;
+      let parsedSequence = 0;
+      let lastSnapshotSequence = -1;
+      let lastSnapshotAt = 0;
+      let snapshotInProgress = false;
+      let checkpointTimer = null;
+      let checkpointForced = false;
 
       function post(message) {
         if (window.chrome && window.chrome.webview) {
@@ -83,6 +94,98 @@
 
       function sendInput(text) {
         post({ type: 'input', data: text });
+      }
+
+      function base64ToBytes(payload) {
+        const binary = atob(payload);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+      }
+
+      function bytesToBase64(bytes) {
+        const chunkSize = 0x8000;
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+          binary += String.fromCharCode.apply(null, chunk);
+        }
+        return btoa(binary);
+      }
+
+      function createBoundedSnapshot() {
+        if (!serializeAddon) return null;
+
+        // The terminal itself keeps 5000 scrollback lines for the local user,
+        // but checkpoints intentionally serialize a bounded suffix. Reducing the
+        // suffix protects the permanent background service from pathological
+        // per-cell style sequences producing oversized snapshots.
+        let scrollback = 256;
+        while (scrollback >= 0) {
+          const serialized = serializeAddon.serialize({ scrollback });
+          const bytes = encoder.encode(serialized);
+          if (bytes.length <= maxSnapshotBytes) {
+            return bytes;
+          }
+          if (scrollback === 0) break;
+          scrollback = Math.floor(scrollback / 2);
+        }
+        return null;
+      }
+
+      function maybeCheckpoint(force) {
+        if (!terminal || !serializeAddon || snapshotInProgress ||
+            parsedSequence !== queuedSequence) {
+          return;
+        }
+
+        const now = Date.now();
+        if (!force &&
+            parsedSequence === lastSnapshotSequence) {
+          return;
+        }
+        const elapsed = now - lastSnapshotAt;
+        if (lastSnapshotAt > 0 && elapsed < checkpointIntervalMs) {
+          checkpointForced = checkpointForced || force;
+          if (checkpointTimer === null) {
+            checkpointTimer = window.setTimeout(() => {
+              checkpointTimer = null;
+              const scheduledForce = checkpointForced;
+              checkpointForced = false;
+              maybeCheckpoint(scheduledForce);
+            }, checkpointIntervalMs - elapsed);
+          }
+          return;
+        }
+
+        snapshotInProgress = true;
+        try {
+          if (checkpointTimer !== null) {
+            window.clearTimeout(checkpointTimer);
+            checkpointTimer = null;
+          }
+          checkpointForced = false;
+          const bytes = createBoundedSnapshot();
+          if (!bytes) {
+            lastSnapshotAt = now;
+            post({ type: 'snapshotUnavailable', sequence: parsedSequence });
+            return;
+          }
+
+          post({
+            type: 'snapshot',
+            sequence: parsedSequence,
+            cols: terminal.cols,
+            rows: terminal.rows,
+            data: bytesToBase64(bytes)
+          });
+          lastSnapshotSequence = parsedSequence;
+          lastSnapshotAt = now;
+        } finally {
+          snapshotInProgress = false;
+        }
       }
 
       function requestPaste() {
@@ -148,7 +251,7 @@
         return !handleClipboardShortcut(event, terminal);
       }
 
-      function estimateSize() {
+      function estimateSize(force) {
         let cols, rows;
         if (terminal && terminal._core && terminal._core._renderService) {
           try {
@@ -169,13 +272,10 @@
           cols = Math.max(20, Math.floor(width / Math.max(7, fontSize * 0.6)));
           rows = Math.max(5, Math.floor(height / Math.max(14, fontSize * 1.2)));
         }
-        if (cols !== lastCols || rows !== lastRows) {
+        if (force || cols !== lastCols || rows !== lastRows) {
           lastCols = cols;
           lastRows = rows;
           post({ type: 'resize', cols, rows });
-          if (terminal) {
-            terminal.resize(cols, rows);
-          }
         }
       }
 
@@ -263,6 +363,10 @@
               selectionBackground: '#264f78'
             }
           });
+          if (window.SerializeAddon && window.SerializeAddon.SerializeAddon) {
+            serializeAddon = new window.SerializeAddon.SerializeAddon();
+            terminal.loadAddon(serializeAddon);
+          }
           terminal.open(terminalHost);
           terminal.focus();
           terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
@@ -280,19 +384,80 @@
       }
 
       window.trayTerminal = {
-        writeBase64(payload) {
-          const binary = atob(payload);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
+        writeSequencedBatch(outputs) {
+          if (!terminal || !Array.isArray(outputs)) return false;
+          for (const output of outputs) {
+            if (!output || !Number.isSafeInteger(output.sequence) ||
+                typeof output.data !== 'string') {
+              return false;
+            }
+            if (output.sequence <= queuedSequence) {
+              continue;
+            }
+            if (output.sequence !== queuedSequence + 1) {
+              post({
+                type: 'stateGap',
+                expected: queuedSequence + 1,
+                actual: output.sequence
+              });
+              return false;
+            }
+
+            const bytes = base64ToBytes(output.data);
+            const sequence = output.sequence;
+            queuedSequence = sequence;
+            terminal.write(bytes, () => {
+              parsedSequence = sequence;
+              maybeCheckpoint(false);
+            });
+          }
+          return true;
+        },
+        restoreState(snapshotSequence, snapshotPayload, latestSequence,
+                     replayPayload, columns, rows, restoreId) {
+          if (!terminal || !serializeAddon ||
+              !Number.isSafeInteger(snapshotSequence) ||
+              !Number.isSafeInteger(latestSequence) ||
+              latestSequence < snapshotSequence) {
+            return false;
           }
 
-          const text = decoder.decode(bytes, { stream: true });
+          const snapshotBytes = base64ToBytes(snapshotPayload);
+          const replayBytes = base64ToBytes(replayPayload);
+          terminal.reset();
+          terminal.resize(
+            Math.max(20, Math.min(500, Number(columns) || 120)),
+            Math.max(5, Math.min(200, Number(rows) || 30)));
+          queuedSequence = latestSequence;
+          parsedSequence = snapshotSequence;
+          lastSnapshotSequence = -1;
+
+          terminal.write(snapshotBytes, () => {
+            parsedSequence = snapshotSequence;
+            if (replayBytes.length > 0) {
+              terminal.write(replayBytes, () => {
+                parsedSequence = latestSequence;
+                maybeCheckpoint(true);
+                post({ type: 'stateRestored', restoreId });
+              });
+            } else {
+              parsedSequence = latestSequence;
+              maybeCheckpoint(true);
+              post({ type: 'stateRestored', restoreId });
+            }
+          });
+          return true;
+        },
+        resizeAuthoritative(columns, rows) {
+          lastCols = Math.max(20, Math.min(500, Number(columns) || 120));
+          lastRows = Math.max(5, Math.min(200, Number(rows) || 30));
           if (terminal) {
-            terminal.write(text);
-          } else {
-            writeFallback(text);
+            terminal.resize(lastCols, lastRows);
+            maybeCheckpoint(true);
           }
+        },
+        requestSizeEstimate() {
+          window.requestAnimationFrame(() => estimateSize(true));
         },
         pasteText(text) {
           if (!text) {

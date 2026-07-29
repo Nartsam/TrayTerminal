@@ -9,5 +9,6 @@ public enum IpcMessageType : byte
     Exit = 5,
     Kill = 6,
     Heartbeat = 7,
-    Error = 8
+    Error = 8,
+    InputAck = 9
 }

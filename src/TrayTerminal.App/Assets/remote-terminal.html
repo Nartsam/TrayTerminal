@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="./xterm/xterm.css" />
   <script src="./xterm/xterm.js"></script>
+  <script src="./remote-protocol.js"></script>
   <title>TrayTerminal Remote</title>
   <style>
     html, body {
@@ -45,7 +46,7 @@
 
   <script>
     (() => {
-      const decoder = new TextDecoder();
+      const protocolVersion = 2;
       const terminalHost = document.getElementById('terminal');
       const fallback = document.getElementById('fallback');
       const statusBar = document.getElementById('status-bar');
@@ -53,7 +54,16 @@
       let ws = null;
       let reconnectTimer = null;
       let reconnectAttempts = 0;
+      let nextInputId = 0;
+      let expectedSequence = 0;
+      let synchronized = false;
+      let canResize = false;
+      let statusKind = '';
+      let socketGeneration = 0;
+      let socketAbortController = null;
+      let terminalStateUnavailable = false;
       let confirmNextKeyboardPaste = false;
+      const pendingInputs = new Map();
       const confirmedKeyboardPasteEvents = new WeakSet();
       const maxReconnectAttempts = 5;
 
@@ -73,24 +83,76 @@
 
       document.title = terminalName + ' — TrayTerminal Remote';
 
-      function showStatus(text, isError) {
+      function showStatus(text, isError, kind) {
         statusBar.textContent = text;
         statusBar.style.display = 'block';
         statusBar.style.color = isError ? '#e06c6c' : '#8a9096';
+        statusKind = kind || '';
       }
 
       function hideStatus() {
         statusBar.style.display = 'none';
+        statusKind = '';
       }
 
       function post(message) {
         if (ws && ws.readyState === WebSocket.OPEN) {
+          message.version = protocolVersion;
           ws.send(JSON.stringify(message));
+          return true;
         }
+        return false;
       }
 
       function sendInput(text) {
-        post({ type: 'input', data: text });
+        if (!text || !synchronized || pendingInputs.size >= 64) {
+          if (pendingInputs.size >= 64) {
+            showStatus('终端输入队列繁忙，请稍候…', false, 'input');
+          }
+          return;
+        }
+
+        const inputId = ++nextInputId;
+        if (post({ type: 'input', inputId, data: text })) {
+          pendingInputs.set(inputId, {
+            sequence: expectedSequence - 1,
+            waitsForVisibleResponse: text.indexOf('\r') >= 0
+          });
+          showStatus('正在将输入送往终端…', false, 'input');
+        }
+      }
+
+      function base64ToBytes(payload) {
+        const binary = atob(payload);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+      }
+
+      function applyTerminalBytes(payload, signal) {
+        if (signal.aborted) return Promise.resolve(false);
+        const bytes = base64ToBytes(payload);
+        if (terminal) {
+          const target = terminal;
+          return new Promise(resolve => {
+            let finished = false;
+            const complete = value => {
+              if (finished) return;
+              finished = true;
+              window.clearTimeout(timeout);
+              signal.removeEventListener('abort', abort);
+              resolve(value);
+            };
+            const abort = () => complete(false);
+            const timeout = window.setTimeout(() => complete(false), 30000);
+            signal.addEventListener('abort', abort, { once: true });
+            target.write(bytes, () => complete(true));
+          });
+        }
+        writeFallback(new TextDecoder().decode(bytes));
+        return Promise.resolve(true);
       }
 
       function isClipboardShortcut(event, key) {
@@ -234,9 +296,6 @@
           rows = Math.max(5, Math.floor((document.body.clientHeight || 500) / 19));
         }
         post({ type: 'resize', cols, rows });
-        if (terminal) {
-          try { terminal.resize(cols, rows); } catch (e) {}
-        }
       }
 
       function stripAnsi(text) {
@@ -263,41 +322,71 @@
 
         showStatus('正在连接...', false);
 
+        let socket;
         try {
-          ws = new WebSocket(wsUrl);
+          socket = new WebSocket(wsUrl);
         } catch (e) {
           showStatus('WebSocket 连接失败', true);
           return;
         }
+        socketAbortController?.abort();
+        const abortController = new AbortController();
+        socketAbortController = abortController;
+        const generation = ++socketGeneration;
+        terminalStateUnavailable = false;
+        ws = socket;
+        const processor = window.TrayTerminalRemoteProtocol.createSerialProcessor(
+          message => processServerMessage(
+            socket,
+            generation,
+            abortController.signal,
+            message),
+          () => {
+            abortController.abort();
+            if (ws === socket && generation === socketGeneration) {
+              socket.close(1002, 'Malformed protocol message');
+            }
+          });
 
-        ws.onopen = function() {
+        socket.onopen = function() {
+          if (ws !== socket || generation !== socketGeneration) return;
           reconnectAttempts = 0;
-          hideStatus();
+          synchronized = false;
+          showStatus('正在同步终端状态…', false, 'connection');
           if (terminal) {
             terminal.focus();
           }
         };
 
-        ws.onmessage = function(event) {
+        socket.onmessage = function(event) {
           if (typeof event.data !== 'string') return;
           try {
-            const binary = atob(event.data);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-              bytes[i] = binary.charCodeAt(i);
+            const message = JSON.parse(event.data);
+            if (!message || message.version !== protocolVersion ||
+                typeof message.type !== 'string') {
+              abortController.abort();
+              socket.close(1002, 'Protocol mismatch');
+              return;
             }
-            const text = decoder.decode(bytes, { stream: true });
-            if (terminal) {
-              terminal.write(text);
-            } else {
-              writeFallback(text);
-            }
+            processor.push(message);
           } catch (e) {
-            // Non-base64 message, ignore
+            abortController.abort();
+            socket.close(1002, 'Malformed protocol message');
           }
         };
 
-        ws.onclose = function(event) {
+        socket.onclose = function(event) {
+          abortController.abort();
+          if (ws !== socket || generation !== socketGeneration) return;
+          synchronized = false;
+          pendingInputs.clear();
+          if (terminalStateUnavailable) {
+            showStatus(
+              '终端状态已无法安全恢复；请在主程序中重建该标签页。',
+              true,
+              'connection');
+            return;
+          }
           if (event.code === 4001) {
             // Server rejected — terminal not available or access denied
             showStatus('连接被拒绝：终端不可用或访问被拒绝', true);
@@ -312,34 +401,142 @@
           }
         };
 
-        ws.onerror = function() {
+        socket.onerror = function() {
           // onclose will fire after this
         };
       }
 
-      function initTerminal() {
-        if (window.Terminal) {
-          terminal = new window.Terminal({
-            cursorBlink: true,
-            convertEol: true,
-            scrollback: 5000,
-            fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
-            fontSize: 14,
-            lineHeight: 1.2,
-            cursorStyle: 'block',
-            allowTransparency: true,
-            theme: {
-              background: 'rgba(0, 0, 0, 0)',
-              foreground: '#d7dde2',
-              cursor: '#20b486',
-              selectionBackground: '#264f78'
+      async function processServerMessage(socket, generation, signal, message) {
+        if (signal.aborted || ws !== socket || generation !== socketGeneration) {
+          return;
+        }
+
+        switch (message.type) {
+          case 'syncStart':
+            if (!Number.isSafeInteger(message.snapshotSequence) ||
+                !Number.isSafeInteger(message.latestSequence)) {
+              throw new Error('Invalid synchronization header');
             }
-          });
-          terminal.open(terminalHost);
-          terminal.focus();
-          terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
-          terminal.onData(sendInput);
-        } else {
+            synchronized = false;
+            pendingInputs.clear();
+            expectedSequence = message.snapshotSequence;
+            canResize = message.canResize === true;
+            if (terminal) {
+              createTerminal();
+              terminal.resize(message.cols, message.rows);
+            } else {
+              fallback.textContent = '';
+            }
+            break;
+
+          case 'snapshot':
+          case 'output': {
+            if (message.sequence !== expectedSequence ||
+                typeof message.data !== 'string') {
+              throw new Error(
+                message.type === 'snapshot'
+                  ? 'Snapshot sequence mismatch'
+                  : 'Output sequence mismatch');
+            }
+            const written = await applyTerminalBytes(message.data, signal);
+            if (signal.aborted || ws !== socket ||
+                generation !== socketGeneration) {
+              return;
+            }
+            if (!written) {
+              throw new Error('Terminal write callback timed out');
+            }
+            expectedSequence = message.sequence + 1;
+            if (message.type === 'output' && statusKind === 'input') {
+              hideStatus();
+            }
+            break;
+          }
+
+          case 'syncComplete':
+            if (message.sequence !== expectedSequence - 1) {
+              throw new Error('Synchronization boundary mismatch');
+            }
+            synchronized = true;
+            hideStatus();
+            estimateSize();
+            break;
+
+          case 'size':
+            canResize = message.canResize === true;
+            if (terminal && Number.isInteger(message.cols) &&
+                Number.isInteger(message.rows)) {
+              terminal.resize(message.cols, message.rows);
+            }
+            break;
+
+          case 'inputAck': {
+            const pending = pendingInputs.get(message.inputId);
+            if (!pending) break;
+            pendingInputs.delete(message.inputId);
+            if (message.accepted !== true) {
+              showStatus('输入未能写入终端，请检查连接状态。', true, 'input');
+            } else if (pending.waitsForVisibleResponse &&
+                       expectedSequence - 1 <= pending.sequence) {
+              showStatus(
+                '输入已写入终端；前台程序可能暂未读取，因此屏幕尚无变化。',
+                false,
+                'input');
+            } else if (pendingInputs.size === 0) {
+              hideStatus();
+            }
+            break;
+          }
+
+          case 'error':
+            if (message.reason === 'stateUnavailable') {
+              terminalStateUnavailable = true;
+              showStatus(
+                '终端状态已无法安全恢复；请在主程序中重建该标签页。',
+                true,
+                'connection');
+              socket.close(1000, 'Terminal state is unavailable');
+            } else {
+              showStatus('远程终端协议错误。', true, 'connection');
+            }
+            break;
+
+          default:
+            throw new Error('Unknown protocol message type');
+        }
+      }
+
+      function createTerminal() {
+        if (!window.Terminal) return false;
+        if (terminal) {
+          terminal.dispose();
+        }
+        terminalHost.textContent = '';
+        terminal = new window.Terminal({
+          cursorBlink: true,
+          convertEol: true,
+          scrollback: 5000,
+          fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
+          fontSize: 14,
+          lineHeight: 1.2,
+          cursorStyle: 'block',
+          allowTransparency: true,
+          theme: {
+            background: 'rgba(0, 0, 0, 0)',
+            foreground: '#d7dde2',
+            cursor: '#20b486',
+            selectionBackground: '#264f78'
+          }
+        });
+        terminal.open(terminalHost);
+        terminal.focus();
+        terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
+        terminal.onData(sendInput);
+        return true;
+      }
+
+      function initTerminal() {
+        if (!createTerminal()) {
           terminalHost.hidden = true;
           fallback.hidden = false;
           fallback.focus();

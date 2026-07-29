@@ -17,9 +17,12 @@ namespace TrayTerminal.App.Services;
 public sealed class RemoteAccessService : IAsyncDisposable
 {
     private const int MaxHeaderBytes = 32 * 1024;
+    private const int MaxConcurrentBridges = 32;
+    private const int MaxConcurrentRequests = 64;
     private static readonly TimeSpan WebSocketKeepAliveInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan WebSocketKeepAliveTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan HeaderReadTimeout = TimeSpan.FromSeconds(10);
     private static readonly byte[] HeaderTerminator = "\r\n\r\n"u8.ToArray();
 
     private readonly Func<string, TerminalPage?> _findTerminalPage;
@@ -29,10 +32,13 @@ public sealed class RemoteAccessService : IAsyncDisposable
     private readonly HashSet<string> _allowedTabs;
     private readonly ConcurrentDictionary<RemoteTerminalBridge, byte> _bridges = new();
     private readonly ConcurrentDictionary<Task, byte> _requestTasks = new();
+    private readonly ConcurrencySlotLimiter _requestSlots = new(
+        MaxConcurrentRequests);
     private TcpListener? _listener;
     private CancellationTokenSource? _serverCts;
     private Task? _acceptLoopTask;
     private bool _disposed;
+    private int _activeBridgeSlots;
 
     public RemoteAccessService(
         Func<string, TerminalPage?> findTerminalPage,
@@ -93,13 +99,42 @@ public sealed class RemoteAccessService : IAsyncDisposable
                 continue;
             }
 
-            var task = ProcessClientAsync(client, baseDir, assetsDir, ct);
+            if (!_requestSlots.TryAcquire(out var requestLease)
+                || requestLease is null)
+            {
+                client.Dispose();
+                continue;
+            }
+
+            var task = ProcessClientWithLeaseAsync(
+                client,
+                requestLease,
+                baseDir,
+                assetsDir,
+                ct);
             _requestTasks.TryAdd(task, 0);
             _ = task.ContinueWith(
                 completed => _requestTasks.TryRemove(completed, out _),
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
+        }
+    }
+
+    private async Task ProcessClientWithLeaseAsync(
+        TcpClient client,
+        IDisposable requestLease,
+        string baseDir,
+        string assetsDir,
+        CancellationToken cancellationToken)
+    {
+        using (requestLease)
+        {
+            await ProcessClientAsync(
+                client,
+                baseDir,
+                assetsDir,
+                cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -112,7 +147,11 @@ public sealed class RemoteAccessService : IAsyncDisposable
                 client.NoDelay = true;
                 await using var stream = client.GetStream();
 
-                var request = await ReadHttpRequestAsync(stream, ct).ConfigureAwait(false);
+                using var headerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                headerCts.CancelAfter(HeaderReadTimeout);
+                var request = await ReadHttpRequestAsync(
+                    stream,
+                    headerCts.Token).ConfigureAwait(false);
                 if (request is null)
                 {
                     return;
@@ -226,31 +265,69 @@ public sealed class RemoteAccessService : IAsyncDisposable
             return;
         }
 
-        await WriteWebSocketHandshakeAsync(stream, key, ct).ConfigureAwait(false);
-
-        using var webSocket = WebSocket.CreateFromStream(
-            stream,
-            new WebSocketCreationOptions
-            {
-                IsServer = true,
-                KeepAliveInterval = WebSocketKeepAliveInterval,
-                KeepAliveTimeout = WebSocketKeepAliveTimeout
-            });
-
-        var bridge = new RemoteTerminalBridge(webSocket, page.Session, terminalName, _logger);
-        _bridges.TryAdd(bridge, 0);
-
-        _logger.Info($"Remote client connected to terminal '{terminalName}' (total bridges: {_bridges.Count}).");
+        if (!TryAcquireBridgeSlot())
+        {
+            await WriteTextResponseAsync(
+                stream,
+                503,
+                "Service Unavailable",
+                "Remote terminal connection limit reached.",
+                ct).ConfigureAwait(false);
+            return;
+        }
 
         try
         {
-            await bridge.RunAsync().ConfigureAwait(false);
+            await WriteWebSocketHandshakeAsync(stream, key, ct).ConfigureAwait(false);
+
+            using var webSocket = WebSocket.CreateFromStream(
+                stream,
+                new WebSocketCreationOptions
+                {
+                    IsServer = true,
+                    KeepAliveInterval = WebSocketKeepAliveInterval,
+                    KeepAliveTimeout = WebSocketKeepAliveTimeout
+                });
+
+            var bridge = new RemoteTerminalBridge(webSocket, page.Session, terminalName, _logger);
+            _bridges.TryAdd(bridge, 0);
+
+            _logger.Info($"Remote client connected to terminal '{terminalName}' (total bridges: {_bridges.Count}).");
+
+            try
+            {
+                await bridge.RunAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _bridges.TryRemove(bridge, out _);
+                await bridge.DisposeAsync().ConfigureAwait(false);
+                _logger.Info($"Remote client disconnected from terminal '{terminalName}' (total bridges: {_bridges.Count}).");
+            }
         }
         finally
         {
-            _bridges.TryRemove(bridge, out _);
-            await bridge.DisposeAsync().ConfigureAwait(false);
-            _logger.Info($"Remote client disconnected from terminal '{terminalName}' (total bridges: {_bridges.Count}).");
+            Interlocked.Decrement(ref _activeBridgeSlots);
+        }
+    }
+
+    private bool TryAcquireBridgeSlot()
+    {
+        while (true)
+        {
+            var current = Volatile.Read(ref _activeBridgeSlots);
+            if (current >= MaxConcurrentBridges)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref _activeBridgeSlots,
+                    current + 1,
+                    current) == current)
+            {
+                return true;
+            }
         }
     }
 

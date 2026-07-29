@@ -88,8 +88,18 @@ internal sealed class TerminalHostSession : IDisposable
             switch (message.Value.Type)
             {
                 case IpcMessageType.Input:
-                    await _conPty.Input.WriteAsync(message.Value.Payload, cancellationToken).ConfigureAwait(false);
+                    var (requestId, input) = IpcProtocol.DecodeInput(message.Value.Payload);
+                    await _conPty.Input.WriteAsync(input, cancellationToken).ConfigureAwait(false);
                     await _conPty.Input.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    // Ack only after the bytes have been accepted by the ConPTY
+                    // input pipe. The App/browser must not interpret pipe delivery
+                    // to this Host as successful terminal input.
+                    await SendAsync(
+                        pipe,
+                        new IpcMessage(
+                            IpcMessageType.InputAck,
+                            IpcProtocol.EncodeRequestId(requestId)),
+                        cancellationToken).ConfigureAwait(false);
                     break;
 
                 case IpcMessageType.Resize:
