@@ -48,6 +48,15 @@ internal static class Program
 
         Assert(paths.IsInsideBase(paths.DataDirectory), "Data directory should be inside base.");
         Assert(paths.IsInsideBase(paths.WebView2DataDirectory), "WebView2 directory should be inside base.");
+        Assert(
+            paths.BackgroundsDirectory == Path.Combine(paths.DataDirectory, "Backgrounds"),
+            "Backgrounds directory should be under Data.");
+        Assert(
+            Directory.Exists(paths.BackgroundsDirectory),
+            "Backgrounds directory should be created with the portable data directories.");
+        Assert(
+            !Directory.Exists(Path.Combine(paths.BaseDirectory, "Backgrounds")),
+            "The legacy root Backgrounds directory should not be created.");
 
         try
         {

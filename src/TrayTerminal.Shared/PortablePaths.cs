@@ -15,6 +15,7 @@ public sealed class PortablePaths
         LogsDirectory = CombineInsideBase("Data", "Logs");
         TempDirectory = CombineInsideBase("Data", "Temp");
         WebView2DataDirectory = CombineInsideBase("Data", "WebView2");
+        BackgroundsDirectory = CombineInsideBase("Data", "Backgrounds");
     }
 
     public string BaseDirectory { get; }
@@ -29,7 +30,7 @@ public sealed class PortablePaths
 
     public string WebView2DataDirectory { get; }
 
-    public string BackgroundsDirectory => CombineInsideBase("Backgrounds");
+    public string BackgroundsDirectory { get; }
 
     public string HostExecutablePath => CombineInsideBase("TrayTerminal.Host.exe");
 
@@ -44,6 +45,7 @@ public sealed class PortablePaths
         Directory.CreateDirectory(LogsDirectory);
         Directory.CreateDirectory(TempDirectory);
         Directory.CreateDirectory(WebView2DataDirectory);
+        Directory.CreateDirectory(BackgroundsDirectory);
     }
 
     public string CombineInsideBase(params string[] parts)

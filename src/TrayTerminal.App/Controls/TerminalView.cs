@@ -12,6 +12,15 @@ using TrayTerminal.Shared.Terminal;
 
 namespace TrayTerminal.App.Controls;
 
+public readonly record struct BackgroundImageUpdateResult(
+    bool Applied,
+    string? ErrorMessage)
+{
+    public static BackgroundImageUpdateResult Success() => new(true, null);
+
+    public static BackgroundImageUpdateResult Failure(string message) => new(false, message);
+}
+
 public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposable
 {
     private const int MaxPastePreviewCharacters = 1600;
@@ -24,12 +33,15 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     // backlog at roughly 8 MB if the WebView2 renderer ever stalls.
     private const int OutputQueueCapacity = 1024;
     private const int MaxScriptBatchBytes = 256 * 1024;
+    private const int MaxBackgroundImageBytes = 32 * 1024 * 1024;
+    private const int BackgroundReadBufferSize = 64 * 1024;
     private readonly PortablePaths _paths;
     private readonly TerminalSession _session;
     private readonly FileLogger _logger;
     private readonly WebView2EnvironmentManager _webView2EnvironmentManager;
     private readonly Guid _terminalClientId;
     private readonly SemaphoreSlim _webViewGate = new(1, 1);
+    private readonly SemaphoreSlim _backgroundUpdateGate = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly Channel<TerminalOutput> _outputQueue = Channel.CreateBounded<TerminalOutput>(
         new BoundedChannelOptions(OutputQueueCapacity)
@@ -48,7 +60,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     private CoreWebView2? _coreWebView2;
     private CoreWebView2Environment? _environment;
     private TaskCompletionSource<WebView2> _webViewReady = CreateWebViewReadySource();
-    private string? _backgroundImagePath;
+    private string? _backgroundDataUri;
     private string? _pendingRecoveryReason;
     private bool _pendingRecoveryInvalidatesEnvironment;
     private int _backgroundCover;
@@ -223,10 +235,11 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
 
         await SetFontSizeAsync(webView, _fontSize);
-        await SetBackgroundImageWithErrorHandlingAsync(
+        await SetBackgroundDataUriAsync(
             webView,
-            _backgroundImagePath,
-            _backgroundCover);
+            _backgroundDataUri,
+            _backgroundCover,
+            _lifetimeCts.Token);
         await RestoreAuthoritativeStateAsync(webView);
         if (IsVisible && _session.IsSizeOwner(_terminalClientId))
         {
@@ -840,18 +853,150 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
-    public void SetBackgroundImage(string? imagePath, int cover = 0)
+    public async Task<BackgroundImageUpdateResult> SetBackgroundImageAsync(
+        string? imagePath,
+        int cover = 0)
     {
-        _backgroundImagePath = imagePath;
-        _backgroundCover = Math.Clamp(cover, 0, 100);
-        var webView = _webView;
-        if (_ready && !_disposed && webView is not null)
+        try
         {
-            _ = UpdateBackgroundImageAsync(
-                webView,
-                _backgroundImagePath,
-                _backgroundCover);
+            await _backgroundUpdateGate.WaitAsync(_lifetimeCts.Token);
         }
+        catch (OperationCanceledException) when (_disposed)
+        {
+            return BackgroundImageUpdateResult.Failure("终端标签已关闭，壁纸重载已取消。");
+        }
+
+        try
+        {
+            return await SetBackgroundImageCoreAsync(imagePath, cover);
+        }
+        finally
+        {
+            _backgroundUpdateGate.Release();
+        }
+    }
+
+    private async Task<BackgroundImageUpdateResult> SetBackgroundImageCoreAsync(
+        string? imagePath,
+        int cover)
+    {
+        string? dataUri;
+        try
+        {
+            dataUri = await LoadBackgroundDataUriAsync(
+                imagePath,
+                _lifetimeCts.Token);
+        }
+        catch (BackgroundImageTooLargeException exception)
+        {
+            return BackgroundImageUpdateResult.Failure(exception.Message);
+        }
+        catch (OperationCanceledException) when (_disposed)
+        {
+            return BackgroundImageUpdateResult.Failure("终端标签已关闭，壁纸重载已取消。");
+        }
+        catch (Exception exception) when (IsBackgroundReadException(exception))
+        {
+            _logger.Error(exception, $"Failed to read terminal background '{imagePath}'.");
+            return BackgroundImageUpdateResult.Failure($"无法读取壁纸：{exception.Message}");
+        }
+
+        if (_disposed)
+        {
+            return BackgroundImageUpdateResult.Failure("终端标签已关闭，无法更新壁纸。");
+        }
+
+        var normalizedCover = Math.Clamp(cover, 0, 100);
+        var webView = _webView;
+        if (_ready && webView is not null)
+        {
+            try
+            {
+                await SetBackgroundDataUriAsync(
+                    webView,
+                    dataUri,
+                    normalizedCover,
+                    _lifetimeCts.Token);
+            }
+            catch (Exception exception) when (IsBrowserDisconnected(exception))
+            {
+                if (!await RecoverWebViewAsync(
+                        webView,
+                        "background update was disconnected",
+                        exception))
+                {
+                    return BackgroundImageUpdateResult.Failure(
+                        "终端视图当前不可用，未能更新壁纸。");
+                }
+
+                // Hidden tabs can defer recovery. In that case the prepared
+                // data URI is committed below and applied when the view returns.
+                if (_ready && _webView is { } recoveredWebView)
+                {
+                    try
+                    {
+                        await SetBackgroundDataUriAsync(
+                            recoveredWebView,
+                            dataUri,
+                            normalizedCover,
+                            _lifetimeCts.Token);
+                    }
+                    catch (Exception recoveryException)
+                    {
+                        if (recoveryException is TimeoutException)
+                        {
+                            await RecoverWebViewAsync(
+                                recoveredWebView,
+                                "background update timed out after recovery",
+                                recoveryException,
+                                invalidateEnvironment: false);
+                        }
+
+                        if (!_disposed)
+                        {
+                            _logger.Error(
+                                recoveryException,
+                                "Failed to apply terminal background after WebView2 recovery.");
+                        }
+
+                        return BackgroundImageUpdateResult.Failure(
+                            $"无法将壁纸应用到终端视图：{recoveryException.Message}");
+                    }
+                }
+            }
+            catch (TimeoutException exception)
+            {
+                await RecoverWebViewAsync(
+                    webView,
+                    "background update timed out",
+                    exception,
+                    invalidateEnvironment: false);
+                return BackgroundImageUpdateResult.Failure(
+                    "应用壁纸超时，已恢复原壁纸。");
+            }
+            catch (Exception exception)
+            {
+                if (!_disposed)
+                {
+                    _logger.Error(exception, "Failed to apply terminal background.");
+                }
+
+                return BackgroundImageUpdateResult.Failure(
+                    $"无法将壁纸应用到终端视图：{exception.Message}");
+            }
+        }
+
+        // Commit only after reading and any immediate renderer update succeed.
+        // A failed reload therefore leaves the previous wallpaper authoritative.
+        if (_disposed)
+        {
+            return BackgroundImageUpdateResult.Failure(
+                "终端标签已关闭，无法更新壁纸。");
+        }
+
+        _backgroundDataUri = dataUri;
+        _backgroundCover = normalizedCover;
+        return BackgroundImageUpdateResult.Success();
     }
 
     public void Dispose()
@@ -866,6 +1011,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         _session.SizeChanged -= OnSessionSizeChanged;
         _lifetimeCts.Cancel();
         _outputQueue.Writer.TryComplete();
+        _backgroundDataUri = null;
         DisposeCurrentWebView();
     }
 
@@ -931,10 +1077,11 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                         {
                             await RestoreAuthoritativeStateAsync(webView);
                             await SetFontSizeAsync(webView, _fontSize);
-                            await SetBackgroundImageWithErrorHandlingAsync(
+                            await SetBackgroundDataUriAsync(
                                 webView,
-                                _backgroundImagePath,
-                                _backgroundCover);
+                                _backgroundDataUri,
+                                _backgroundCover,
+                                _lifetimeCts.Token);
                         }
                         catch (Exception exception) when (IsBrowserDisconnected(exception))
                         {
@@ -1080,81 +1227,109 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
-    private async Task UpdateBackgroundImageAsync(
-        WebView2 webView,
-        string? imagePath,
-        int cover)
-    {
-        try
-        {
-            await SetBackgroundImageWithErrorHandlingAsync(webView, imagePath, cover);
-        }
-        catch (Exception exception) when (IsBrowserDisconnected(exception))
-        {
-            await RecoverWebViewAsync(
-                webView,
-                "background update was disconnected",
-                exception);
-        }
-        catch (Exception exception)
-        {
-            if (!_disposed)
-            {
-                _logger.Error(exception, "Failed to update terminal background.");
-            }
-        }
-    }
-
     private static async Task SetFontSizeAsync(WebView2 webView, int fontSize)
     {
         await webView.ExecuteScriptAsync($"window.trayTerminal.setFontSize({fontSize});");
     }
 
-    private static async Task SetBackgroundImageAsync(
-        WebView2 webView,
+    private static async Task<string?> LoadBackgroundDataUriAsync(
         string? imagePath,
-        int cover)
+        CancellationToken cancellationToken)
     {
-        // Read the image file and convert to a data: URL so the WebView2 engine does
-        // not cache the image across tab creations or config changes.
-        string? dataUri;
         if (string.IsNullOrWhiteSpace(imagePath))
         {
-            dataUri = null;
-        }
-        else
-        {
-            var bytes = await File.ReadAllBytesAsync(imagePath);
-            var base64 = Convert.ToBase64String(bytes);
-            var mime = Path.GetExtension(imagePath).ToLowerInvariant() switch
-            {
-                ".png" => "image/png",
-                ".jpg" => "image/jpeg",
-                ".jpeg" => "image/jpeg",
-                _ => "image/png"
-            };
-            dataUri = $"data:{mime};base64,{base64}";
+            return null;
         }
 
-        var payload = JsonSerializer.Serialize(dataUri);
-        await webView.ExecuteScriptAsync(
-            $"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});");
+        await using var input = new FileStream(
+            imagePath,
+            new FileStreamOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.Read,
+                BufferSize = BackgroundReadBufferSize,
+                Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+            });
+        if (input.Length > MaxBackgroundImageBytes)
+        {
+            throw new BackgroundImageTooLargeException();
+        }
+
+        var initialCapacity = (int)Math.Min(
+            input.Length,
+            MaxBackgroundImageBytes);
+        using var content = new MemoryStream(initialCapacity);
+        var buffer = new byte[BackgroundReadBufferSize];
+        while (true)
+        {
+            var read = await input.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                break;
+            }
+
+            // Recheck while reading because a file can grow after Length was
+            // sampled. Never retain more source bytes than the documented cap.
+            var requiredLength = content.Length + read;
+            if (requiredLength > MaxBackgroundImageBytes)
+            {
+                throw new BackgroundImageTooLargeException();
+            }
+
+            if (requiredLength > content.Capacity)
+            {
+                content.Capacity = (int)Math.Min(
+                    MaxBackgroundImageBytes,
+                    Math.Max(
+                        requiredLength,
+                        Math.Max(
+                            BackgroundReadBufferSize,
+                            content.Capacity * 2L)));
+            }
+
+            content.Write(buffer, 0, read);
+        }
+
+        var base64 = Convert.ToBase64String(
+            content.GetBuffer(),
+            0,
+            checked((int)content.Length));
+        var mime = Path.GetExtension(imagePath).ToLowerInvariant() switch
+        {
+            ".png" => "image/png",
+            ".jpg" => "image/jpeg",
+            ".jpeg" => "image/jpeg",
+            _ => "image/png"
+        };
+        return $"data:{mime};base64,{base64}";
     }
 
-    private static async Task SetBackgroundImageWithErrorHandlingAsync(
+    private static async Task SetBackgroundDataUriAsync(
         WebView2 webView,
-        string? imagePath,
-        int cover)
+        string? dataUri,
+        int cover,
+        CancellationToken cancellationToken)
     {
-        try
+        var payload = JsonSerializer.Serialize(dataUri);
+        await webView.ExecuteScriptAsync(
+                $"window.trayTerminal.setBackground({payload}, {Math.Clamp(cover, 0, 100)});")
+            .WaitAsync(InitializationTimeout, cancellationToken);
+    }
+
+    private static bool IsBackgroundReadException(Exception exception)
+    {
+        return exception is IOException
+            or UnauthorizedAccessException
+            or ArgumentException
+            or NotSupportedException;
+    }
+
+    private sealed class BackgroundImageTooLargeException : IOException
+    {
+        public BackgroundImageTooLargeException()
+            : base("壁纸文件超过 32 MiB 上限，已保留当前壁纸。")
         {
-            await SetBackgroundImageAsync(webView, imagePath, cover);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // Fire-and-forget path — log the error but don't crash.
-            System.Diagnostics.Debug.WriteLine(
-                $"TerminalView: failed to set background image '{imagePath}': {ex.Message}");
         }
     }
 

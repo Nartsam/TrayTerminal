@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private WpfPoint? _tabDragStartPoint;
     private TabItem? _draggedTab;
     private bool _syncingFontSize;
+    private bool _backgroundReloadInProgress;
     private RemoteAccessService? _remoteAccess;
     private bool _forceClose;
     private int _untitledIndex = 1;
@@ -73,12 +74,14 @@ public partial class MainWindow : Window
         FontSizeComboBox.SelectionChanged += (_, _) => ApplyFontSizeToSelectedTab();
 
         NewTabButton.Click += async (_, _) => await CreateTabFromDialogAsync();
+        ReloadBackgroundButton.Click += async (_, _) => await ReloadSelectedBackgroundAsync();
         HideToTrayButton.Click += (_, _) => HideToTray();
         Tabs.SelectionChanged += (_, args) =>
         {
             if (args.Source == Tabs)
             {
                 SyncFontSizeComboBoxToSelectedTab();
+                UpdateReloadBackgroundButtonState();
             }
         };
         Loaded += async (_, _) =>
@@ -256,7 +259,16 @@ public partial class MainWindow : Window
             _logger,
             _webView2EnvironmentManager,
             GetSelectedFontSize());
-        page.SetBackgroundImage(ResolveBackgroundImage(request.Title, preset), preset?.Cover ?? 0);
+        var initialBackground = await page.SetBackgroundImageAsync(
+            ResolveBackgroundImage(request.Title, preset),
+            preset?.Cover ?? 0);
+        if (!initialBackground.Applied)
+        {
+            _logger.Warn(
+                $"Failed to load initial background for tab '{request.Title}': "
+                + initialBackground.ErrorMessage);
+        }
+
         var item = new TabItem
         {
             Header = CreateTabHeader(request.Title, page),
@@ -377,6 +389,57 @@ public partial class MainWindow : Window
         {
             _syncingFontSize = false;
         }
+    }
+
+    private async Task ReloadSelectedBackgroundAsync()
+    {
+        if (_backgroundReloadInProgress
+            || Tabs.SelectedItem is not TabItem { Content: TerminalPage page })
+        {
+            UpdateReloadBackgroundButtonState();
+            return;
+        }
+
+        _backgroundReloadInProgress = true;
+        UpdateReloadBackgroundButtonState();
+        var title = page.Title;
+        try
+        {
+            ReloadTabPresets();
+            _presets.TryGetValue(title, out var preset);
+            var imagePath = ResolveBackgroundImage(title, preset);
+            var result = await page.SetBackgroundImageAsync(
+                imagePath,
+                preset?.Cover ?? 0);
+            if (!result.Applied)
+            {
+                _logger.Warn(
+                    $"Failed to reload background for tab '{title}': "
+                    + result.ErrorMessage);
+                SetStatusText($"重载“{title}”的壁纸失败：{result.ErrorMessage}");
+                return;
+            }
+
+            SetStatusText(imagePath is null
+                ? $"未找到“{title}”的壁纸，已清除当前壁纸"
+                : $"已重载“{title}”的壁纸");
+        }
+        catch (Exception exception)
+        {
+            _logger.Error(exception, $"Failed to reload background for tab '{title}'.");
+            SetStatusText($"重载“{title}”的壁纸失败：{exception.Message}");
+        }
+        finally
+        {
+            _backgroundReloadInProgress = false;
+            UpdateReloadBackgroundButtonState();
+        }
+    }
+
+    private void UpdateReloadBackgroundButtonState()
+    {
+        ReloadBackgroundButton.IsEnabled = !_backgroundReloadInProgress
+            && Tabs.SelectedItem is TabItem { Content: TerminalPage };
     }
 
     private FrameworkElement CreateTabHeader(string title, TerminalPage page)
@@ -536,15 +599,21 @@ public partial class MainWindow : Window
         var newTitle = dialog.NewTitle.Trim();
         page.SetTitle(newTitle);
         _presets.TryGetValue(newTitle, out var preset);
-        page.SetBackgroundImage(ResolveBackgroundImage(newTitle, preset), preset?.Cover ?? 0);
+        var backgroundResult = await page.SetBackgroundImageAsync(
+            ResolveBackgroundImage(newTitle, preset),
+            preset?.Cover ?? 0);
+        if (!backgroundResult.Applied)
+        {
+            _logger.Warn(
+                $"Failed to update background after renaming tab to '{newTitle}': "
+                + backgroundResult.ErrorMessage);
+        }
 
         var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
         if (item is not null)
         {
             item.Header = CreateTabHeader(newTitle, page);
         }
-
-        await Task.CompletedTask;
     }
 
     private string? FindBackgroundImagePath(string title)
@@ -560,7 +629,9 @@ public partial class MainWindow : Window
         {
             try
             {
-                var candidate = _paths.CombineInsideBase("Backgrounds", title + extension);
+                var candidate = Path.Combine(
+                    _paths.BackgroundsDirectory,
+                    title + extension);
                 if (File.Exists(candidate))
                 {
                     return candidate;

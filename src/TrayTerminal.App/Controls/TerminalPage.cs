@@ -102,11 +102,21 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         Title = title;
     }
 
-    public void SetBackgroundImage(string? imagePath, int cover = 0)
+    public async Task<BackgroundImageUpdateResult> SetBackgroundImageAsync(
+        string? imagePath,
+        int cover = 0)
     {
-        BackgroundImagePath = imagePath;
-        BackgroundCover = Math.Clamp(cover, 0, 100);
-        _terminalView.SetBackgroundImage(imagePath, BackgroundCover);
+        var normalizedCover = Math.Clamp(cover, 0, 100);
+        var result = await _terminalView.SetBackgroundImageAsync(
+            imagePath,
+            normalizedCover);
+        if (result.Applied)
+        {
+            BackgroundImagePath = imagePath;
+            BackgroundCover = normalizedCover;
+        }
+
+        return result;
     }
 
     public async Task SendInputAsync(string text)

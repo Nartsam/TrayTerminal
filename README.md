@@ -9,7 +9,8 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 管理员终端：新建标签时勾选”以管理员模式启动”，会通过 UAC 启动提权的 Host 进程。
 - 标签排序：拖动顶部标签可以调整终端在界面中的显示顺序。
 - 标签重命名：双击标签标题可以修改名称。
-- 标签背景：在程序运行目录旁手动创建 `Backgrounds` 文件夹，放入与标签名相同的 `.png`、`.jpg`、`.jpeg` 图片，创建或重命名标签时会自动匹配为当前终端背景。匹配顺序为 `.png`、`.jpg`、`.jpeg`。
+- 标签背景：应用会自动创建 `Data\Backgrounds` 文件夹。放入与标签名相同的 `.png`、`.jpg`、`.jpeg` 图片后，创建或重命名标签时会自动匹配为当前终端背景。匹配顺序为 `.png`、`.jpg`、`.jpeg`；旧的程序根目录 `Backgrounds` 不再作为同名图片的自动匹配目录。
+- 壁纸重载：右上角“重载壁纸”按钮会重新读取当前标签在 `config.txt` 中的 `bg`、`cover` 和 `Data\Backgrounds` 同名图片设置，不会重新应用 `cd`、`run` 或 `fill`。找不到目标图片时会清除当前壁纸；读取失败时会保留原壁纸。
 - 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令、背景图片和背景遮罩；创建、关闭、重命名标签等相关操作前会重新加载配置。
 - 启动自动建标签：通过 `Data\Config\init.txt` 指定程序启动时自动创建的标签列表。
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
@@ -22,11 +23,10 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文件夹中：
 
 - `Data\Config`：配置目录，存放 `settings.txt`（全局设置）、`config.txt`（标签预设配置）和 `init.txt`（启动自动建标签）。
+- `Data\Backgrounds`：自动创建的标签背景目录，存放按标签名匹配的 `.png`、`.jpg`、`.jpeg` 图片。
 - `Data\Logs`：应用和 Host 日志，例如 `app-20260517.log`、`host-20260517.log`。每天生成一个新文件，程序启动时及跨天滚动时自动清理过期旧日志（默认保留 **30 天**，可在 `settings.txt` 中配置）。
 - `Data\Temp`：预留的临时文件目录。
 - `Data\WebView2`：WebView2 用户数据目录，包括缓存、Local State、GPUCache 等浏览器运行数据。
-
-`Backgrounds` 是用户手动创建的可选目录，程序只读取其中同名图片，不会自动创建它。
 
 便携性约定是：TrayTerminal 主动创建的配置、日志、缓存、临时文件都在程序目录内。Windows、.NET、WebView2 Runtime 自身可能存在系统级缓存或安装目录，这些不属于应用可控数据。
 
@@ -34,13 +34,15 @@ TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文�
 
 ### config.txt
 
-`Data\Config\config.txt` 是标签预设配置文件，YAML 格式。为特定名称的标签指定创建时的预设动作，名称区分大小写。程序会在创建、关闭、重命名标签等可能用到预设配置的操作前重新读取此文件，因此保存后不需要重启应用。支持的字段：
+`Data\Config\config.txt` 是标签预设配置文件，YAML 格式。为特定名称的标签指定创建时的预设动作，名称区分大小写。程序会在创建、关闭、重命名标签以及点击“重载壁纸”等可能用到预设配置的操作前重新读取此文件，因此保存后不需要重启应用。支持的字段：
 
 - `cd`：创建标签时将终端工作目录切换到指定路径。
 - `run`：终端启动后自动执行的命令（会自动按下回车）。
 - `fill`：终端启动后预填到命令行的内容（不按回车，等待用户手动执行）。`run` 和 `fill` 同时存在时仅 `run` 生效。
-- `bg`：终端背景图片路径，支持相对路径（相对于程序运行目录）和绝对路径。优先级高于 `Backgrounds` 目录的同名图片自动匹配；如果指定的文件不存在则不显示任何背景。
+- `bg`：终端背景图片路径，支持相对路径（仍相对于程序运行目录）和绝对路径。优先级高于 `Data\Backgrounds` 目录的同名图片自动匹配；如果指定的文件不存在则不显示任何背景。
 - `cover`：背景图遮罩强度，合法值是 `0` 到 `100` 的整数。`0` 表示原图，`100` 表示几乎全黑但仍能隐约看到原图。未设置或非法值按 `0` 处理。
+
+无论通过同名自动匹配还是 `bg` 指定，单张背景图片的硬上限都是 **32 MiB**。超限或读取失败时不会替换当前壁纸。
 
 配置文件读取会尽量容错：文件不存在、暂时不可读、正在保存导致读取失败时，本次按空配置处理并继续运行；空标签名会被跳过；非法或不存在的 `cd` 会被剔除并使用终端 Profile 的默认工作目录；非法 `bg` 会被忽略；格式不符合字段要求的行会被跳过；section 内部的空行会被安全忽略，不会截断后续属性。
 
@@ -50,7 +52,7 @@ TrayTerminal 的应用自有数据都写在程序运行目录下的 `Data` 文�
 MMSys:
   cd: "D:\Program Files\MMSys"
   run: "cmd run.bat"
-  bg: "./Backgrounds/1.png"
+  bg: "./Data/Backgrounds/1.png"
   cover: 45
 
 NapCat:
@@ -151,7 +153,7 @@ http://192.168.1.100:8443/ttyd?token=my_secret_token
 - **HTTP 请求总数有硬上限**：从 TCP 接受开始计算，整个服务最多同时处理 64 个请求（其中 WebSocket 仍受 32 个连接上限约束）；请求头必须在 10 秒内读完，超限的新连接立即关闭，慢速请求不会形成无界任务或长期占满服务
 - **终端结束会断开远程连接**：终端进程退出、标签被关闭或应用正在退出时，服务端会主动关闭对应的远程 WebSocket，避免浏览器窗口继续持有已经结束的终端会话
 - **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的 IPC 层按 64 KB 分片并逐块等待 ConPTY 写入确认；单个远程输入限制为 1 MB，任一输入操作限制为 4 MB，远程单条 WebSocket 消息限制为 16 MB。每个会话最多保留 64 个、合计 16 MB 的等待输入操作，超限会立即失败而不是继续占用内存
-- **不显示背景图**：远程浏览器无法访问本机的 `Backgrounds` 目录，因此不会显示终端背景图
+- **不显示背景图**：远程浏览器不接收本机的 `Data\Backgrounds` 图片，因此不会显示终端背景图
 - **HTTP 明文传输**：所有数据（包括令牌）通过 HTTP 明文传输。该功能设计用于可信局域网环境，不建议暴露到公网
 - **浏览器依赖**：需要浏览器支持 WebSocket。所有现代浏览器均支持
 
@@ -334,7 +336,7 @@ publish\TrayTerminal\TrayTerminal.exe
 - `ConPtySession.Start` 在每个 Win32 创建步骤之间都必须保持失败路径可释放：管道句柄、伪控制台、attribute list、Job Object 和 FileStream 的所有权转移不要简化，否则反复创建失败的终端可能泄漏句柄。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。
 - `terminal.html` 保留轻量 fallback 用于显示静态加载错误，但可恢复状态依赖锁定版本的 xterm.js + SerializeAddon；这两个静态文件缺失或不兼容时终端初始化必须失败，不能让不完整的 fallback 状态冒充权威状态。
-- 终端背景图通过 `data:` URL 内联到 WebView2，而非使用 `file://` URL。这样避免 WebView2 的浏览器缓存导致修改 `config.txt` 后背景图不更新。
+- 终端背景图只从 `Data\Backgrounds` 自动匹配；`config.txt` 的相对 `bg` 路径仍相对于程序目录。图片读取完成并确认不超过 32 MiB 后，才会通过 `data:` URL 原子应用到 WebView2；读取、大小检查或渲染失败会保留旧壁纸，避免重载竞态和浏览器缓存造成状态不一致。
 - 终端输出由 `TerminalStateHub` 分配单调序列，并保存最多 8 MB 的最新 xterm.js SerializeAddon 快照，以及最多 8 MB、4096 块的快照后尾流；双重上限避免极端细碎输出的对象开销突破内存边界。`TerminalView` 的 1024 块有界队列由单个泵任务在 UI 线程上合批调用 `ExecuteScriptAsync`；队列满时后续序列检查会强制从快照重建，不能使用 `DropOldest` 静默跳过 VT 字节。快照生成至少间隔 2 秒，并仅序列化最近 256 行滚动历史，单个快照硬限制 8 MB。
 - `TerminalView` 订阅了 `CoreWebView2.ProcessFailed`：渲染进程崩溃（`RenderProcessExited`）和本地逻辑序列缺口会重建当前控件，并从有效快照+完整尾流恢复，但不会错误地使所有标签共享的浏览器环境失效；只有主浏览器进程退出（`BrowserProcessExited`）或脚本调用返回 `RPC_E_DISCONNECTED` 时才会使旧环境失效。不可见标签仍会把 WebView2 重建延迟到再次选中；若此期间尾流超过硬上限，状态已经不可重建，必须明确提示用户重建标签页，不能无限重试或从空状态冒充权威状态。首次初始化及断连重试仍有 30 秒 `ready` 超时，避免页面异常时永久挂起。
 - 远程访问功能通过 `RemoteAccessService` 内置的轻量 TCP HTTP/WebSocket 服务实现，避免把 `Microsoft.AspNetCore.App` 变成目标机器的额外运行时依赖。远程协议版本为 2：按 `syncStart → snapshot → replay/output → syncComplete → 当前权威尺寸` 建立状态，之后每个 `output` 必须连续；浏览器按 WebSocket 世代串行处理消息，并等待 xterm `write` 回调后才推进序列或处理 size/`syncComplete`，旧连接回调不能污染重连后的状态。`TerminalStateSubscription` 在断开时必须释放，以免会话继续持有浏览器客户端。
