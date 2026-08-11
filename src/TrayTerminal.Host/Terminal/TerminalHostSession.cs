@@ -6,9 +6,19 @@ namespace TrayTerminal.Host.Terminal;
 
 internal sealed class TerminalHostSession : IDisposable
 {
+    private const int MaxQueuedInputChunks = 64;
+    private static readonly TimeSpan OutputDrainTimeout = TimeSpan.FromSeconds(3);
     private readonly ConPtySession _conPty;
     private readonly FileLogger _logger;
-    private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly SemaphoreSlim _controlSendGate = new(1, 1);
+    private readonly SemaphoreSlim _inputSignal = new(0);
+    private readonly SemaphoreSlim _resizeSignal = new(0);
+    private readonly object _inputLock = new();
+    private readonly object _resizeLock = new();
+    private readonly Queue<PendingInput> _ordinaryInputs = new();
+    private readonly Queue<PendingInput> _interrupts = new();
+    private PendingResize? _pendingResize;
+    private bool _acceptingResizes = true;
 
     private TerminalHostSession(ConPtySession conPty, FileLogger logger)
     {
@@ -29,57 +39,199 @@ internal sealed class TerminalHostSession : IDisposable
         return new TerminalHostSession(conPty, logger);
     }
 
-    public async Task<int> RunAsync(PipeStream pipe, CancellationToken cancellationToken)
+    public async Task<int> RunAsync(
+        PipeStream outputPipe,
+        PipeStream controlPipe,
+        CancellationToken cancellationToken)
     {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        // The Host owns three concurrent flows: terminal output to App, App input to
-        // terminal, and shell-exit detection. Any one ending should tear down the rest.
-        var outputTask = PumpTerminalOutputAsync(pipe, linkedCts.Token);
-        var inputTask = PumpClientInputAsync(pipe, linkedCts.Token);
-        var exitTask = WaitForExitAsync(pipe, linkedCts.Token);
+        using var outputCts = CancellationTokenSource.CreateLinkedTokenSource(
+            linkedCts.Token);
+        var outputTask = PumpTerminalEventsAsync(outputPipe, outputCts.Token);
+        var controlTask = PumpControlAsync(controlPipe, linkedCts.Token);
+        var inputTask = PumpConPtyInputAsync(controlPipe, linkedCts.Token);
+        var exitTask = _conPty.WaitForExitAsync(linkedCts.Token);
 
-        var completed = await Task.WhenAny(outputTask, inputTask, exitTask).ConfigureAwait(false);
-        if (completed == exitTask)
+        var completed = await Task.WhenAny(
+            exitTask,
+            outputTask,
+            controlTask,
+            inputTask).ConfigureAwait(false);
+        if (completed != exitTask && !exitTask.IsCompleted)
         {
             linkedCts.Cancel();
-            var exitCode = await exitTask.ConfigureAwait(false);
-            await SuppressAsync(outputTask, inputTask).ConfigureAwait(false);
-            return exitCode;
+            _conPty.KillProcessTree();
+            await SuppressAsync(
+                outputTask,
+                controlTask,
+                inputTask,
+                exitTask).ConfigureAwait(false);
+            return 1;
+        }
+
+        var exitCode = await exitTask.ConfigureAwait(false);
+        _logger.Info($"Terminal process {_conPty.ProcessId} exited with code {exitCode}; draining ConPTY output.");
+        var exitDeadline = DateTime.UtcNow + OutputDrainTimeout;
+        var abandonedResize = StopAcceptingResizes();
+        if (abandonedResize is not null)
+        {
+            await TrySendResizeResultBeforeDeadlineAsync(
+                controlPipe,
+                abandonedResize.RequestId,
+                accepted: false,
+                exitDeadline).ConfigureAwait(false);
+        }
+        _conPty.CompleteProcessExit();
+
+        var outputComplete = false;
+        try
+        {
+            var drainBudget = Remaining(exitDeadline) - TimeSpan.FromMilliseconds(250);
+            if (drainBudget <= TimeSpan.Zero)
+            {
+                throw new TimeoutException();
+            }
+
+            await outputTask.WaitAsync(drainBudget).ConfigureAwait(false);
+            outputComplete = true;
+        }
+        catch (TimeoutException)
+        {
+            _logger.Warn(
+                $"ConPTY output for process {_conPty.ProcessId} did not drain within 3 seconds.");
+        }
+        catch (Exception exception)
+        {
+            _logger.Warn(
+                $"ConPTY output for process {_conPty.ProcessId} was incomplete: {exception.Message}");
+        }
+
+        if (!outputComplete)
+        {
+            outputCts.Cancel();
+        }
+
+        if (outputComplete)
+        {
+            try
+            {
+                using var boundaryCts = CreateDeadlineToken(exitDeadline);
+                await IpcProtocol.WriteAsync(
+                    outputPipe,
+                    new IpcMessage(IpcMessageType.OutputCompleted, [1]),
+                    boundaryCts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                outputComplete = false;
+            }
+        }
+
+        try
+        {
+            using var exitCts = CreateDeadlineToken(exitDeadline);
+            await SendControlAsync(
+                controlPipe,
+                new IpcMessage(
+                    IpcMessageType.Exit,
+                    IpcProtocol.EncodeExitStatus(exitCode, outputComplete)),
+                exitCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
         }
 
         linkedCts.Cancel();
-        _conPty.KillProcessTree();
-        await SuppressAsync(outputTask, inputTask, exitTask).ConfigureAwait(false);
-        return 0;
+        await SuppressAsync(
+            outputTask,
+            controlTask,
+            inputTask).ConfigureAwait(false);
+        return exitCode;
     }
 
     public void Dispose()
     {
-        _sendGate.Dispose();
+        _controlSendGate.Dispose();
+        _inputSignal.Dispose();
+        _resizeSignal.Dispose();
         _conPty.Dispose();
     }
 
-    private async Task PumpTerminalOutputAsync(PipeStream pipe, CancellationToken cancellationToken)
+    private async Task PumpTerminalEventsAsync(
+        PipeStream outputPipe,
+        CancellationToken cancellationToken)
     {
         var buffer = new byte[8192];
+        Task<int>? readTask = null;
+        Task? resizeWaitTask = null;
         while (!cancellationToken.IsCancellationRequested)
         {
-            var read = await _conPty.Output.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken).ConfigureAwait(false);
-            if (read == 0)
+            readTask ??= _conPty.Output.ReadAsync(
+                buffer.AsMemory(0, buffer.Length),
+                cancellationToken).AsTask();
+            resizeWaitTask ??= _resizeSignal.WaitAsync(cancellationToken);
+            if (!readTask.IsCompleted && !resizeWaitTask.IsCompleted)
             {
-                return;
+                await Task.WhenAny(readTask, resizeWaitTask).ConfigureAwait(false);
             }
 
-            var payload = buffer.AsSpan(0, read).ToArray();
-            await SendAsync(pipe, new IpcMessage(IpcMessageType.Output, payload), cancellationToken).ConfigureAwait(false);
+            // A completed read always wins over resize. This is the crucial
+            // ordering point: bytes already removed from ConPTY cannot appear
+            // after a resize boundary that was requested later.
+            if (readTask.IsCompleted)
+            {
+                var read = await readTask.ConfigureAwait(false);
+                readTask = null;
+                if (read == 0)
+                {
+                    return;
+                }
+
+                await IpcProtocol.WriteAsync(
+                    outputPipe,
+                    new IpcMessage(
+                        IpcMessageType.Output,
+                        buffer.AsSpan(0, read).ToArray()),
+                    cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            await resizeWaitTask.ConfigureAwait(false);
+            resizeWaitTask = null;
+            PendingResize? resize;
+            lock (_resizeLock)
+            {
+                resize = _pendingResize;
+                _pendingResize = null;
+            }
+
+            if (resize is null)
+            {
+                continue;
+            }
+
+            _conPty.Resize(resize.Columns, resize.Rows);
+            await IpcProtocol.WriteAsync(
+                outputPipe,
+                new IpcMessage(
+                    IpcMessageType.ResizeBoundary,
+                    IpcProtocol.EncodeResizeRequest(
+                        resize.RequestId,
+                        resize.Columns,
+                        resize.Rows)),
+                cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private async Task PumpClientInputAsync(PipeStream pipe, CancellationToken cancellationToken)
+    private async Task PumpControlAsync(
+        PipeStream controlPipe,
+        CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            var message = await IpcProtocol.ReadAsync(pipe, cancellationToken).ConfigureAwait(false);
+            var message = await IpcProtocol.ReadAsync(
+                controlPipe,
+                cancellationToken).ConfigureAwait(false);
             if (message is null)
             {
                 return;
@@ -88,66 +240,265 @@ internal sealed class TerminalHostSession : IDisposable
             switch (message.Value.Type)
             {
                 case IpcMessageType.Input:
+                {
                     var (requestId, input) = IpcProtocol.DecodeInput(message.Value.Payload);
-                    await _conPty.Input.WriteAsync(input, cancellationToken).ConfigureAwait(false);
-                    await _conPty.Input.FlushAsync(cancellationToken).ConfigureAwait(false);
-                    // Ack only after the bytes have been accepted by the ConPTY
-                    // input pipe. The App/browser must not interpret pipe delivery
-                    // to this Host as successful terminal input.
-                    await SendAsync(
-                        pipe,
-                        new IpcMessage(
+                    if (!TryEnqueueInput(new PendingInput(
+                            requestId,
+                            input.ToArray(),
+                            IsInterrupt: false)))
+                    {
+                        await SendInputResultAsync(
+                            controlPipe,
                             IpcMessageType.InputAck,
-                            IpcProtocol.EncodeRequestId(requestId)),
-                        cancellationToken).ConfigureAwait(false);
+                            requestId,
+                            accepted: false,
+                            cancellationToken).ConfigureAwait(false);
+                    }
                     break;
+                }
+
+                case IpcMessageType.Interrupt:
+                {
+                    var requestId = IpcProtocol.DecodeRequestId(message.Value.Payload);
+                    var result = EnqueueInterrupt(requestId);
+                    foreach (var canceledRequestId in result.CanceledRequestIds)
+                    {
+                        await SendInputResultAsync(
+                            controlPipe,
+                            IpcMessageType.InputAck,
+                            canceledRequestId,
+                            accepted: false,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    if (!result.Accepted)
+                    {
+                        await SendInputResultAsync(
+                            controlPipe,
+                            IpcMessageType.InterruptAck,
+                            requestId,
+                            accepted: false,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    break;
+                }
 
                 case IpcMessageType.Resize:
-                    var (columns, rows) = IpcProtocol.DecodeResize(message.Value.Payload);
-                    _conPty.Resize(columns, rows);
+                {
+                    var (requestId, columns, rows) =
+                        IpcProtocol.DecodeResizeRequest(message.Value.Payload);
+                    var replaced = QueueResize(
+                        new PendingResize(requestId, columns, rows));
+                    if (replaced is not null)
+                    {
+                        await SendInputResultAsync(
+                            controlPipe,
+                            IpcMessageType.ResizeAck,
+                            replaced.RequestId,
+                            accepted: false,
+                            cancellationToken).ConfigureAwait(false);
+                    }
                     break;
+                }
 
                 case IpcMessageType.Kill:
                     _conPty.KillProcessTree();
                     return;
 
                 case IpcMessageType.Heartbeat:
-                    await SendAsync(pipe, IpcMessage.Empty(IpcMessageType.Heartbeat), cancellationToken).ConfigureAwait(false);
+                    await SendControlAsync(
+                        controlPipe,
+                        IpcMessage.Empty(IpcMessageType.Heartbeat),
+                        cancellationToken).ConfigureAwait(false);
                     break;
             }
         }
     }
 
-    private async Task<int> WaitForExitAsync(PipeStream pipe, CancellationToken cancellationToken)
+    private bool TryEnqueueInput(PendingInput input)
     {
-        var exitCode = await _conPty.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        _logger.Info($"Terminal process {_conPty.ProcessId} exited with code {exitCode}.");
+        lock (_inputLock)
+        {
+            if (_ordinaryInputs.Count + _interrupts.Count >= MaxQueuedInputChunks)
+            {
+                return false;
+            }
 
-        try
-        {
-            await SendAsync(pipe, new IpcMessage(IpcMessageType.Exit, IpcProtocol.EncodeExit(exitCode)), cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (IOException)
-        {
+            _ordinaryInputs.Enqueue(input);
         }
 
-        return exitCode;
+        _inputSignal.Release();
+        return true;
     }
 
-    private async Task SendAsync(PipeStream pipe, IpcMessage message, CancellationToken cancellationToken)
+    private PendingResize? QueueResize(PendingResize resize)
     {
-        await _sendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var signal = false;
+        PendingResize? replaced;
+        lock (_resizeLock)
+        {
+            if (!_acceptingResizes)
+            {
+                return resize;
+            }
+
+            // App-side ownership coalescing normally leaves only one request.
+            // Keeping only the newest here is the final hard bound if a malformed
+            // or future client violates that contract.
+            signal = _pendingResize is null;
+            replaced = _pendingResize;
+            _pendingResize = resize;
+        }
+
+        if (signal)
+        {
+            _resizeSignal.Release();
+        }
+
+        return replaced;
+    }
+
+    private PendingResize? StopAcceptingResizes()
+    {
+        lock (_resizeLock)
+        {
+            _acceptingResizes = false;
+            var abandoned = _pendingResize;
+            _pendingResize = null;
+            return abandoned;
+        }
+    }
+
+    private InterruptEnqueueResult EnqueueInterrupt(long requestId)
+    {
+        long[] canceled;
+        bool accepted;
+        lock (_inputLock)
+        {
+            canceled = _ordinaryInputs.Select(input => input.RequestId).ToArray();
+            _ordinaryInputs.Clear();
+            accepted = _interrupts.Count < MaxQueuedInputChunks;
+            if (accepted)
+            {
+                _interrupts.Enqueue(new PendingInput(
+                    requestId,
+                    new byte[] { 0x03 },
+                    IsInterrupt: true));
+            }
+        }
+
+        if (accepted)
+        {
+            _inputSignal.Release();
+        }
+        return new InterruptEnqueueResult(canceled, accepted);
+    }
+
+    private async Task PumpConPtyInputAsync(
+        PipeStream controlPipe,
+        CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await _inputSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
+            PendingInput? input;
+            lock (_inputLock)
+            {
+                if (_interrupts.Count > 0)
+                {
+                    input = _interrupts.Dequeue();
+                }
+                else
+                {
+                    input = _ordinaryInputs.Count > 0
+                        ? _ordinaryInputs.Dequeue()
+                        : null;
+                }
+            }
+
+            if (input is null)
+            {
+                continue;
+            }
+
+            await _conPty.Input.WriteAsync(
+                input.Data,
+                cancellationToken).ConfigureAwait(false);
+            await _conPty.Input.FlushAsync(cancellationToken).ConfigureAwait(false);
+            await SendInputResultAsync(
+                controlPipe,
+                input.IsInterrupt
+                    ? IpcMessageType.InterruptAck
+                    : IpcMessageType.InputAck,
+                input.RequestId,
+                accepted: true,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private Task SendInputResultAsync(
+        PipeStream controlPipe,
+        IpcMessageType type,
+        long requestId,
+        bool accepted,
+        CancellationToken cancellationToken)
+    {
+        return SendControlAsync(
+            controlPipe,
+            new IpcMessage(
+                type,
+                IpcProtocol.EncodeInputResult(requestId, accepted)),
+            cancellationToken);
+    }
+
+    private async Task SendControlAsync(
+        PipeStream controlPipe,
+        IpcMessage message,
+        CancellationToken cancellationToken)
+    {
+        await _controlSendGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await IpcProtocol.WriteAsync(pipe, message, cancellationToken).ConfigureAwait(false);
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                message,
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            _sendGate.Release();
+            _controlSendGate.Release();
         }
+    }
+
+    private async Task TrySendResizeResultBeforeDeadlineAsync(
+        PipeStream controlPipe,
+        long requestId,
+        bool accepted,
+        DateTime deadline)
+    {
+        try
+        {
+            using var deadlineCts = CreateDeadlineToken(deadline);
+            await SendInputResultAsync(
+                controlPipe,
+                IpcMessageType.ResizeAck,
+                requestId,
+                accepted,
+                deadlineCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+        }
+    }
+
+    private static TimeSpan Remaining(DateTime deadline)
+    {
+        var remaining = deadline - DateTime.UtcNow;
+        return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+    }
+
+    private static CancellationTokenSource CreateDeadlineToken(DateTime deadline)
+    {
+        return new CancellationTokenSource(Remaining(deadline));
     }
 
     private static async Task SuppressAsync(params Task[] tasks)
@@ -158,18 +509,23 @@ internal sealed class TerminalHostSession : IDisposable
             {
                 await task.ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
-            {
-            }
-            catch (IOException)
-            {
-            }
-            catch (ObjectDisposedException)
-            {
-            }
             catch
             {
             }
         }
     }
+
+    private sealed record PendingInput(
+        long RequestId,
+        ReadOnlyMemory<byte> Data,
+        bool IsInterrupt);
+
+    private sealed record InterruptEnqueueResult(
+        long[] CanceledRequestIds,
+        bool Accepted);
+
+    private sealed record PendingResize(
+        long RequestId,
+        int Columns,
+        int Rows);
 }

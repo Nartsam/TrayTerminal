@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Windows;
 using System.Text.Json;
@@ -43,6 +44,7 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     private readonly SemaphoreSlim _webViewGate = new(1, 1);
     private readonly SemaphoreSlim _backgroundUpdateGate = new(1, 1);
     private readonly CancellationTokenSource _lifetimeCts = new();
+    private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> _pendingBatches = new();
     private readonly Channel<TerminalOutput> _outputQueue = Channel.CreateBounded<TerminalOutput>(
         new BoundedChannelOptions(OutputQueueCapacity)
         {
@@ -71,7 +73,6 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     private int _renderCrashCount;
     private int _recoveryFailed;
     private int _outputQueueOverflow;
-    private int _snapshotRejected;
     private int _logicalRecoveryScheduled;
     private long _lastRenderCrashTicks;
 
@@ -383,8 +384,14 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                 var payload = JsonSerializer.Serialize(
                     batch.Select(output => new
                     {
-                        sequence = output.Sequence,
-                        data = Convert.ToBase64String(output.Data)
+                        type = output.IsResize ? "resize" : "output",
+                        sequence = output.Sequence.ToString(
+                            System.Globalization.CultureInfo.InvariantCulture),
+                        data = output.IsResize
+                            ? null
+                            : Convert.ToBase64String(output.Data),
+                        cols = output.Resize?.Columns,
+                        rows = output.Resize?.Rows
                     }));
                 var recoveryAttempts = 0;
                 while (!_disposed)
@@ -397,8 +404,36 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
 
                     try
                     {
-                        await webView.ExecuteScriptAsync(
-                            $"window.trayTerminal.writeSequencedBatch({payload});");
+                        var batchId = Guid.NewGuid().ToString("N");
+                        var applied = new TaskCompletionSource<bool>(
+                            TaskCreationOptions.RunContinuationsAsynchronously);
+                        if (!_pendingBatches.TryAdd(batchId, applied))
+                        {
+                            throw new InvalidOperationException(
+                                "Duplicate local terminal batch ID.");
+                        }
+
+                        try
+                        {
+                            var accepted = await webView.ExecuteScriptAsync(
+                                $"window.trayTerminal.writeSequencedBatch("
+                                + $"{payload},{JsonSerializer.Serialize(batchId)});");
+                            if (!string.Equals(
+                                    accepted,
+                                    "true",
+                                    StringComparison.OrdinalIgnoreCase)
+                                || !await applied.Task.WaitAsync(
+                                    InitializationTimeout,
+                                    _lifetimeCts.Token))
+                            {
+                                throw new InvalidOperationException(
+                                    "The local terminal replica rejected an output batch.");
+                            }
+                        }
+                        finally
+                        {
+                            _pendingBatches.TryRemove(batchId, out _);
+                        }
                         _scriptWriteFailing = false;
                         break;
                     }
@@ -602,62 +637,13 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         }
     }
 
-    private async void OnSessionSizeChanged(object? sender, TerminalSizeUpdate update)
+    private void OnSessionSizeChanged(object? sender, TerminalSizeUpdate update)
     {
-        try
-        {
-            Columns = update.Size.Columns;
-            Rows = update.Size.Rows;
-            if (_disposed)
-            {
-                return;
-            }
-
-            if (Dispatcher.CheckAccess())
-            {
-                await ApplyAuthoritativeSizeAsync(update.Size);
-            }
-            else
-            {
-                await Dispatcher.InvokeAsync(
-                    () => ApplyAuthoritativeSizeAsync(update.Size)).Task.Unwrap();
-            }
-        }
-        catch (Exception exception)
-        {
-            if (!_disposed)
-            {
-                _logger.Error(exception, "Failed to dispatch authoritative terminal size.");
-            }
-        }
-    }
-
-    private async Task ApplyAuthoritativeSizeAsync(TerminalSize size)
-    {
-        var webView = _webView;
-        if (!_ready || _disposed || webView is null)
-        {
-            return;
-        }
-
-        try
-        {
-            await ApplyAuthoritativeSizeCoreAsync(webView, size);
-        }
-        catch (Exception exception) when (IsBrowserDisconnected(exception))
-        {
-            await RecoverWebViewAsync(
-                webView,
-                "authoritative resize delivery was disconnected",
-                exception);
-        }
-        catch (Exception exception)
-        {
-            if (!_disposed)
-            {
-                _logger.Error(exception, "Failed to apply authoritative terminal size.");
-            }
-        }
+        Columns = update.Size.Columns;
+        Rows = update.Size.Rows;
+        // Rendering resize is delivered only through the sequenced output
+        // stream. Applying this ownership notification directly could race
+        // ahead of older output that was already queued for the replica.
     }
 
     private async Task RestoreAuthoritativeStateAsync(WebView2 webView)
@@ -670,7 +656,6 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                 + "Rebuild the terminal tab.");
         }
 
-        using var replay = new MemoryStream();
         var expectedSequence = state.Snapshot.Sequence + 1;
         foreach (var output in state.Replay)
         {
@@ -680,7 +665,6 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                     "Terminal checkpoint replay contains an output sequence gap.");
             }
 
-            replay.Write(output.Data, 0, output.Data.Length);
             expectedSequence++;
         }
 
@@ -693,10 +677,17 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         var snapshot = JsonSerializer.Serialize(
             Convert.ToBase64String(state.Snapshot.Data));
         var replayPayload = JsonSerializer.Serialize(
-            Convert.ToBase64String(
-                replay.GetBuffer(),
-                0,
-                (int)replay.Length));
+            state.Replay.Select(output => new
+            {
+                type = output.IsResize ? "resize" : "output",
+                sequence = output.Sequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                data = output.IsResize
+                    ? null
+                    : Convert.ToBase64String(output.Data),
+                cols = output.Resize?.Columns,
+                rows = output.Resize?.Rows
+            }));
         var restoreId = Guid.NewGuid().ToString("N");
         var restored = new TaskCompletionSource<bool>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -728,8 +719,8 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             var snapshotSize = state.Snapshot.Size;
             var accepted = await webView.ExecuteScriptAsync(
                 $"window.trayTerminal.restoreState("
-                + $"{state.Snapshot.Sequence},{snapshot},"
-                + $"{state.LatestSequence},{replayPayload},"
+                + $"{JsonSerializer.Serialize(state.Snapshot.Sequence.ToString())},{snapshot},"
+                + $"{JsonSerializer.Serialize(state.LatestSequence.ToString())},{replayPayload},"
                 + $"{snapshotSize.Columns},{snapshotSize.Rows},"
                 + $"{JsonSerializer.Serialize(restoreId)});");
             if (!string.Equals(accepted, "true", StringComparison.OrdinalIgnoreCase))
@@ -1010,6 +1001,11 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
         IsVisibleChanged -= OnIsVisibleChanged;
         _session.SizeChanged -= OnSessionSizeChanged;
         _lifetimeCts.Cancel();
+        foreach (var source in _pendingBatches.Values)
+        {
+            source.TrySetCanceled();
+        }
+        _pendingBatches.Clear();
         _outputQueue.Writer.TryComplete();
         _backgroundDataUri = null;
         DisposeCurrentWebView();
@@ -1104,6 +1100,21 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                     }
                     break;
 
+                case "interrupt":
+                    await _session.TryInterruptAsync();
+                    break;
+
+                case "batchApplied":
+                case "batchRejected":
+                    if (root.TryGetProperty("batchId", out var batchId)
+                        && batchId.GetString() is { } id
+                        && _pendingBatches.TryGetValue(id, out var batchSource))
+                    {
+                        batchSource.TrySetResult(
+                            typeProperty.GetString() == "batchApplied");
+                    }
+                    break;
+
                 case "copy":
                     if (root.TryGetProperty("data", out var copyData))
                     {
@@ -1133,60 +1144,6 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                             _terminalClientId,
                             Columns,
                             Rows);
-                    }
-                    break;
-
-                case "snapshot":
-                    if (root.TryGetProperty("sequence", out var sequenceProperty)
-                        && sequenceProperty.TryGetInt64(out var sequence)
-                        && root.TryGetProperty("data", out var snapshotData)
-                        && root.TryGetProperty("cols", out var snapshotColumns)
-                        && snapshotColumns.TryGetInt32(out var snapshotColumnCount)
-                        && root.TryGetProperty("rows", out var snapshotRows)
-                        && snapshotRows.TryGetInt32(out var snapshotRowCount))
-                    {
-                        var base64 = snapshotData.GetString();
-                        if (base64 is null
-                            || base64.Length > TerminalStateHub.DefaultSnapshotByteLimit * 2)
-                        {
-                            break;
-                        }
-
-                        try
-                        {
-                            var snapshot = Convert.FromBase64String(base64);
-                            if (!_session.TryAcceptSnapshot(
-                                    sequence,
-                                    snapshot,
-                                    snapshotColumnCount,
-                                    snapshotRowCount))
-                            {
-                                if (Interlocked.Exchange(ref _snapshotRejected, 1) == 0)
-                                {
-                                    _logger.Warn(
-                                        "Rejected a terminal state checkpoint; "
-                                        + "remote recovery remains on the previous "
-                                        + "bounded checkpoint.");
-                                }
-                            }
-                            else
-                            {
-                                Interlocked.Exchange(ref _snapshotRejected, 0);
-                            }
-                        }
-                        catch (FormatException)
-                        {
-                        }
-                    }
-                    break;
-
-                case "snapshotUnavailable":
-                    if (Interlocked.Exchange(ref _snapshotRejected, 1) == 0)
-                    {
-                        _logger.Warn(
-                            "xterm.js could not produce a checkpoint under the "
-                            + "8 MB limit; new remote recovery will be refused "
-                            + "if the existing tail later overflows.");
                     }
                     break;
 

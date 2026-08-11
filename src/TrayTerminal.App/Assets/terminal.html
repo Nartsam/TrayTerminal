@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="./xterm/xterm.css" />
   <script src="./xterm/xterm.js"></script>
   <script src="./xterm/addon-serialize.js"></script>
+  <script src="./terminal-input-policy.js"></script>
   <title>TrayTerminal</title>
   <style>
     html,
@@ -71,20 +72,15 @@
       const encoder = new TextEncoder();
       const terminalHost = document.getElementById('terminal');
       const fallback = document.getElementById('fallback');
-      const maxSnapshotBytes = 8 * 1024 * 1024;
-      const checkpointIntervalMs = 2000;
       let terminal = null;
       let serializeAddon = null;
       let fontSize = 16;
       let lastCols = 120;
       let lastRows = 30;
-      let queuedSequence = 0;
-      let parsedSequence = 0;
-      let lastSnapshotSequence = -1;
-      let lastSnapshotAt = 0;
-      let snapshotInProgress = false;
-      let checkpointTimer = null;
-      let checkpointForced = false;
+      let queuedSequence = 0n;
+      let parsedSequence = 0n;
+      let composing = false;
+      let interruptHeld = false;
 
       function post(message) {
         if (window.chrome && window.chrome.webview) {
@@ -103,89 +99,6 @@
           bytes[i] = binary.charCodeAt(i);
         }
         return bytes;
-      }
-
-      function bytesToBase64(bytes) {
-        const chunkSize = 0x8000;
-        let binary = '';
-        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-          const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
-          binary += String.fromCharCode.apply(null, chunk);
-        }
-        return btoa(binary);
-      }
-
-      function createBoundedSnapshot() {
-        if (!serializeAddon) return null;
-
-        // The terminal itself keeps 5000 scrollback lines for the local user,
-        // but checkpoints intentionally serialize a bounded suffix. Reducing the
-        // suffix protects the permanent background service from pathological
-        // per-cell style sequences producing oversized snapshots.
-        let scrollback = 256;
-        while (scrollback >= 0) {
-          const serialized = serializeAddon.serialize({ scrollback });
-          const bytes = encoder.encode(serialized);
-          if (bytes.length <= maxSnapshotBytes) {
-            return bytes;
-          }
-          if (scrollback === 0) break;
-          scrollback = Math.floor(scrollback / 2);
-        }
-        return null;
-      }
-
-      function maybeCheckpoint(force) {
-        if (!terminal || !serializeAddon || snapshotInProgress ||
-            parsedSequence !== queuedSequence) {
-          return;
-        }
-
-        const now = Date.now();
-        if (!force &&
-            parsedSequence === lastSnapshotSequence) {
-          return;
-        }
-        const elapsed = now - lastSnapshotAt;
-        if (lastSnapshotAt > 0 && elapsed < checkpointIntervalMs) {
-          checkpointForced = checkpointForced || force;
-          if (checkpointTimer === null) {
-            checkpointTimer = window.setTimeout(() => {
-              checkpointTimer = null;
-              const scheduledForce = checkpointForced;
-              checkpointForced = false;
-              maybeCheckpoint(scheduledForce);
-            }, checkpointIntervalMs - elapsed);
-          }
-          return;
-        }
-
-        snapshotInProgress = true;
-        try {
-          if (checkpointTimer !== null) {
-            window.clearTimeout(checkpointTimer);
-            checkpointTimer = null;
-          }
-          checkpointForced = false;
-          const bytes = createBoundedSnapshot();
-          if (!bytes) {
-            lastSnapshotAt = now;
-            post({ type: 'snapshotUnavailable', sequence: parsedSequence });
-            return;
-          }
-
-          post({
-            type: 'snapshot',
-            sequence: parsedSequence,
-            cols: terminal.cols,
-            rows: terminal.rows,
-            data: bytesToBase64(bytes)
-          });
-          lastSnapshotSequence = parsedSequence;
-          lastSnapshotAt = now;
-        } finally {
-          snapshotInProgress = false;
-        }
       }
 
       function requestPaste() {
@@ -211,12 +124,27 @@
           return typeof terminal.getSelection === 'function' ? terminal.getSelection() : '';
         }
 
-        if (target && typeof target.selectionStart === 'number' && typeof target.selectionEnd === 'number') {
+        if (target && typeof target.selectionStart === 'number' &&
+            typeof target.selectionEnd === 'number' &&
+            target.selectionStart !== target.selectionEnd) {
           return target.value.substring(target.selectionStart, target.selectionEnd);
         }
 
         const selection = window.getSelection();
         return selection && !selection.isCollapsed ? selection.toString() : '';
+      }
+
+      function hasAnySelection(target) {
+        if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
+          return true;
+        }
+        if (target && typeof target.selectionStart === 'number' &&
+            typeof target.selectionEnd === 'number' &&
+            target.selectionStart !== target.selectionEnd) {
+          return true;
+        }
+        const selection = window.getSelection();
+        return !!selection && !selection.isCollapsed && selection.toString().length > 0;
       }
 
       function stopShortcut(event) {
@@ -232,18 +160,46 @@
         }
 
         if (isClipboardShortcut(event, 'c')) {
-          const selectedText = selectedTextFor(target);
-          if (selectedText) {
+          if (hasAnySelection(target)) {
             stopShortcut(event);
-            requestCopy(selectedText);
+            requestCopy(selectedTextFor(target));
             return true;
           }
+
+          const active = document.activeElement;
+          const terminalFocused = active &&
+            (terminalHost.contains(active) || active === fallback);
+          const decision = window.TrayTerminalInputPolicy
+            ? window.TrayTerminalInputPolicy.classifyCtrlC({
+                hasSelection: false,
+                isTrusted: event.isTrusted,
+                focused: !!terminalFocused,
+                isComposing: composing || event.isComposing,
+                repeat: event.repeat,
+                held: interruptHeld
+              })
+            : 'consume';
+          if (decision === 'interrupt') {
+            interruptHeld = true;
+            stopShortcut(event);
+            post({ type: 'interrupt' });
+          }
+          // A no-selection Ctrl+C is always consumed here. Synthetic, repeated,
+          // composing or unfocused events must never fall through to xterm.onData.
+          stopShortcut(event);
+          return true;
         }
 
         return false;
       }
 
       function handleTerminalKeyEvent(event) {
+        if (event.type === 'keyup' &&
+            typeof event.key === 'string' &&
+            event.key.toLowerCase() === 'c') {
+          interruptHeld = false;
+          return true;
+        }
         if (event.type !== 'keydown') {
           return true;
         }
@@ -336,6 +292,12 @@
           }
         });
 
+        target.addEventListener('keyup', event => {
+          if (typeof event.key === 'string' && event.key.toLowerCase() === 'c') {
+            interruptHeld = false;
+          }
+        });
+
         target.addEventListener('paste', event => {
           const text = event.clipboardData.getData('text/plain');
           if (text) {
@@ -380,71 +342,130 @@
         }
 
         estimateSize();
+        document.addEventListener('compositionstart', () => { composing = true; });
+        document.addEventListener('compositionend', () => { composing = false; });
+        document.addEventListener('keyup', event => {
+          if (typeof event.key === 'string' && event.key.toLowerCase() === 'c') {
+            interruptHeld = false;
+          }
+        }, true);
+        // Do not clear an active latch on window blur: the physical C key may
+        // still be held while keyup is hidden from this renderer. The next keyup
+        // is deliberately required before another interrupt can be generated.
         post({ type: 'ready' });
       }
 
       window.trayTerminal = {
-        writeSequencedBatch(outputs) {
+        writeSequencedBatch(outputs, batchId) {
           if (!terminal || !Array.isArray(outputs)) return false;
-          for (const output of outputs) {
-            if (!output || !Number.isSafeInteger(output.sequence) ||
-                typeof output.data !== 'string') {
-              return false;
+          let index = 0;
+          const applyNext = () => {
+            if (index >= outputs.length) {
+              post({ type: 'batchApplied', batchId, sequence: parsedSequence.toString() });
+              return;
             }
-            if (output.sequence <= queuedSequence) {
-              continue;
+
+            const output = outputs[index++];
+            if (!output || typeof output.sequence !== 'string' ||
+                !/^\d+$/.test(output.sequence)) {
+              post({ type: 'batchRejected', batchId, reason: 'invalidEvent' });
+              return;
             }
-            if (output.sequence !== queuedSequence + 1) {
+            const sequence = BigInt(output.sequence);
+            if (sequence <= queuedSequence) {
+              applyNext();
+              return;
+            }
+            if (sequence !== queuedSequence + 1n) {
               post({
                 type: 'stateGap',
-                expected: queuedSequence + 1,
+                expected: (queuedSequence + 1n).toString(),
                 actual: output.sequence
               });
+              post({ type: 'batchRejected', batchId, reason: 'sequenceGap' });
+              return;
+            }
+
+            queuedSequence = sequence;
+            if (output.type === 'resize') {
+              terminal.resize(
+                Math.max(20, Math.min(500, Number(output.cols) || 120)),
+                Math.max(5, Math.min(200, Number(output.rows) || 30)));
+              parsedSequence = sequence;
+              applyNext();
+              return;
+            }
+            if (output.type !== 'output' || typeof output.data !== 'string') {
+              post({ type: 'batchRejected', batchId, reason: 'invalidEvent' });
               return false;
             }
 
             const bytes = base64ToBytes(output.data);
-            const sequence = output.sequence;
-            queuedSequence = sequence;
             terminal.write(bytes, () => {
               parsedSequence = sequence;
-              maybeCheckpoint(false);
+              applyNext();
             });
-          }
+          };
+          applyNext();
           return true;
         },
         restoreState(snapshotSequence, snapshotPayload, latestSequence,
-                     replayPayload, columns, rows, restoreId) {
+                     replayEvents, columns, rows, restoreId) {
           if (!terminal || !serializeAddon ||
-              !Number.isSafeInteger(snapshotSequence) ||
-              !Number.isSafeInteger(latestSequence) ||
-              latestSequence < snapshotSequence) {
+              typeof snapshotSequence !== 'string' ||
+              typeof latestSequence !== 'string' ||
+              !/^\d+$/.test(snapshotSequence) ||
+              !/^\d+$/.test(latestSequence) ||
+              !Array.isArray(replayEvents) ||
+              BigInt(latestSequence) < BigInt(snapshotSequence)) {
             return false;
           }
 
           const snapshotBytes = base64ToBytes(snapshotPayload);
-          const replayBytes = base64ToBytes(replayPayload);
           terminal.reset();
           terminal.resize(
             Math.max(20, Math.min(500, Number(columns) || 120)),
             Math.max(5, Math.min(200, Number(rows) || 30)));
-          queuedSequence = latestSequence;
-          parsedSequence = snapshotSequence;
-          lastSnapshotSequence = -1;
+          queuedSequence = BigInt(snapshotSequence);
+          parsedSequence = BigInt(snapshotSequence);
 
           terminal.write(snapshotBytes, () => {
-            parsedSequence = snapshotSequence;
-            if (replayBytes.length > 0) {
-              terminal.write(replayBytes, () => {
-                parsedSequence = latestSequence;
-                maybeCheckpoint(true);
+            parsedSequence = BigInt(snapshotSequence);
+            let index = 0;
+            const applyReplay = () => {
+              if (index >= replayEvents.length) {
+                if (parsedSequence !== BigInt(latestSequence)) {
+                  post({ type: 'stateGap' });
+                  return;
+                }
                 post({ type: 'stateRestored', restoreId });
-              });
-            } else {
-              parsedSequence = latestSequence;
-              maybeCheckpoint(true);
-              post({ type: 'stateRestored', restoreId });
-            }
+                return;
+              }
+
+              const event = replayEvents[index++];
+              if (!event || typeof event.sequence !== 'string' ||
+                  !/^\d+$/.test(event.sequence) ||
+                  BigInt(event.sequence) !== queuedSequence + 1n) {
+                post({ type: 'stateGap' });
+                return;
+              }
+              queuedSequence = BigInt(event.sequence);
+              if (event.type === 'resize') {
+                terminal.resize(
+                  Math.max(20, Math.min(500, Number(event.cols) || 120)),
+                  Math.max(5, Math.min(200, Number(event.rows) || 30)));
+                parsedSequence = queuedSequence;
+                applyReplay();
+              } else if (event.type === 'output' && typeof event.data === 'string') {
+                terminal.write(base64ToBytes(event.data), () => {
+                  parsedSequence = queuedSequence;
+                  applyReplay();
+                });
+              } else {
+                post({ type: 'stateGap' });
+              }
+            };
+            applyReplay();
           });
           return true;
         },
@@ -453,7 +474,6 @@
           lastRows = Math.max(5, Math.min(200, Number(rows) || 30));
           if (terminal) {
             terminal.resize(lastCols, lastRows);
-            maybeCheckpoint(true);
           }
         },
         requestSizeEstimate() {

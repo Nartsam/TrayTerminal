@@ -1,0 +1,490 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./xterm/xterm.js"></script>
+  <script src="./xterm/addon-serialize.js"></script>
+</head>
+<body>
+<script>
+  (() => {
+    'use strict';
+
+    const protocolVersion = 3;
+    const maxStateBytes = Math.min(
+      8 * 1024 * 1024,
+      Math.max(1024, Number(window.trayAuthorityMaxStateBytes) || 8 * 1024 * 1024));
+    const engines = new Map();
+    const chains = new Map();
+    const encoder = new TextEncoder();
+    const eventOverheadBudget = Math.min(64 * 1024, maxStateBytes / 256);
+    let probeActive = false;
+    let probeStageCount = 0;
+
+    function post(message) {
+      message.version = protocolVersion;
+      window.chrome.webview.postMessage(message);
+    }
+
+    function fromBase64(value) {
+      const binary = atob(value || '');
+      const bytes = new Uint8Array(binary.length);
+      for (let offset = 0; offset < binary.length; offset++) {
+        bytes[offset] = binary.charCodeAt(offset);
+      }
+      return bytes;
+    }
+
+    function toBase64(bytes) {
+      let result = '';
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        result += String.fromCharCode.apply(
+          null,
+          bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length)));
+      }
+      return btoa(result);
+    }
+
+    function createEngine(cols, rows) {
+      const terminal = new Terminal({
+        cols,
+        rows,
+        scrollback: 256,
+        convertEol: true,
+        allowProposedApi: false
+      });
+      const serializeAddon = new SerializeAddon.SerializeAddon();
+      try {
+        terminal.loadAddon(serializeAddon);
+        return {
+          terminal,
+          serializeAddon,
+          sequence: 0n,
+          parserState: 0,
+          controlStringBytes: 0,
+          controlStringAllowsBell: false,
+          controlStringIsOsc: false,
+          controlStringPrefix: '',
+          utf8Remaining: 0,
+          utf8Lead: 0,
+          stateBudgetBytes: 0,
+          csiHasDollar: false
+        };
+      } catch (error) {
+        try { terminal.dispose(); } catch (_) {}
+        throw error;
+      }
+    }
+
+    function probeStage(message, stage) {
+      if (message && message.probe === true && probeStageCount < 64) {
+        probeActive = true;
+        probeStageCount++;
+        post({
+          type: 'probeStage',
+          operationId: message.operationId,
+          stage: String(stage).slice(0, 256)
+        });
+      }
+    }
+
+    function disposeEngine(engine) {
+      if (!engine) return;
+      try {
+        engine.terminal.dispose();
+      } catch (_) {}
+    }
+
+    // xterm.js has its own OSC/DCS limit, but it is larger than TrayTerminal's
+    // per-session state budget. Track incomplete control strings as bytes arrive
+    // so they cannot hide outside SerializeAddon's visible buffer snapshot.
+    function scanControlStrings(engine, bytes) {
+      for (const value of bytes) {
+        const continuedUtf8 = engine.utf8Remaining > 0 &&
+          value >= 0x80 && value <= 0xbf;
+        const isC1 = continuedUtf8 && engine.utf8Remaining === 1 &&
+          engine.utf8Lead === 0xc2 && value >= 0x80 && value <= 0x9f;
+        if (engine.utf8Remaining > 0) {
+          if (continuedUtf8) {
+            engine.utf8Remaining--;
+            if (engine.utf8Remaining === 0) engine.utf8Lead = 0;
+          } else {
+            engine.utf8Remaining = 0;
+            engine.utf8Lead = 0;
+          }
+        }
+        if (!continuedUtf8) {
+          if (value >= 0xc2 && value <= 0xdf) engine.utf8Remaining = 1;
+          else if (value >= 0xe0 && value <= 0xef) engine.utf8Remaining = 2;
+          else if (value >= 0xf0 && value <= 0xf4) engine.utf8Remaining = 3;
+          if (engine.utf8Remaining > 0) engine.utf8Lead = value;
+        }
+
+        switch (engine.parserState) {
+          case 0:
+            if (value === 0x1b) {
+              engine.parserState = 1;
+            } else if (isC1 && value === 0x9b) {
+              engine.parserState = 4;
+              engine.controlStringBytes = 0;
+              engine.csiHasDollar = false;
+            } else if (isC1 && (value === 0x9d || value === 0x90 ||
+                value === 0x9f || value === 0x9e || value === 0x98)) {
+              engine.parserState = 2;
+              engine.controlStringBytes = 0;
+              engine.controlStringAllowsBell = value === 0x9d;
+              engine.controlStringIsOsc = value === 0x9d;
+              engine.controlStringPrefix = '';
+            }
+            break;
+          case 1:
+            if (value === 0x5b) {
+              engine.parserState = 4;
+              engine.controlStringBytes = 0;
+              engine.csiHasDollar = false;
+            } else if (value === 0x23) {
+              engine.parserState = 5;
+            } else if (value === 0x5d || value === 0x50 || value === 0x5f ||
+                value === 0x5e || value === 0x58) {
+              engine.parserState = 2;
+              engine.controlStringBytes = 0;
+              engine.controlStringAllowsBell = value === 0x5d;
+              engine.controlStringIsOsc = value === 0x5d;
+              engine.controlStringPrefix = '';
+            } else {
+              engine.parserState = value === 0x1b ? 1 : 0;
+            }
+            break;
+          case 2:
+            if ((value === 0x07 && engine.controlStringAllowsBell) ||
+                (isC1 && value === 0x9c)) {
+              engine.parserState = 0;
+              engine.controlStringBytes = 0;
+              engine.controlStringAllowsBell = false;
+              engine.controlStringIsOsc = false;
+              engine.controlStringPrefix = '';
+            } else if (value === 0x1b) {
+              engine.parserState = 3;
+            } else {
+              if (engine.controlStringIsOsc && engine.controlStringPrefix !== null) {
+                if (engine.controlStringPrefix.length < 16) {
+                  engine.controlStringPrefix += String.fromCharCode(value);
+                }
+                if (value === 0x3b) {
+                  if (/^0*8;$/.test(engine.controlStringPrefix)) {
+                    // SerializeAddon can repeat an OSC 8 URI for many screen
+                    // rows, amplifying a small stored URI beyond its input size.
+                    // Reject hyperlinks before xterm can commit that state.
+                    throw new Error('stateAmplificationUnsupported');
+                  }
+                  engine.controlStringPrefix = null;
+                } else if (value < 0x30 || value > 0x39) {
+                  engine.controlStringPrefix = null;
+                }
+              }
+              if (++engine.controlStringBytes > maxStateBytes) {
+                throw new Error('stateTooLarge');
+              }
+            }
+            break;
+          case 3:
+            if (value === 0x5c) {
+              engine.parserState = 0;
+              engine.controlStringBytes = 0;
+              engine.controlStringAllowsBell = false;
+              engine.controlStringIsOsc = false;
+              engine.controlStringPrefix = '';
+            } else {
+              engine.controlStringBytes += 2;
+              if (engine.controlStringBytes > maxStateBytes) {
+                throw new Error('stateTooLarge');
+              }
+              engine.parserState = value === 0x1b ? 3 : 2;
+            }
+            break;
+          case 4:
+            if (value >= 0x40 && value <= 0x7e) {
+              // REP and DEC rectangular fill/copy can multiply one stored cell
+              // over a large grid without carrying the multiplied text in this
+              // event. Reject those rare sequences before xterm mutates state;
+              // this makes the incremental byte budget a strict upper bound.
+              if (value === 0x62 ||
+                  (engine.csiHasDollar && (value === 0x76 || value === 0x78))) {
+                throw new Error('stateAmplificationUnsupported');
+              }
+              engine.parserState = 0;
+              engine.controlStringBytes = 0;
+              engine.csiHasDollar = false;
+            } else if (value === 0x24) {
+              engine.csiHasDollar = true;
+            } else if (++engine.controlStringBytes > maxStateBytes) {
+              throw new Error('stateTooLarge');
+            }
+            break;
+          case 5:
+            if (value === 0x38) {
+              throw new Error('stateAmplificationUnsupported');
+            }
+            engine.parserState = value === 0x1b ? 1 : 0;
+            break;
+        }
+      }
+    }
+
+    function serializeBytes(engine) {
+      const text = engine.serializeAddon.serialize({ scrollback: 256 });
+      const bytes = encoder.encode(text);
+      if (bytes.byteLength > maxStateBytes) {
+        throw new Error('stateTooLarge');
+      }
+      return bytes;
+    }
+
+    function estimateMutationBudget(bytes) {
+      // Stored Unicode, combining marks, hyperlinks and serialized SGR runs are
+      // derived from incoming bytes. Eight serialized bytes per input byte plus
+      // fixed event overhead is deliberately conservative. The few VT commands
+      // that can amplify existing cell text are rejected by scanControlStrings.
+      let budget = eventOverheadBudget + bytes.byteLength * 8;
+      return Math.min(maxStateBytes + 1, budget);
+    }
+
+    function getInputHandler(terminal) {
+      const inputHandler = terminal && terminal._core && terminal._core._inputHandler;
+      if (!inputHandler || typeof inputHandler.parse !== 'function') {
+        throw new Error('pinnedParserUnavailable');
+      }
+      return inputHandler;
+    }
+
+    async function parseAsync(terminal, bytes, message) {
+      // The pinned xterm WriteBuffer defers its first write with setTimeout.
+      // Offscreen WebView2 renderers may throttle that timer indefinitely, so
+      // authority commits drive the same pinned InputHandler action directly.
+      // Promise continuations mirror WriteBuffer._innerWrite exactly.
+      const inputHandler = getInputHandler(terminal);
+      probeStage(message, 'parserAvailable');
+
+      const chunkSize = 64 * 1024;
+      for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+        const chunk = bytes.subarray(
+          offset,
+          Math.min(offset + chunkSize, bytes.byteLength));
+        let continuation = true;
+        while (true) {
+          const pending = inputHandler.parse(chunk, continuation);
+          probeStage(
+            message,
+            pending && typeof pending.then === 'function'
+              ? 'parseThenable'
+              : 'parseSynchronous');
+          if (!pending || typeof pending.then !== 'function') break;
+          continuation = await pending;
+          probeStage(message, 'parseContinuationResolved');
+        }
+      }
+      probeStage(message, 'parseComplete');
+    }
+
+    async function execute(message) {
+      const id = String(message.sessionId || '');
+      if (!id) throw new Error('invalidSession');
+      probeStage(message, `execute:${message.type}`);
+
+      if (message.type === 'create') {
+        if (engines.has(id)) throw new Error('duplicateSession');
+        if (engines.size >= 32) throw new Error('sessionLimit');
+        const engine = createEngine(message.cols, message.rows);
+        try {
+          const snapshot = serializeBytes(engine);
+          engine.stateBudgetBytes = snapshot.byteLength;
+          engines.set(id, engine);
+          return {
+            sequence: '0',
+            snapshot: toBase64(snapshot),
+            snapshotSequence: '0',
+            snapshotCols: engine.terminal.cols,
+            snapshotRows: engine.terminal.rows,
+            checkpointSafe: true
+          };
+        } catch (error) {
+          disposeEngine(engine);
+          throw error;
+        }
+      }
+
+      if (message.type === 'restore') {
+        const old = engines.get(id);
+        if (!old && engines.size >= 32) throw new Error('sessionLimit');
+        const engine = createEngine(message.cols, message.rows);
+        try {
+          const bytes = fromBase64(message.snapshot);
+          await parseAsync(engine.terminal, bytes, message);
+          engine.sequence = BigInt(message.sequence);
+          const snapshot = serializeBytes(engine);
+          engine.stateBudgetBytes = snapshot.byteLength;
+          engines.set(id, engine);
+          disposeEngine(old);
+          return {
+            sequence: message.sequence,
+            snapshot: toBase64(snapshot),
+            snapshotSequence: message.sequence,
+            snapshotCols: engine.terminal.cols,
+            snapshotRows: engine.terminal.rows,
+            checkpointSafe: true
+          };
+        } catch (error) {
+          disposeEngine(engine);
+          throw error;
+        }
+      }
+
+      if (message.type === 'dispose') {
+        const engine = engines.get(id);
+        disposeEngine(engine);
+        engines.delete(id);
+        chains.delete(id);
+        return { sequence: message.sequence || '0' };
+      }
+
+      const engine = engines.get(id);
+      if (!engine) throw new Error('stateUnavailable');
+      const sequence = BigInt(message.sequence);
+      if (sequence !== engine.sequence + 1n) throw new Error('sequenceGap');
+
+      let snapshot = null;
+      let snapshotSequence = null;
+      let snapshotCols = null;
+      let snapshotRows = null;
+      const outputBytes = message.type === 'output'
+        ? fromBase64(message.data)
+        : new Uint8Array();
+      const mutationBudget = message.type === 'output'
+        ? estimateMutationBudget(outputBytes)
+        : eventOverheadBudget;
+      if (engine.stateBudgetBytes > maxStateBytes - mutationBudget) {
+        if (engine.parserState !== 0 || engine.utf8Remaining !== 0) {
+          throw new Error('stateTooLarge');
+        }
+        const before = serializeBytes(engine);
+        snapshot = toBase64(before);
+        snapshotSequence = engine.sequence.toString();
+        snapshotCols = engine.terminal.cols;
+        snapshotRows = engine.terminal.rows;
+        engine.stateBudgetBytes = before.byteLength;
+        if (engine.stateBudgetBytes > maxStateBytes - mutationBudget) {
+          throw new Error('stateTooLarge');
+        }
+      }
+
+      if (message.type === 'output') {
+        probeStage(message, 'scanBegin');
+        scanControlStrings(engine, outputBytes);
+        probeStage(message, 'scanComplete');
+        await parseAsync(engine.terminal, outputBytes, message);
+      } else if (message.type === 'resize') {
+        engine.terminal.resize(message.cols, message.rows);
+      } else {
+        throw new Error('invalidOperation');
+      }
+
+      engine.sequence = sequence;
+      engine.stateBudgetBytes += mutationBudget;
+      const checkpointSafe = engine.parserState === 0 && engine.utf8Remaining === 0;
+      if (message.checkpoint === true && checkpointSafe) {
+        const current = serializeBytes(engine);
+        snapshot = toBase64(current);
+        snapshotSequence = message.sequence;
+        snapshotCols = engine.terminal.cols;
+        snapshotRows = engine.terminal.rows;
+        engine.stateBudgetBytes = current.byteLength;
+      }
+      probeStage(message, 'executeComplete');
+      return {
+        sequence: message.sequence,
+        snapshot,
+        snapshotSequence,
+        snapshotCols,
+        snapshotRows,
+        checkpointSafe
+      };
+    }
+
+    window.chrome.webview.addEventListener('message', event => {
+      const message = event.data;
+      if (!message || message.version !== protocolVersion ||
+          !Number.isSafeInteger(message.operationId)) {
+        return;
+      }
+
+      const id = String(message.sessionId || '');
+      const previous = chains.get(id) || Promise.resolve();
+      const current = previous.then(() => execute(message));
+      chains.set(id, current.catch(() => {}));
+      current.then(
+        result => {
+          probeStage(message, 'resultPost');
+          post({ type: 'result', operationId: message.operationId, ok: true, ...result });
+        },
+        error => {
+          const reason = error && error.message ? error.message : 'authorityFailure';
+          if (reason === 'stateTooLarge') {
+            const failed = engines.get(String(message.sessionId || ''));
+            disposeEngine(failed);
+            engines.delete(String(message.sessionId || ''));
+            chains.delete(String(message.sessionId || ''));
+          }
+          post({ type: 'result', operationId: message.operationId, ok: false, reason });
+        });
+    });
+
+    window.addEventListener('error', event => {
+      if (probeActive && probeStageCount < 64) {
+        probeStageCount++;
+        post({
+          type: 'probeStage',
+          operationId: 0,
+          stage: `windowError:${event.message}`.slice(0, 256)
+        });
+      }
+    });
+    window.addEventListener('unhandledrejection', event => {
+      if (probeActive && probeStageCount < 64) {
+        probeStageCount++;
+        const reason = event.reason && event.reason.message
+          ? event.reason.message
+          : String(event.reason);
+        post({
+          type: 'probeStage',
+          operationId: 0,
+          stage: `unhandledRejection:${reason}`.slice(0, 256)
+        });
+      }
+    });
+
+    if (typeof Terminal !== 'function' ||
+        !window.SerializeAddon ||
+        typeof window.SerializeAddon.SerializeAddon !== 'function') {
+      post({ type: 'fatal', reason: 'Pinned xterm.js or SerializeAddon is unavailable.' });
+      return;
+    }
+
+    let validationEngine = null;
+    try {
+      validationEngine = createEngine(2, 2);
+      getInputHandler(validationEngine.terminal);
+      serializeBytes(validationEngine);
+    } catch (error) {
+      const reason = error && error.message ? error.message : 'authorityInitializationFailed';
+      post({ type: 'fatal', reason });
+      return;
+    } finally {
+      disposeEngine(validationEngine);
+    }
+
+    post({ type: 'ready' });
+  })();
+</script>
+</body>
+</html>

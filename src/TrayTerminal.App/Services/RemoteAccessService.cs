@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using TrayTerminal.App.Controls;
 using TrayTerminal.Shared;
 
@@ -32,6 +33,7 @@ public sealed class RemoteAccessService : IAsyncDisposable
     private readonly HashSet<string> _allowedTabs;
     private readonly ConcurrentDictionary<RemoteTerminalBridge, byte> _bridges = new();
     private readonly ConcurrentDictionary<Task, byte> _requestTasks = new();
+    private readonly ConcurrentDictionary<Task, byte> _disconnectTasks = new();
     private readonly ConcurrencySlotLimiter _requestSlots = new(
         MaxConcurrentRequests);
     private TcpListener? _listener;
@@ -226,19 +228,21 @@ public sealed class RemoteAccessService : IAsyncDisposable
             query.TryGetValue("token", out var requestToken);
             if (requestToken != _token)
             {
-                await WriteTextResponseAsync(stream, 403, "Forbidden", "Forbidden: invalid or missing token.", ct)
-                    .ConfigureAwait(false);
+                await RejectWebSocketAsync(
+                    stream,
+                    key,
+                    "authRejected",
+                    ct).ConfigureAwait(false);
                 return;
             }
         }
 
         if (!_allowedTabs.Contains(terminalName))
         {
-            await WriteTextResponseAsync(
+            await RejectWebSocketAsync(
                 stream,
-                403,
-                "Forbidden",
-                $"Forbidden: '{terminalName}' is not in the remote access allow list.",
+                key,
+                "authRejected",
                 ct).ConfigureAwait(false);
             return;
         }
@@ -256,22 +260,20 @@ public sealed class RemoteAccessService : IAsyncDisposable
 
         if (page is null || !page.IsRunning)
         {
-            await WriteTextResponseAsync(
+            await RejectWebSocketAsync(
                 stream,
-                404,
-                "Not Found",
-                $"Terminal '{terminalName}' not found or not running.",
+                key,
+                "terminalUnavailable",
                 ct).ConfigureAwait(false);
             return;
         }
 
         if (!TryAcquireBridgeSlot())
         {
-            await WriteTextResponseAsync(
+            await RejectWebSocketAsync(
                 stream,
-                503,
-                "Service Unavailable",
-                "Remote terminal connection limit reached.",
+                key,
+                "temporaryUnavailable",
                 ct).ConfigureAwait(false);
             return;
         }
@@ -311,6 +313,47 @@ public sealed class RemoteAccessService : IAsyncDisposable
         }
     }
 
+    private static async Task RejectWebSocketAsync(
+        NetworkStream stream,
+        string key,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        using var deadlineCts = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken);
+        deadlineCts.CancelAfter(ShutdownWaitTimeout);
+        var deadlineToken = deadlineCts.Token;
+        await WriteWebSocketHandshakeAsync(
+            stream,
+            key,
+            deadlineToken).ConfigureAwait(false);
+        using var webSocket = WebSocket.CreateFromStream(
+            stream,
+            new WebSocketCreationOptions
+            {
+                IsServer = true,
+                KeepAliveInterval = WebSocketKeepAliveInterval,
+                KeepAliveTimeout = WebSocketKeepAliveTimeout
+            });
+        var payload = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            type = "error",
+            version = RemoteTerminalBridge.ProtocolVersion,
+            reason
+        });
+        await webSocket.SendAsync(
+            payload,
+            WebSocketMessageType.Text,
+            endOfMessage: true,
+            deadlineToken).ConfigureAwait(false);
+        await webSocket.CloseAsync(
+            reason == "temporaryUnavailable"
+                ? WebSocketCloseStatus.EndpointUnavailable
+                : WebSocketCloseStatus.PolicyViolation,
+            reason,
+            deadlineToken).ConfigureAwait(false);
+    }
+
     private bool TryAcquireBridgeSlot()
     {
         while (true)
@@ -327,6 +370,26 @@ public sealed class RemoteAccessService : IAsyncDisposable
                     current) == current)
             {
                 return true;
+            }
+        }
+    }
+
+    public void DisconnectTerminal(string terminalName, string reason)
+    {
+        foreach (var bridge in _bridges.Keys)
+        {
+            if (string.Equals(
+                    bridge.TerminalName,
+                    terminalName,
+                    StringComparison.Ordinal))
+            {
+                var task = bridge.DisconnectAsync(reason);
+                _disconnectTasks.TryAdd(task, 0);
+                _ = task.ContinueWith(
+                    completed => _disconnectTasks.TryRemove(completed, out _),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
             }
         }
     }
@@ -554,8 +617,19 @@ public sealed class RemoteAccessService : IAsyncDisposable
             return null;
         }
 
-        var decoded = UrlDecode(path).TrimStart('/');
-        if (decoded.Length == 0 || decoded.Contains('\0'))
+        string decoded;
+        try
+        {
+            // Remove exactly the HTTP route separator before decoding. Encoded
+            // leading slashes are part of the ordinal terminal title.
+            decoded = UrlDecode(path[1..]);
+        }
+        catch (UriFormatException)
+        {
+            return null;
+        }
+
+        if (decoded.Length == 0 || decoded.Any(char.IsControl))
         {
             return null;
         }
@@ -602,6 +676,21 @@ public sealed class RemoteAccessService : IAsyncDisposable
         var bridges = _bridges.Keys.ToArray();
         await Task.WhenAll(bridges.Select(bridge => bridge.DisposeAsync().AsTask())).ConfigureAwait(false);
         _bridges.Clear();
+
+        var disconnects = _disconnectTasks.Keys.ToArray();
+        if (disconnects.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(disconnects)
+                    .WaitAsync(ShutdownWaitTimeout)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+        }
+        _disconnectTasks.Clear();
 
         var requests = _requestTasks.Keys.ToArray();
         if (requests.Length > 0)

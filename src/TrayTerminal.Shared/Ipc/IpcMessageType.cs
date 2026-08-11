@@ -10,5 +10,10 @@ public enum IpcMessageType : byte
     Kill = 6,
     Heartbeat = 7,
     Error = 8,
-    InputAck = 9
+    InputAck = 9,
+    Interrupt = 10,
+    InterruptAck = 11,
+    ResizeBoundary = 12,
+    OutputCompleted = 13,
+    ResizeAck = 14
 }

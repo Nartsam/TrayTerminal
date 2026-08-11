@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="./xterm/xterm.css" />
   <script src="./xterm/xterm.js"></script>
   <script src="./remote-protocol.js"></script>
+  <script src="./terminal-input-policy.js"></script>
   <title>TrayTerminal Remote</title>
   <style>
     html, body {
@@ -46,7 +47,7 @@
 
   <script>
     (() => {
-      const protocolVersion = 2;
+      const protocolVersion = 3;
       const terminalHost = document.getElementById('terminal');
       const fallback = document.getElementById('fallback');
       const statusBar = document.getElementById('status-bar');
@@ -55,21 +56,31 @@
       let reconnectTimer = null;
       let reconnectAttempts = 0;
       let nextInputId = 0;
-      let expectedSequence = 0;
+      let expectedSequence = 0n;
+      let advertisedLatestSequence = 0n;
       let synchronized = false;
       let canResize = false;
       let statusKind = '';
       let socketGeneration = 0;
       let socketAbortController = null;
       let terminalStateUnavailable = false;
+      let terminalEnded = false;
+      let explicitRejection = false;
+      let composing = false;
+      let interruptHeld = false;
+      let unresolvedInputResults = false;
       let confirmNextKeyboardPaste = false;
       const pendingInputs = new Map();
       const confirmedKeyboardPasteEvents = new WeakSet();
-      const maxReconnectAttempts = 5;
-
-      // Parse terminal name from path: /NapCat → NapCat
-      const pathParts = window.location.pathname.split('/').filter(Boolean);
-      const terminalName = pathParts.length > 0 ? pathParts[0] : '';
+      // The whole encoded path is one ordinal terminal name. Encoded slashes,
+      // question marks and hashes must not be treated as URL separators.
+      const encodedTerminalName = window.location.pathname.startsWith('/')
+        ? window.location.pathname.substring(1)
+        : window.location.pathname;
+      let terminalName = '';
+      try {
+        terminalName = decodeURIComponent(encodedTerminalName);
+      } catch (_) {}
 
       // Parse token from query string
       const params = new URLSearchParams(window.location.search);
@@ -105,20 +116,37 @@
       }
 
       function sendInput(text) {
-        if (!text || !synchronized || pendingInputs.size >= 64) {
-          if (pendingInputs.size >= 64) {
+        if (!text || !synchronized || pendingInputs.size >= 63) {
+          if (pendingInputs.size >= 63) {
             showStatus('终端输入队列繁忙，请稍候…', false, 'input');
           }
           return;
         }
 
+        unresolvedInputResults = false;
         const inputId = ++nextInputId;
         if (post({ type: 'input', inputId, data: text })) {
           pendingInputs.set(inputId, {
-            sequence: expectedSequence - 1,
+            sequence: expectedSequence - 1n,
             waitsForVisibleResponse: text.indexOf('\r') >= 0
           });
           showStatus('正在将输入送往终端…', false, 'input');
+        }
+      }
+
+      function sendInterrupt() {
+        // One slot in the shared 64-operation budget remains available for an
+        // interrupt even while ordinary/paste input is saturated.
+        if (!synchronized || pendingInputs.size >= 64) return;
+        unresolvedInputResults = false;
+        const inputId = ++nextInputId;
+        if (post({ type: 'interrupt', inputId })) {
+          pendingInputs.set(inputId, {
+            sequence: expectedSequence - 1n,
+            waitsForVisibleResponse: false,
+            interrupt: true
+          });
+          showStatus('正在中止前台进程…', false, 'input');
         }
       }
 
@@ -160,20 +188,17 @@
           typeof event.key === 'string' && event.key.toLowerCase() === key;
       }
 
-      function hasTextSelection() {
+      function hasTextSelection(target) {
         if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
           return true;
         }
-        var sel = window.getSelection();
-        return sel !== null && !sel.isCollapsed;
-      }
-
-      function getSelectedText() {
-        if (terminal && typeof terminal.hasSelection === 'function' && terminal.hasSelection()) {
-          return typeof terminal.getSelection === 'function' ? terminal.getSelection() : '';
+        if (target && typeof target.selectionStart === 'number' &&
+            typeof target.selectionEnd === 'number' &&
+            target.selectionStart !== target.selectionEnd) {
+          return true;
         }
         var sel = window.getSelection();
-        return sel !== null && !sel.isCollapsed ? sel.toString() : '';
+        return sel !== null && !sel.isCollapsed && sel.toString().length > 0;
       }
 
       function isMultiline(text) {
@@ -209,21 +234,46 @@
         }
 
         if (isClipboardShortcut(event, 'c')) {
-          var selectedText = getSelectedText();
-          if (selectedText) {
+          if (hasTextSelection(event.target)) {
             // xterm's hidden textarea handles the native copy event and places
             // its canvas selection on the clipboard. Do not preventDefault here:
             // programmatic Clipboard API access is blocked on plain HTTP.
             return true;
           }
-          // No selection — let xterm.js handle Ctrl+C (sends \x03)
-          return false;
+
+          const active = document.activeElement;
+          const terminalFocused = active &&
+            (terminalHost.contains(active) || active === fallback);
+          const decision = window.TrayTerminalInputPolicy
+            ? window.TrayTerminalInputPolicy.classifyCtrlC({
+                hasSelection: false,
+                isTrusted: event.isTrusted,
+                focused: !!terminalFocused,
+                isComposing: composing || event.isComposing,
+                repeat: event.repeat,
+                held: interruptHeld
+              })
+            : 'consume';
+          if (decision === 'interrupt') {
+            interruptHeld = true;
+            event.preventDefault();
+            event.stopPropagation();
+            sendInterrupt();
+          }
+          // Always consume no-selection Ctrl+C here. Invalid, composing,
+          // repeated or synthetic events must never fall through to onData.
+          return true;
         }
 
         return false;
       }
 
       function handleTerminalKeyEvent(event) {
+        if (event.type === 'keyup' && typeof event.key === 'string' &&
+            event.key.toLowerCase() === 'c') {
+          interruptHeld = false;
+          return true;
+        }
         if (event.type !== 'keydown') return true;
         return !handleClipboardShortcut(event);
       }
@@ -279,6 +329,7 @@
       }
 
       function estimateSize() {
+        if (!synchronized) return;
         let cols, rows;
         if (terminal && terminal._core && terminal._core._renderService) {
           try {
@@ -317,7 +368,8 @@
       function connect() {
         // Build WebSocket URL: ws://host:port/terminalName?token=xxx
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = wsProtocol + '//' + window.location.host + '/' + terminalName +
+        const wsUrl = wsProtocol + '//' + window.location.host + '/' +
+          encodeURIComponent(terminalName) +
           (token ? '?token=' + encodeURIComponent(token) : '');
 
         showStatus('正在连接...', false);
@@ -326,7 +378,7 @@
         try {
           socket = new WebSocket(wsUrl);
         } catch (e) {
-          showStatus('WebSocket 连接失败', true);
+          scheduleReconnect('WebSocket 连接失败，');
           return;
         }
         socketAbortController?.abort();
@@ -334,6 +386,7 @@
         socketAbortController = abortController;
         const generation = ++socketGeneration;
         terminalStateUnavailable = false;
+        explicitRejection = false;
         ws = socket;
         const processor = window.TrayTerminalRemoteProtocol.createSerialProcessor(
           message => processServerMessage(
@@ -350,7 +403,6 @@
 
         socket.onopen = function() {
           if (ws !== socket || generation !== socketGeneration) return;
-          reconnectAttempts = 0;
           synchronized = false;
           showStatus('正在同步终端状态…', false, 'connection');
           if (terminal) {
@@ -379,6 +431,7 @@
           abortController.abort();
           if (ws !== socket || generation !== socketGeneration) return;
           synchronized = false;
+          unresolvedInputResults = unresolvedInputResults || pendingInputs.size > 0;
           pendingInputs.clear();
           if (terminalStateUnavailable) {
             showStatus(
@@ -387,23 +440,38 @@
               'connection');
             return;
           }
-          if (event.code === 4001) {
-            // Server rejected — terminal not available or access denied
+          if (terminalEnded) {
+            return;
+          }
+          if (explicitRejection || event.code === 1008 || event.code === 4001) {
             showStatus('连接被拒绝：终端不可用或访问被拒绝', true);
             return;
           }
-          if (reconnectAttempts < maxReconnectAttempts) {
-            reconnectAttempts++;
-            showStatus('连接断开，' + reconnectAttempts + '/' + maxReconnectAttempts + ' 次重连...', false);
-            reconnectTimer = setTimeout(connect, 2000 * reconnectAttempts);
-          } else {
-            showStatus('连接断开，已达到最大重连次数', true);
-          }
+          scheduleReconnect(
+            unresolvedInputResults
+              ? '连接中断，未确认输入的结果未知；'
+              : '连接断开，');
         };
 
         socket.onerror = function() {
           // onclose will fire after this
         };
+      }
+
+      function scheduleReconnect(prefix) {
+        reconnectAttempts++;
+        const delay = Math.min(
+          30000,
+          500 * Math.pow(2, Math.min(6, reconnectAttempts - 1)));
+        showStatus(
+          prefix + Math.ceil(delay / 1000) + ' 秒后重连…',
+          false,
+          'connection');
+        if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, delay);
       }
 
       async function processServerMessage(socket, generation, signal, message) {
@@ -413,13 +481,13 @@
 
         switch (message.type) {
           case 'syncStart':
-            if (!Number.isSafeInteger(message.snapshotSequence) ||
-                !Number.isSafeInteger(message.latestSequence)) {
-              throw new Error('Invalid synchronization header');
-            }
+            const syncBoundary = window.TrayTerminalRemoteProtocol.parseSyncStart(
+              message.snapshotSequence,
+              message.latestSequence);
             synchronized = false;
             pendingInputs.clear();
-            expectedSequence = message.snapshotSequence;
+            expectedSequence = syncBoundary.snapshot;
+            advertisedLatestSequence = syncBoundary.latest;
             canResize = message.canResize === true;
             if (terminal) {
               createTerminal();
@@ -430,15 +498,26 @@
             break;
 
           case 'snapshot':
-          case 'output': {
-            if (message.sequence !== expectedSequence ||
-                typeof message.data !== 'string') {
+          case 'output':
+          case 'resize': {
+            if (typeof message.sequence !== 'string' ||
+                !/^\d+$/.test(message.sequence) ||
+                BigInt(message.sequence) !== expectedSequence ||
+                (message.type !== 'resize' && typeof message.data !== 'string')) {
               throw new Error(
                 message.type === 'snapshot'
                   ? 'Snapshot sequence mismatch'
                   : 'Output sequence mismatch');
             }
-            const written = await applyTerminalBytes(message.data, signal);
+            let written = true;
+            if (message.type === 'resize') {
+              if (!Number.isInteger(message.cols) || !Number.isInteger(message.rows)) {
+                throw new Error('Invalid resize event');
+              }
+              if (terminal) terminal.resize(message.cols, message.rows);
+            } else {
+              written = await applyTerminalBytes(message.data, signal);
+            }
             if (signal.aborted || ws !== socket ||
                 generation !== socketGeneration) {
               return;
@@ -446,38 +525,49 @@
             if (!written) {
               throw new Error('Terminal write callback timed out');
             }
-            expectedSequence = message.sequence + 1;
-            if (message.type === 'output' && statusKind === 'input') {
+            expectedSequence = BigInt(message.sequence) + 1n;
+            if (message.type === 'output' &&
+                window.TrayTerminalRemoteProtocol.shouldHideInputStatus(
+                  statusKind,
+                  unresolvedInputResults)) {
               hideStatus();
             }
             break;
           }
 
           case 'syncComplete':
-            if (message.sequence !== expectedSequence - 1) {
+            if (!window.TrayTerminalRemoteProtocol.isSyncComplete(
+                  message.sequence,
+                  advertisedLatestSequence,
+                  expectedSequence - 1n)) {
               throw new Error('Synchronization boundary mismatch');
             }
             synchronized = true;
-            hideStatus();
+            reconnectAttempts = 0;
+            if (unresolvedInputResults) {
+              showStatus(
+                '上次连接断开前有输入未确认，执行结果未知。下一次操作不会自动重发。',
+                true,
+                'input');
+            } else {
+              hideStatus();
+            }
             estimateSize();
             break;
 
           case 'size':
             canResize = message.canResize === true;
-            if (terminal && Number.isInteger(message.cols) &&
-                Number.isInteger(message.rows)) {
-              terminal.resize(message.cols, message.rows);
-            }
             break;
 
-          case 'inputAck': {
+          case 'inputAck':
+          case 'interruptAck': {
             const pending = pendingInputs.get(message.inputId);
             if (!pending) break;
             pendingInputs.delete(message.inputId);
             if (message.accepted !== true) {
               showStatus('输入未能写入终端，请检查连接状态。', true, 'input');
             } else if (pending.waitsForVisibleResponse &&
-                       expectedSequence - 1 <= pending.sequence) {
+                       expectedSequence - 1n <= pending.sequence) {
               showStatus(
                 '输入已写入终端；前台程序可能暂未读取，因此屏幕尚无变化。',
                 false,
@@ -496,9 +586,49 @@
                 true,
                 'connection');
               socket.close(1000, 'Terminal state is unavailable');
+            } else if (message.reason === 'temporaryUnavailable') {
+              showStatus('终端状态暂不可用，正在等待自动重连…', false, 'connection');
+              socket.close(1013, 'Terminal state is temporarily unavailable');
+            } else if (message.reason === 'renamed' ||
+                       message.reason === 'protocolMismatch' ||
+                       message.reason === 'authRejected' ||
+                       message.reason === 'terminalUnavailable') {
+              explicitRejection = true;
+              showStatus('连接已被明确拒绝，请检查名称、令牌或刷新页面。', true, 'connection');
+              socket.close(1008, 'Connection rejected');
             } else {
               showStatus('远程终端协议错误。', true, 'connection');
             }
+            break;
+
+          case 'stateUnavailable':
+            if (typeof message.sequence !== 'string' ||
+                !/^\d+$/.test(message.sequence) ||
+                BigInt(message.sequence) !== expectedSequence - 1n) {
+              throw new Error('Terminal failure boundary mismatch');
+            }
+            terminalStateUnavailable = true;
+            showStatus(
+              '终端状态已无法安全恢复；请在主程序中手动重建该标签页。',
+              true,
+              'connection');
+            socket.close(1000, 'Terminal state unavailable');
+            break;
+
+          case 'terminalEnded':
+            if (typeof message.sequence !== 'string' ||
+                !/^\d+$/.test(message.sequence) ||
+                BigInt(message.sequence) !== expectedSequence - 1n) {
+              throw new Error('Terminal end boundary mismatch');
+            }
+            terminalEnded = true;
+            synchronized = false;
+            showStatus(
+              '终端已退出，代码 ' + message.exitCode +
+                (message.outputComplete === true ? '' : '（最终输出不完整）'),
+              message.outputComplete !== true,
+              'connection');
+            socket.close(1000, 'Terminal ended');
             break;
 
           default:
@@ -549,6 +679,11 @@
               sendInput(input);
             }
           });
+          fallback.addEventListener('keyup', function(event) {
+            if (typeof event.key === 'string' && event.key.toLowerCase() === 'c') {
+              interruptHeld = false;
+            }
+          });
           fallback.addEventListener('paste', function(event) {
             const text = event.clipboardData.getData('text/plain');
             if (!text) return;
@@ -569,6 +704,16 @@
           window.requestAnimationFrame(estimateSize);
         });
         setTimeout(estimateSize, 500);
+
+        document.addEventListener('compositionstart', () => { composing = true; });
+        document.addEventListener('compositionend', () => { composing = false; });
+        document.addEventListener('keyup', event => {
+          if (typeof event.key === 'string' && event.key.toLowerCase() === 'c') {
+            interruptHeld = false;
+          }
+        }, true);
+        // Keep an active latch across window blur. This biases toward suppressing
+        // an interrupt when keyup was hidden, never toward a false second ETX.
 
         connect();
       }

@@ -10,6 +10,7 @@
         Foreground="{StaticResource TextBrush}"
         Icon="Assets/app.ico"
         WindowStartupLocation="CenterScreen">
+    <Grid x:Name="RootGrid">
     <DockPanel>
         <Border DockPanel.Dock="Top"
                 Height="48"
@@ -71,4 +72,5 @@
                     BorderThickness="0"
                     Padding="8" />
     </DockPanel>
+    </Grid>
 </Window>

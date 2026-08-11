@@ -44,6 +44,29 @@ async function main() {
     'start:syncComplete',
     'end:syncComplete'
   ]);
+  const boundary = protocol.parseSyncStart('40', '42');
+  assert.equal(boundary.snapshot, 40n);
+  assert.equal(boundary.latest, 42n);
+  assert.throws(
+    () => protocol.parseSyncStart('43', '42'),
+    /newer than advertised/,
+    'syncStart accepted a snapshot beyond advertised latest');
+  assert.equal(
+    protocol.isSyncComplete('42', boundary.latest, 42n),
+    true,
+    'valid synchronization completion was rejected');
+  assert.equal(
+    protocol.isSyncComplete('41', boundary.latest, 41n),
+    false,
+    'syncComplete was accepted before advertised latest');
+  assert.equal(
+    protocol.shouldHideInputStatus('input', true),
+    false,
+    'ordinary output hid the unresolved-input result warning');
+  assert.equal(
+    protocol.shouldHideInputStatus('input', false),
+    true,
+    'ordinary acknowledged-input status was not cleared by output');
   console.log('PASS remote protocol waits for terminal write callbacks');
 }
 

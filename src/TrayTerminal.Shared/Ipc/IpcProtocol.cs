@@ -103,6 +103,28 @@ public static class IpcProtocol
         return BinaryPrimitives.ReadInt64LittleEndian(payload);
     }
 
+    public static byte[] EncodeInputResult(long requestId, bool accepted)
+    {
+        var payload = new byte[sizeof(long) + sizeof(byte)];
+        BinaryPrimitives.WriteInt64LittleEndian(payload, requestId);
+        payload[sizeof(long)] = accepted ? (byte)1 : (byte)0;
+        return payload;
+    }
+
+    public static (long RequestId, bool Accepted) DecodeInputResult(byte[] payload)
+    {
+        if (payload.Length != sizeof(long) + sizeof(byte)
+            || payload[sizeof(long)] > 1)
+        {
+            throw new InvalidDataException(
+                $"Input result payload must be a request ID and boolean, got {payload.Length} bytes.");
+        }
+
+        return (
+            BinaryPrimitives.ReadInt64LittleEndian(payload),
+            payload[sizeof(long)] == 1);
+    }
+
     public static byte[] EncodeResize(int columns, int rows)
     {
         var payload = new byte[8];
@@ -123,6 +145,29 @@ public static class IpcProtocol
             BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(4, 4)));
     }
 
+    public static byte[] EncodeResizeRequest(long requestId, int columns, int rows)
+    {
+        var payload = new byte[sizeof(long) + sizeof(int) * 2];
+        BinaryPrimitives.WriteInt64LittleEndian(payload, requestId);
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(sizeof(long)), columns);
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(sizeof(long) + sizeof(int)), rows);
+        return payload;
+    }
+
+    public static (long RequestId, int Columns, int Rows) DecodeResizeRequest(byte[] payload)
+    {
+        if (payload.Length != sizeof(long) + sizeof(int) * 2)
+        {
+            throw new InvalidDataException(
+                $"Resize request payload must be 16 bytes, got {payload.Length}.");
+        }
+
+        return (
+            BinaryPrimitives.ReadInt64LittleEndian(payload),
+            BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(sizeof(long))),
+            BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(sizeof(long) + sizeof(int))));
+    }
+
     public static byte[] EncodeExit(int exitCode)
     {
         var payload = new byte[4];
@@ -138,6 +183,28 @@ public static class IpcProtocol
         }
 
         return BinaryPrimitives.ReadInt32LittleEndian(payload);
+    }
+
+    public static byte[] EncodeExitStatus(int exitCode, bool outputComplete)
+    {
+        var payload = new byte[sizeof(int) + sizeof(byte)];
+        BinaryPrimitives.WriteInt32LittleEndian(payload, exitCode);
+        payload[sizeof(int)] = outputComplete ? (byte)1 : (byte)0;
+        return payload;
+    }
+
+    public static (int ExitCode, bool OutputComplete) DecodeExitStatus(byte[] payload)
+    {
+        if (payload.Length != sizeof(int) + sizeof(byte)
+            || payload[sizeof(int)] > 1)
+        {
+            throw new InvalidDataException(
+                $"Exit status payload must be an exit code and boolean, got {payload.Length} bytes.");
+        }
+
+        return (
+            BinaryPrimitives.ReadInt32LittleEndian(payload),
+            payload[sizeof(int)] == 1);
     }
 
     private static async Task<byte[]?> ReadExactAsync(Stream stream, int length, CancellationToken cancellationToken)

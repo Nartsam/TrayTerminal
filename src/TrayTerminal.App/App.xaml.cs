@@ -2,6 +2,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Threading;
 using TrayTerminal.App.Dialogs;
+using TrayTerminal.App.Services;
 using TrayTerminal.Shared;
 
 namespace TrayTerminal.App;
@@ -67,7 +68,46 @@ public partial class App : System.Windows.Application
             timer.Start();
         };
 
+        if (e.Args is ["--authority-probe"])
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            RunAuthorityProbeAsync(paths, _logger);
+            return;
+        }
+
         MainWindow = new MainWindow(paths, _logger);
         MainWindow.Show();
+    }
+
+    private async void RunAuthorityProbeAsync(
+        PortablePaths paths,
+        FileLogger logger)
+    {
+        TerminalAuthorityHost? authority = null;
+        var exitCode = 1;
+        try
+        {
+            var environmentManager = new WebView2EnvironmentManager(paths, logger);
+            authority = new TerminalAuthorityHost(
+                paths,
+                logger,
+                environmentManager);
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            await authority.RunRealWebViewProbeAsync(deadline.Token);
+            logger.Info("Real WebView2 authority probe passed.");
+            exitCode = 0;
+        }
+        catch (Exception exception)
+        {
+            logger.Error(exception, "Real WebView2 authority probe failed.");
+        }
+        finally
+        {
+            if (authority is not null)
+            {
+                await authority.DisposeAsync();
+            }
+            Shutdown(exitCode);
+        }
     }
 }

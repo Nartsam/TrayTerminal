@@ -28,12 +28,14 @@ namespace TrayTerminal.App;
 
 public partial class MainWindow : Window
 {
+    private const int MaxTerminalTabs = 32;
     private const string IdleStatusText = "当前暂无新状态";
     private static readonly TimeSpan StatusIdleDelay = TimeSpan.FromSeconds(60);
     private readonly PortablePaths _paths;
     private readonly FileLogger _logger;
     private readonly IReadOnlyList<TerminalProfile> _profiles;
     private readonly WebView2EnvironmentManager _webView2EnvironmentManager;
+    private readonly TerminalAuthorityHost _terminalAuthorityHost;
     private readonly string _tabPresetConfigPath;
     private readonly string _initConfigPath;
     private readonly NotifyIcon _trayIcon;
@@ -63,6 +65,10 @@ public partial class MainWindow : Window
         _logger = logger;
         _profiles = TerminalProfileCatalog.Detect(paths);
         _webView2EnvironmentManager = new WebView2EnvironmentManager(paths, logger);
+        _terminalAuthorityHost = new TerminalAuthorityHost(
+            paths,
+            logger,
+            _webView2EnvironmentManager);
         _tabPresetConfigPath = Path.Combine(paths.ConfigDirectory, "config.txt");
         _initConfigPath = Path.Combine(paths.ConfigDirectory, "init.txt");
         ReloadTabPresets();
@@ -86,6 +92,23 @@ public partial class MainWindow : Window
         };
         Loaded += async (_, _) =>
         {
+            try
+            {
+                // Authority initialization is deliberately before any Host/ConPTY
+                // creation. There is no renderer-as-authority fallback.
+                await _terminalAuthorityHost.InitializeAsync();
+            }
+            catch (Exception exception)
+            {
+                _logger.Error(exception, "Failed to initialize terminal authority.");
+                AppMessageDialog.Info(
+                    this,
+                    $"无法初始化终端权威状态引擎，程序将退出：{exception.Message}");
+                _forceClose = true;
+                Close();
+                return;
+            }
+
             var initEntries = LoadInitEntries();
             if (initEntries.Count > 0)
             {
@@ -141,7 +164,39 @@ public partial class MainWindow : Window
             _statusIdleTimer.Stop();
             if (_remoteAccess is not null)
             {
-                await _remoteAccess.DisposeAsync();
+                try
+                {
+                    await _remoteAccess.DisposeAsync();
+                }
+                catch (Exception exception)
+                {
+                    _logger.Error(exception, "Failed to stop remote access during shutdown.");
+                }
+            }
+
+            foreach (var page in Tabs.Items
+                         .Cast<TabItem>()
+                         .Select(tab => tab.Content)
+                         .OfType<TerminalPage>()
+                         .ToArray())
+            {
+                try
+                {
+                    await page.DisposeAsync();
+                }
+                catch (Exception exception)
+                {
+                    _logger.Error(exception, "Failed to dispose a terminal during shutdown.");
+                }
+            }
+
+            try
+            {
+                await _terminalAuthorityHost.DisposeAsync();
+            }
+            catch (Exception exception)
+            {
+                _logger.Error(exception, "Failed to dispose the terminal authority host.");
             }
 
             _trayIcon.Dispose();
@@ -202,6 +257,12 @@ public partial class MainWindow : Window
 
     private async Task CreateTabFromDialogAsync(bool useDefaults = false)
     {
+        if (Tabs.Items.Count >= MaxTerminalTabs)
+        {
+            AppMessageDialog.Info(this, "最多只能同时创建 32 个终端标签");
+            return;
+        }
+
         if (_profiles.Count == 0)
         {
             AppMessageDialog.Info(this, "未找到 CMD 或 PowerShell，无法创建终端");
@@ -243,6 +304,25 @@ public partial class MainWindow : Window
 
     private async Task CreateTabCoreAsync(NewTerminalRequest request)
     {
+        if (string.IsNullOrWhiteSpace(request.Title)
+            || request.Title.Any(char.IsControl))
+        {
+            _logger.Warn("Skipped a terminal with an empty or control-character title.");
+            return;
+        }
+
+        if (Tabs.Items.Count >= MaxTerminalTabs)
+        {
+            _logger.Warn($"Skipped terminal '{request.Title}': 32-tab hard limit reached.");
+            return;
+        }
+
+        if (FindTerminalPage(request.Title) is not null)
+        {
+            _logger.Warn($"Skipped duplicate terminal title '{request.Title}'.");
+            return;
+        }
+
         ReloadTabPresets();
         _presets.TryGetValue(request.Title, out var preset);
 
@@ -258,6 +338,7 @@ public partial class MainWindow : Window
             _paths,
             _logger,
             _webView2EnvironmentManager,
+            _terminalAuthorityHost,
             GetSelectedFontSize());
         var initialBackground = await page.SetBackgroundImageAsync(
             ResolveBackgroundImage(request.Title, preset),
@@ -279,14 +360,7 @@ public partial class MainWindow : Window
         Tabs.Items.Add(item);
         Tabs.SelectedItem = item;
 
-        page.Exited += (_, exitCode) =>
-        {
-            Dispatcher.Invoke(() =>
-            {
-                SetStatusText($"{request.Title} 已退出，代码 {exitCode}");
-                DimTabHeader(page);
-            });
-        };
+        WirePageEvents(page);
 
         try
         {
@@ -389,6 +463,97 @@ public partial class MainWindow : Window
         {
             _syncingFontSize = false;
         }
+    }
+
+    private void WirePageEvents(TerminalPage page)
+    {
+        page.Exited += (_, exitCode) =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                SetStatusText($"{page.Title} 已退出，代码 {exitCode}");
+                DimTabHeader(page);
+            });
+        };
+        page.RecreateRequested += async (_, _) => await RecreateTabAsync(page);
+    }
+
+    private async Task RecreateTabAsync(TerminalPage failedPage)
+    {
+        if (!failedPage.Session.IsFailed)
+        {
+            return;
+        }
+
+        ReloadTabPresets();
+        _presets.TryGetValue(failedPage.Title, out var preset);
+        var request = failedPage.Request;
+        var profile = request.Profile;
+        if (preset?.WorkingDirectory is not null)
+        {
+            profile = profile with { WorkingDirectory = preset.WorkingDirectory };
+            request = request with { Profile = profile };
+        }
+
+        var executeRun = preset?.RunCommand is not null
+            && AppMessageDialog.Confirm(
+                this,
+                $"重建后将执行预设命令：\n{preset.RunCommand}\n\n是否继续执行该命令？",
+                "执行并重建",
+                "仅重建");
+
+        var replacement = new TerminalPage(
+            request,
+            _paths,
+            _logger,
+            _webView2EnvironmentManager,
+            _terminalAuthorityHost,
+            failedPage.TerminalFontSize);
+        var background = await replacement.SetBackgroundImageAsync(
+            ResolveBackgroundImage(failedPage.Title, preset),
+            preset?.Cover ?? 0);
+        if (!background.Applied)
+        {
+            _logger.Warn(
+                $"Failed to load background while recreating '{failedPage.Title}': "
+                + background.ErrorMessage);
+        }
+
+        try
+        {
+            await replacement.StartAsync();
+            if (executeRun && preset?.RunCommand is not null)
+            {
+                await replacement.SendInputAsync(preset.RunCommand + "\r");
+            }
+            else if (preset?.RunCommand is null && preset?.FillCommand is not null)
+            {
+                await replacement.SendInputAsync(preset.FillCommand);
+            }
+        }
+        catch (Exception exception)
+        {
+            _logger.Error(exception, $"Failed to recreate terminal '{failedPage.Title}'.");
+            AppMessageDialog.Info(this, $"重建终端失败：{exception.Message}");
+            await replacement.DisposeAsync();
+            return;
+        }
+
+        var item = Tabs.Items
+            .Cast<TabItem>()
+            .FirstOrDefault(tab => ReferenceEquals(tab.Content, failedPage));
+        if (item is null)
+        {
+            await replacement.DisposeAsync();
+            return;
+        }
+
+        WirePageEvents(replacement);
+        item.Content = replacement;
+        item.Header = CreateTabHeader(replacement.Title, replacement);
+        item.Background = null;
+        await failedPage.DisposeAsync();
+        SetStatusText($"{replacement.Title} 已手动重建");
     }
 
     private async Task ReloadSelectedBackgroundAsync()
@@ -597,6 +762,26 @@ public partial class MainWindow : Window
         }
 
         var newTitle = dialog.NewTitle.Trim();
+        if (newTitle.Any(char.IsControl))
+        {
+            AppMessageDialog.Info(this, "标签名称不能包含 NUL 或其他控制字符");
+            return;
+        }
+        if (string.Equals(newTitle, page.Title, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (FindTerminalPage(newTitle) is not null)
+        {
+            AppMessageDialog.Info(this, "标签名称已存在；名称区分大小写且必须唯一");
+            return;
+        }
+
+        var oldTitle = page.Title;
+        _remoteAccess?.DisconnectTerminal(
+            oldTitle,
+            "Terminal renamed; reconnect with the new encoded URL.");
         page.SetTitle(newTitle);
         _presets.TryGetValue(newTitle, out var preset);
         var backgroundResult = await page.SetBackgroundImageAsync(
@@ -669,7 +854,28 @@ public partial class MainWindow : Window
     {
         try
         {
-            return InitConfig.Load(_initConfigPath);
+            var entries = InitConfig.Load(_initConfigPath);
+            var accepted = new List<InitTabEntry>(MaxTerminalTabs);
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var entry in entries)
+            {
+                if (!names.Add(entry.Title))
+                {
+                    _logger.Warn($"Init: duplicate tab title '{entry.Title}' skipped.");
+                    continue;
+                }
+
+                if (accepted.Count >= MaxTerminalTabs)
+                {
+                    _logger.Warn(
+                        $"Init: tab '{entry.Title}' skipped because the 32-tab hard limit was reached.");
+                    continue;
+                }
+
+                accepted.Add(entry);
+            }
+
+            return accepted;
         }
         catch (Exception exception) when (IsConfigurationException(exception))
         {

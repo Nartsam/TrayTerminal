@@ -1,4 +1,8 @@
 using System.IO.Pipes;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using TrayTerminal.Shared;
 using TrayTerminal.Shared.Ipc;
 using TrayTerminal.Shared.Terminal;
@@ -7,8 +11,29 @@ namespace TrayTerminal.SmokeTests;
 
 internal static class Program
 {
-    private static async Task<int> Main()
+    private static async Task<int> Main(string[] args)
     {
+        if (args.Length == 1
+            && args[0] is "--stdin-probe" or "--backpressure-probe")
+        {
+            Console.TreatControlCAsInput = true;
+            Console.WriteLine("READY");
+            if (args[0] == "--backpressure-probe")
+            {
+                _ = Task.Run(() =>
+                {
+                    var block = new string('x', 4096);
+                    for (var index = 0; index < 1024; index++)
+                    {
+                        Console.Out.Write(block);
+                    }
+                });
+            }
+            var key = Console.ReadKey(intercept: true);
+            Console.WriteLine($"KEY:{(int)key.KeyChar:X2}");
+            return 0;
+        }
+
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("Portable paths stay under base directory", TestPortablePaths),
@@ -17,10 +42,16 @@ internal static class Program
             ("Terminal snapshot boundary has no gaps or duplicates", TestTerminalSnapshotBoundary),
             ("Terminal state overflow invalidates and recovers", TestTerminalStateOverflowRecovery),
             ("Resize invalidates snapshots until matching checkpoint", TestResizeSnapshotRace),
+            ("Unsafe authority checkpoints retain an exact bounded replay tail", TestAuthorityCheckpointTail),
             ("Slow and repeated subscribers are cleaned up", TestTerminalSubscriberCleanup),
             ("Terminal resize owner transfers deterministically", TestResizeOwnership),
             ("Input acknowledgements complete success and failure", TestInputAcknowledgements),
-            ("Concurrency slots are bounded and released once", TestConcurrencySlots)
+            ("Concurrency slots are bounded and released once", TestConcurrencySlots),
+            ("Authority readiness is generation-scoped", TestAuthorityReadinessBarrier),
+            ("Authority response null fields are parsed without timeout", TestAuthorityResponseParsing),
+            ("Remote operations wait for sync and reserve interrupt capacity", TestRemoteOperationGate),
+            ("Terminal end follows its final continuous event", TestTerminalDeliveryBoundary),
+            ("Host interrupt reaches ConPTY before complete exit", TestHostInterruptIntegration)
         };
 
         foreach (var test in tests)
@@ -83,6 +114,22 @@ internal static class Program
         var exitPayload = IpcProtocol.EncodeExit(123);
         Assert(IpcProtocol.DecodeExit(exitPayload) == 123, "Exit payload mismatch.");
 
+        var resizeRequest = IpcProtocol.DecodeResizeRequest(
+            IpcProtocol.EncodeResizeRequest(7, 140, 50));
+        Assert(
+            resizeRequest == (7, 140, 50),
+            "Sequenced resize request payload mismatch.");
+        var inputResult = IpcProtocol.DecodeInputResult(
+            IpcProtocol.EncodeInputResult(8, accepted: false));
+        Assert(
+            inputResult == (8, false),
+            "Input result payload mismatch.");
+        var exitStatus = IpcProtocol.DecodeExitStatus(
+            IpcProtocol.EncodeExitStatus(123, outputComplete: true));
+        Assert(
+            exitStatus == (123, true),
+            "Exit completion payload mismatch.");
+
         var text = "hello 你好";
         Assert(IpcProtocol.DecodeText(IpcProtocol.EncodeText(text)) == text, "Text payload mismatch.");
 
@@ -95,6 +142,50 @@ internal static class Program
         Assert(
             IpcProtocol.DecodeRequestId(IpcProtocol.EncodeRequestId(42)) == 42,
             "Input acknowledgement request ID mismatch.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestAuthorityResponseParsing()
+    {
+        using var validDocument = JsonDocument.Parse("""
+            {
+              "ok": true,
+              "sequence": "1",
+              "snapshot": null,
+              "snapshotSequence": null,
+              "snapshotCols": null,
+              "snapshotRows": null,
+              "reason": null,
+              "checkpointSafe": true
+            }
+            """);
+        var response = AuthorityResponseProtocol.Parse(validDocument.RootElement);
+        Assert(response.Ok && response.Sequence == "1", "Authority response identity mismatch.");
+        Assert(
+            response.Snapshot is null
+                && response.SnapshotSequence is null
+                && response.SnapshotCols is null
+                && response.SnapshotRows is null,
+            "Nullable authority response fields were not preserved.");
+
+        using var invalidDocument = JsonDocument.Parse("""
+            {
+              "ok": true,
+              "sequence": "1",
+              "snapshotCols": "80",
+              "checkpointSafe": true
+            }
+            """);
+        try
+        {
+            AuthorityResponseProtocol.Parse(invalidDocument.RootElement);
+            throw new InvalidOperationException(
+                "Malformed authority response should fail immediately.");
+        }
+        catch (InvalidDataException)
+        {
+        }
+
         return Task.CompletedTask;
     }
 
@@ -216,6 +307,92 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task TestAuthorityCheckpointTail()
+    {
+        using var hub = new TerminalStateHub(
+            tailByteLimit: 8,
+            tailItemLimit: 3,
+            snapshotByteLimit: 32,
+            initialSize: new TerminalSize(80, 24));
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                1,
+                [1],
+                null,
+                [10],
+                new TerminalSize(80, 24),
+                out _),
+            "Initial authority checkpoint failed.");
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                2,
+                [2],
+                null,
+                null,
+                new TerminalSize(80, 24),
+                out _),
+            "Unsafe output should retain a replay event.");
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                3,
+                [],
+                new TerminalSize(100, 30),
+                null,
+                new TerminalSize(100, 30),
+                out _),
+            "Unsafe resize should retain a replay boundary.");
+        Assert(hub.TryGetRecoveryState(out var state), "Recovery state disappeared.");
+        Assert(state!.Snapshot.Sequence == 1, "Unsafe events replaced the safe checkpoint.");
+        Assert(
+            state.Replay.Select(item => item.Sequence).SequenceEqual([2L, 3L]),
+            "Recovery replay does not exactly cover the unsafe event tail.");
+        Assert(
+            state.Replay[1].Resize == new TerminalSize(100, 30),
+            "Sequenced resize was lost from the recovery tail.");
+
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                4,
+                [4],
+                null,
+                [40],
+                new TerminalSize(100, 30),
+                out _),
+            "A later safe checkpoint should collapse the replay tail.");
+        Assert(hub.TryGetRecoveryState(out state), "Safe checkpoint was not recoverable.");
+        Assert(state!.Snapshot.Sequence == 4, "Safe checkpoint sequence mismatch.");
+        Assert(state.Replay.Count == 0, "Safe checkpoint did not clear the covered tail.");
+
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                5,
+                [5, 5, 5, 5],
+                null,
+                null,
+                new TerminalSize(100, 30),
+                out _),
+            "First bounded unsafe tail event failed.");
+        Assert(
+            hub.TryCommitAuthorityEvent(
+                6,
+                [6, 6, 6, 6],
+                null,
+                null,
+                new TerminalSize(100, 30),
+                out _),
+            "Second bounded unsafe tail event failed.");
+        Assert(
+            !hub.TryCommitAuthorityEvent(
+                7,
+                [7],
+                null,
+                null,
+                new TerminalSize(100, 30),
+                out _),
+            "Unsafe tail was allowed to exceed its hard byte limit.");
+        return Task.CompletedTask;
+    }
+
     private static Task TestTerminalSubscriberCleanup()
     {
         using var hub = new TerminalStateHub(
@@ -282,7 +459,9 @@ internal static class Program
         Assert(
             acknowledgements.TryRegister(1, out var accepted),
             "Input acknowledgement registration failed.");
-        Assert(acknowledgements.TryAcknowledge(1), "Input acknowledgement was not correlated.");
+        Assert(
+            acknowledgements.TryComplete(1, accepted: true),
+            "Input acknowledgement was not correlated.");
         Assert(await accepted, "Acknowledged input should complete successfully.");
         acknowledgements.Remove(1);
 
@@ -310,5 +489,314 @@ internal static class Program
         second!.Dispose();
         Assert(limiter.ActiveCount == 0, "All request slots should be released.");
         return Task.CompletedTask;
+    }
+
+    private static async Task TestAuthorityReadinessBarrier()
+    {
+        var barrier = new AuthorityRecoveryBarrier();
+        barrier.StartInitialRecovery();
+        var firstGeneration = barrier.Generation;
+        var oldWaiter = barrier.WaitReadyAsync();
+        var secondGeneration = barrier.RestartRecovery();
+        Assert(secondGeneration > firstGeneration, "Recovery generation did not advance.");
+        try
+        {
+            await oldWaiter;
+            throw new InvalidOperationException(
+                "A waiter crossed a superseded renderer generation.");
+        }
+        catch (AuthorityGenerationSupersededException)
+        {
+        }
+
+        Assert(
+            !barrier.TrySetReady(firstGeneration),
+            "A stale renderer result opened the current barrier.");
+        var currentWaiter = barrier.WaitReadyAsync();
+        Assert(!currentWaiter.IsCompleted, "Recovering renderer was exposed as ready.");
+        Assert(barrier.TrySetReady(secondGeneration), "Current renderer was not accepted.");
+        await currentWaiter.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert(
+            barrier.IsCurrentReady(secondGeneration),
+            "Ready state was not scoped to the current generation.");
+    }
+
+    private static Task TestRemoteOperationGate()
+    {
+        var gate = new RemoteOperationGate();
+        Assert(!gate.TryBegin(interrupt: false), "Pre-sync input was accepted.");
+        Assert(!gate.TryBegin(interrupt: true), "Pre-sync interrupt was accepted.");
+        gate.Open();
+        for (var index = 0; index < RemoteOperationGate.MaxOperations - 1; index++)
+        {
+            Assert(gate.TryBegin(interrupt: false), "Ordinary input capacity regressed.");
+        }
+
+        Assert(!gate.TryBegin(interrupt: false), "Ordinary input consumed interrupt reserve.");
+        Assert(gate.TryBegin(interrupt: true), "Interrupt reserve was unavailable.");
+        Assert(!gate.TryBegin(interrupt: true), "Combined operation cap exceeded 64.");
+        gate.Close();
+        Assert(!gate.TryBegin(interrupt: true), "Disconnected client accepted an operation.");
+        for (var index = 0; index < RemoteOperationGate.MaxOperations; index++)
+        {
+            gate.End();
+        }
+        Assert(gate.ActiveCount == 0, "Completed operations were retained.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestTerminalDeliveryBoundary()
+    {
+        var tracker = new TerminalDeliveryTracker(initialLatestSequence: 10);
+        Assert(!tracker.Reaches(12), "Terminal ended before its live output arrived.");
+        Assert(tracker.TryObserve(11), "First live output was rejected.");
+        Assert(!tracker.Reaches(12), "Terminal ended before its final output arrived.");
+        Assert(tracker.TryObserve(12), "Final live output was rejected.");
+        Assert(tracker.Reaches(12), "Terminal end boundary did not follow final output.");
+        Assert(!tracker.TryObserve(14), "A sequence gap was accepted.");
+        Assert(
+            tracker.LastContinuousSequence == 12,
+            "A rejected gap changed the continuous delivery boundary.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestHostInterruptIntegration()
+    {
+        var hostPath = FindSiblingProjectExecutable(
+            "TrayTerminal.Host",
+            "TrayTerminal.Host.exe");
+        var probePath = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Smoke-test process path is unavailable.");
+        Assert(File.Exists(hostPath), $"Host executable not found: {hostPath}");
+        Assert(File.Exists(probePath), $"Probe executable not found: {probePath}");
+
+        var outputPipeName = $"TrayTerminalSmoke-Output-{Guid.NewGuid():N}";
+        var controlPipeName = $"TrayTerminalSmoke-Control-{Guid.NewGuid():N}";
+        var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+        await using var outputPipe = new NamedPipeServerStream(
+            outputPipeName,
+            PipeDirection.In,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+        await using var controlPipe = new NamedPipeServerStream(
+            controlPipeName,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+
+        var arguments = string.Join(
+            ' ',
+            "--output-pipe", outputPipeName,
+            "--control-pipe", controlPipeName,
+            "--nonce", nonce,
+            "--exe", EncodeHostArgument(probePath),
+            "--args", EncodeHostArgument("--backpressure-probe"),
+            "--cwd", EncodeHostArgument(AppContext.BaseDirectory),
+            "--cols", "80",
+            "--rows", "24");
+        using var host = Process.Start(new ProcessStartInfo
+        {
+            FileName = hostPath,
+            Arguments = arguments,
+            WorkingDirectory = Path.GetDirectoryName(hostPath)!,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }) ?? throw new InvalidOperationException("Could not start Host integration test.");
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            await Task.WhenAll(
+                outputPipe.WaitForConnectionAsync(timeout.Token),
+                controlPipe.WaitForConnectionAsync(timeout.Token));
+            var hellos = await Task.WhenAll(
+                IpcProtocol.ReadAsync(outputPipe, timeout.Token),
+                IpcProtocol.ReadAsync(controlPipe, timeout.Token));
+            Assert(
+                hellos.All(hello => hello is { Type: IpcMessageType.Hello }
+                    && IpcProtocol.DecodeText(hello.Value.Payload) == nonce),
+                "Dual-pipe Host nonce handshake failed.");
+
+            var probeReady = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var resumeOutput = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var interruptAcked = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var outputTask = Task.Run(async () =>
+            {
+                using var captured = new MemoryStream();
+                var eventOrder = new List<(string Type, long RequestId)>();
+                bool? complete = null;
+                var paused = false;
+                while (complete is null)
+                {
+                    var message = await IpcProtocol.ReadAsync(outputPipe, timeout.Token)
+                        ?? throw new EndOfStreamException("Output pipe ended before completion.");
+                    if (message.Type == IpcMessageType.Output)
+                    {
+                        captured.Write(message.Payload);
+                        eventOrder.Add((
+                            Encoding.UTF8.GetString(message.Payload)
+                                .Contains("KEY:03", StringComparison.Ordinal)
+                                    ? "key"
+                                    : "output",
+                            0));
+                        if (Encoding.UTF8.GetString(captured.ToArray())
+                            .Contains("READY", StringComparison.Ordinal))
+                        {
+                            probeReady.TrySetResult();
+                            if (!paused)
+                            {
+                                paused = true;
+                                await resumeOutput.Task.WaitAsync(timeout.Token);
+                            }
+                        }
+                    }
+                    else if (message.Type == IpcMessageType.ResizeBoundary)
+                    {
+                        var boundary = IpcProtocol.DecodeResizeRequest(message.Payload);
+                        eventOrder.Add(("resize", boundary.RequestId));
+                    }
+                    else if (message.Type == IpcMessageType.OutputCompleted)
+                    {
+                        complete = message.Payload is [1];
+                    }
+                }
+
+                return (
+                    Encoding.UTF8.GetString(captured.ToArray()),
+                    complete.Value,
+                    eventOrder);
+            }, timeout.Token);
+            var controlTask = Task.Run(async () =>
+            {
+                bool? interruptAccepted = null;
+                (int ExitCode, bool OutputComplete)? exit = null;
+                var rejectedResizes = new HashSet<long>();
+                while (exit is null)
+                {
+                    var message = await IpcProtocol.ReadAsync(controlPipe, timeout.Token)
+                        ?? throw new EndOfStreamException("Control pipe ended before exit.");
+                    if (message.Type == IpcMessageType.InterruptAck)
+                    {
+                        var result = IpcProtocol.DecodeInputResult(message.Payload);
+                        if (result.RequestId == 77)
+                        {
+                            interruptAccepted = result.Accepted;
+                            interruptAcked.TrySetResult(result.Accepted);
+                        }
+                    }
+                    else if (message.Type == IpcMessageType.ResizeAck)
+                    {
+                        var result = IpcProtocol.DecodeInputResult(message.Payload);
+                        if (!result.Accepted)
+                        {
+                            rejectedResizes.Add(result.RequestId);
+                        }
+                    }
+                    else if (message.Type == IpcMessageType.Exit)
+                    {
+                        exit = IpcProtocol.DecodeExitStatus(message.Payload);
+                    }
+                }
+
+                return (interruptAccepted, exit.Value, rejectedResizes);
+            }, timeout.Token);
+
+            await probeReady.Task.WaitAsync(timeout.Token);
+            // Let terminal output fill the one-way data pipe while the output
+            // reader is intentionally paused. Resize coalescing and interrupt ACK
+            // must remain independent from that blocked data path.
+            await Task.Delay(500, timeout.Token);
+            const long finalResizeRequestId = 20;
+            for (long requestId = 1; requestId <= finalResizeRequestId; requestId++)
+            {
+                await IpcProtocol.WriteAsync(
+                    controlPipe,
+                    new IpcMessage(
+                        IpcMessageType.Resize,
+                        IpcProtocol.EncodeResizeRequest(
+                            requestId,
+                            80 + (int)requestId,
+                            24)),
+                    timeout.Token);
+            }
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                new IpcMessage(
+                    IpcMessageType.Interrupt,
+                    IpcProtocol.EncodeRequestId(77)),
+                timeout.Token);
+            Assert(
+                await interruptAcked.Task.WaitAsync(TimeSpan.FromSeconds(3), timeout.Token),
+                "Host control ACK was blocked by terminal output backpressure.");
+            resumeOutput.TrySetResult();
+            var output = await outputTask;
+            var control = await controlTask;
+            Assert(control.interruptAccepted == true, "Host did not ACK the ConPTY interrupt write.");
+            Assert(output.Item1.Contains("KEY:03", StringComparison.Ordinal),
+                "The probe did not receive exactly one ETX byte through ConPTY. "
+                + $"Captured: {Convert.ToBase64String(Encoding.UTF8.GetBytes(output.Item1))}");
+            Assert(output.Item2, "Host marked final ConPTY output incomplete.");
+            Assert(control.Value.ExitCode == 0 && control.Value.OutputComplete,
+                "Host exit status did not confirm a complete output drain.");
+            Assert(
+                Enumerable.Range(1, (int)finalResizeRequestId - 1)
+                    .All(requestId => control.rejectedResizes.Contains(requestId)),
+                "Coalesced resize requests did not receive explicit false ACKs.");
+            var resizeIndex = output.eventOrder.FindIndex(item =>
+                item == ("resize", finalResizeRequestId));
+            var keyIndex = output.eventOrder.FindIndex(item => item.Type == "key");
+            Assert(resizeIndex > 0, "Latest resize boundary was not sequenced after old output.");
+            Assert(
+                keyIndex > resizeIndex,
+                "Output produced after resize crossed ahead of its resize boundary.");
+            await host.WaitForExitAsync(timeout.Token);
+        }
+        finally
+        {
+            // If an assertion fails before the data reader resumes, killing the
+            // Host must still be able to release the probe process tree.
+            if (!host.HasExited)
+            {
+                host.Kill(entireProcessTree: true);
+            }
+        }
+    }
+
+    private static string FindSiblingProjectExecutable(
+        string projectName,
+        string executableName)
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null
+            && !string.Equals(directory.Name, "src", StringComparison.OrdinalIgnoreCase))
+        {
+            directory = directory.Parent;
+        }
+
+        if (directory is null)
+        {
+            throw new DirectoryNotFoundException("Could not locate the repository src directory.");
+        }
+
+        return Path.Combine(
+            directory.FullName,
+            projectName,
+            "bin",
+            "x64",
+            "Debug",
+            "net10.0-windows",
+            executableName);
+    }
+
+    private static string EncodeHostArgument(string value)
+    {
+        return value.Length == 0
+            ? "."
+            : Convert.ToBase64String(Encoding.UTF8.GetBytes(value));
     }
 }

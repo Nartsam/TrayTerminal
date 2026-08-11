@@ -36,6 +36,8 @@ public sealed class PortablePaths
 
     public string TerminalHtmlPath => CombineInsideBase("Assets", "terminal.html");
 
+    public string AuthorityTerminalHtmlPath => CombineInsideBase("Assets", "authority-terminal.html");
+
     public string AppIconPath => CombineInsideBase("Assets", "app.ico");
 
     public void EnsureCreated()

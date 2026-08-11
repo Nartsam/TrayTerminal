@@ -4,7 +4,9 @@ namespace TrayTerminal.Host;
 
 internal sealed class HostOptions
 {
-    public required string PipeName { get; init; }
+    public required string OutputPipeName { get; init; }
+
+    public required string ControlPipeName { get; init; }
 
     public required string Nonce { get; init; }
 
@@ -41,7 +43,8 @@ internal sealed class HostOptions
 
         return new HostOptions
         {
-            PipeName = Required(values, "pipe"),
+            OutputPipeName = Required(values, "output-pipe"),
+            ControlPipeName = Required(values, "control-pipe"),
             Nonce = Required(values, "nonce"),
             ExecutablePath = DecodeRequired(values, "exe"),
             Arguments = DecodeRequired(values, "args"),

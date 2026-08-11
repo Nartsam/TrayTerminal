@@ -2,7 +2,13 @@ using System.Threading.Channels;
 
 namespace TrayTerminal.Shared.Terminal;
 
-public sealed record TerminalOutput(long Sequence, byte[] Data);
+public sealed record TerminalOutput(
+    long Sequence,
+    byte[] Data,
+    TerminalSize? Resize = null)
+{
+    public bool IsResize => Resize is not null;
+}
 
 public sealed record TerminalSnapshot(
     long Sequence,
@@ -15,8 +21,9 @@ public sealed record TerminalInitialState(
     long LatestSequence);
 
 /// <summary>
-/// Keeps a bounded checkpoint and the output after it. The visible xterm instance
-/// produces checkpoints; this class makes snapshot + replay subscription atomic.
+/// Keeps a bounded authority checkpoint and the sequenced events after it. The
+/// process-level headless xterm produces checkpoints; visible renderers only
+/// consume snapshot + replay and can never overwrite the authority state.
 /// </summary>
 public sealed class TerminalStateHub : IDisposable
 {
@@ -146,6 +153,145 @@ public sealed class TerminalStateHub : IDisposable
         }
 
         return output;
+    }
+
+    public TerminalOutput PublishResize(TerminalSize size)
+    {
+        return PublishCore([], size);
+    }
+
+    private TerminalOutput PublishCore(byte[] data, TerminalSize? resize)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+
+        List<KeyValuePair<Guid, Channel<TerminalOutput>>>? slowSubscribers = null;
+        TerminalOutput output;
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            output = new TerminalOutput(++_latestSequence, data, resize);
+            _tail.AddLast(output);
+            _tailBytes += data.Length;
+            TrimTail();
+            QueueSubscribers(output, ref slowSubscribers);
+        }
+
+        return output;
+    }
+
+    public bool TryCommitAuthorityEvent(
+        long sequence,
+        byte[] data,
+        TerminalSize? resize,
+        byte[]? snapshot,
+        TerminalSize size,
+        out TerminalOutput? output)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (snapshot is not null && snapshot.Length > _snapshotByteLimit)
+        {
+            output = null;
+            return false;
+        }
+
+        List<KeyValuePair<Guid, Channel<TerminalOutput>>>? slowSubscribers = null;
+        lock (_lock)
+        {
+            if (_disposed || sequence != _latestSequence + 1)
+            {
+                output = null;
+                return false;
+            }
+
+            if (snapshot is null
+                && (_tailBytes > _tailByteLimit - data.Length
+                    || _tail.Count >= _tailItemLimit))
+            {
+                output = null;
+                return false;
+            }
+
+            output = new TerminalOutput(sequence, data, resize);
+            _latestSequence = sequence;
+            _tail.AddLast(output);
+            _tailBytes += data.Length;
+            if (snapshot is not null)
+            {
+                _snapshot = new TerminalSnapshot(sequence, snapshot, size);
+                while (_tail.First is { } first && first.Value.Sequence <= sequence)
+                {
+                    _tail.RemoveFirst();
+                    _tailBytes -= first.Value.Data.Length;
+                }
+            }
+
+            QueueSubscribers(output, ref slowSubscribers);
+            return true;
+        }
+    }
+
+    public void Fail(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        Channel<TerminalOutput>[] subscribers;
+        lock (_lock)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _snapshot = null;
+            _tail.Clear();
+            _tailBytes = 0;
+            subscribers = _subscribers.Values.ToArray();
+            _subscribers.Clear();
+        }
+
+        foreach (var subscriber in subscribers)
+        {
+            subscriber.Writer.TryComplete(exception);
+        }
+    }
+
+    private void TrimTail()
+    {
+        while ((_tailBytes > _tailByteLimit || _tail.Count > _tailItemLimit)
+            && _tail.First is { } first)
+        {
+            _tail.RemoveFirst();
+            _tailBytes -= first.Value.Data.Length;
+            if (_snapshot is not null && first.Value.Sequence > _snapshot.Sequence)
+            {
+                _snapshot = null;
+            }
+        }
+    }
+
+    private void QueueSubscribers(
+        TerminalOutput output,
+        ref List<KeyValuePair<Guid, Channel<TerminalOutput>>>? slowSubscribers)
+    {
+        foreach (var subscriber in _subscribers)
+        {
+            if (!subscriber.Value.Writer.TryWrite(output))
+            {
+                slowSubscribers ??= [];
+                slowSubscribers.Add(subscriber);
+            }
+        }
+
+        if (slowSubscribers is null)
+        {
+            return;
+        }
+
+        foreach (var slowSubscriber in slowSubscribers)
+        {
+            _subscribers.Remove(slowSubscriber.Key);
+            slowSubscriber.Value.Writer.TryComplete(
+                new TerminalSubscriberTooSlowException());
+        }
     }
 
     public bool TryAcceptSnapshot(

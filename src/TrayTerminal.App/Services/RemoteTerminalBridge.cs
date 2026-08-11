@@ -17,7 +17,7 @@ namespace TrayTerminal.App.Services;
 /// </summary>
 public sealed class RemoteTerminalBridge : IAsyncDisposable
 {
-    public const int ProtocolVersion = 2;
+    public const int ProtocolVersion = 3;
     private const int OutboundQueueCapacity = 512;
     private const int MaxInputBytes = 1024 * 1024;
     private const long MaxJavaScriptSafeInteger = 9_007_199_254_740_991;
@@ -35,6 +35,15 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
     private readonly string _terminalName;
     private readonly FileLogger _logger;
     private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _socketGate = new(1, 1);
+    private readonly SemaphoreSlim _resizeSignal = new(0);
+    private readonly object _operationLock = new();
+    private readonly object _resizeLock = new();
+    private readonly object _disconnectLock = new();
+    private readonly RemoteOperationGate _clientOperationGate = new();
+    private readonly HashSet<Task> _clientOperations = [];
+    private readonly TaskCompletionSource<SessionTermination> _termination = new(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly Channel<ServerMessage> _outbound = Channel.CreateBounded<ServerMessage>(
         new BoundedChannelOptions(OutboundQueueCapacity)
         {
@@ -47,6 +56,8 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
     private TerminalStateSubscription? _stateSubscription;
     private Guid? _terminalClientId;
     private long _lastInputId;
+    private RemoteResize? _pendingResize;
+    private Task? _disconnectTask;
     private int _disposed;
 
     public RemoteTerminalBridge(
@@ -63,6 +74,25 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
     public string TerminalName => _terminalName;
 
+    public Task DisconnectAsync(string reason)
+    {
+        lock (_disconnectLock)
+        {
+            return _disconnectTask ??= DisconnectCoreAsync(reason);
+        }
+    }
+
+    private async Task DisconnectCoreAsync(string reason)
+    {
+        await SendDirectAsync(
+            ServerMessage.Error("renamed"),
+            _cts.Token).ConfigureAwait(false);
+        await CloseDirectAsync(
+            WebSocketCloseStatus.PolicyViolation,
+            reason).ConfigureAwait(false);
+        Abort();
+    }
+
     public async Task RunAsync()
     {
         if (_webSocket.State != WebSocketState.Open)
@@ -70,11 +100,11 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             return;
         }
 
-        if (!_session.TryOpenRemoteStream(out var subscription)
-            || subscription is null)
+        var openResult = await OpenRemoteStreamAsync().ConfigureAwait(false);
+        if (openResult.Subscription is not { } subscription)
         {
             await SendDirectAsync(
-                ServerMessage.Error("stateUnavailable"),
+                ServerMessage.Error(openResult.FailureReason),
                 CancellationToken.None).ConfigureAwait(false);
             await CloseDirectAsync(
                 WebSocketCloseStatus.EndpointUnavailable,
@@ -96,11 +126,10 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
         if (_session.Completion.IsCompleted)
         {
-            Abort();
-            await DisposeAsync();
-            return;
+            OnSessionTerminated(_session, EventArgs.Empty);
         }
 
+        var resizeTask = PumpResizeAsync(clientId, _cts.Token);
         var sendTask = SendLoopAsync(subscription, clientId);
         try
         {
@@ -131,8 +160,51 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             {
             }
 
+            try
+            {
+                await resizeTask.ConfigureAwait(false);
+            }
+            catch
+            {
+            }
+
+            await WaitForClientOperationsAsync().ConfigureAwait(false);
+
             await DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    private async Task<RemoteOpenResult> OpenRemoteStreamAsync()
+    {
+        var deadline = DateTime.UtcNow + SendTimeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var availability = _session.AuthorityAvailability;
+            if (availability == AuthorityAvailability.Failed)
+            {
+                return new RemoteOpenResult(null, "stateUnavailable");
+            }
+
+            if (availability == AuthorityAvailability.Ready
+                && _session.TryOpenRemoteStream(out var subscription)
+                && subscription is not null)
+            {
+                return new RemoteOpenResult(subscription, string.Empty);
+            }
+
+            if (!_session.IsRunning)
+            {
+                break;
+            }
+
+            await Task.Delay(100, _cts.Token).ConfigureAwait(false);
+        }
+
+        return new RemoteOpenResult(
+            null,
+            _session.AuthorityAvailability == AuthorityAvailability.Failed
+                ? "stateUnavailable"
+                : "temporaryUnavailable");
     }
 
     private async Task SendLoopAsync(
@@ -166,7 +238,7 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                 }
 
                 await SendAsync(
-                    ServerMessage.Output(output),
+                    ServerMessage.Event(output),
                     _cts.Token).ConfigureAwait(false);
                 expected++;
             }
@@ -180,6 +252,7 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             await SendAsync(
                 ServerMessage.SyncComplete(initial.LatestSequence),
                 _cts.Token).ConfigureAwait(false);
+            _clientOperationGate.Open();
 
             // Registration can change ownership before the SizeChanged handler is
             // attached. Capture an atomic canonical state at this exact protocol
@@ -207,6 +280,14 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                 }
 
                 await SendAsync(message, _cts.Token).ConfigureAwait(false);
+                if (message.Type is "terminalEnded" or "stateUnavailable")
+                {
+                    await CloseDirectAsync(
+                        WebSocketCloseStatus.NormalClosure,
+                        message.Type).ConfigureAwait(false);
+                    CancelBridge();
+                    break;
+                }
             }
         }
         catch (OperationCanceledException)
@@ -225,6 +306,11 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
         catch (Exception exception)
         {
+            if (_session.IsFailed)
+            {
+                return;
+            }
+
             if (!_cts.IsCancellationRequested)
             {
                 _logger.Info(
@@ -248,14 +334,42 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
     private async Task PumpLiveOutputAsync(TerminalStateSubscription subscription)
     {
+        var delivery = new TerminalDeliveryTracker(
+            subscription.InitialState.LatestSequence);
         try
         {
-            await foreach (var output in subscription.Outputs
-                               .ReadAllAsync(_cts.Token)
-                               .ConfigureAwait(false))
+            while (!_cts.IsCancellationRequested)
             {
-                if (!TryQueue(ServerMessage.Output(output)))
+                if (_termination.Task.IsCompleted)
                 {
+                    var termination = await _termination.Task.ConfigureAwait(false);
+                    await FinalizeTerminationAsync(
+                        subscription,
+                        delivery,
+                        termination).ConfigureAwait(false);
+                    return;
+                }
+
+                while (subscription.Outputs.TryRead(out var output))
+                {
+                    if (!delivery.TryObserve(output.Sequence)
+                        || !TryQueue(ServerMessage.Event(output)))
+                    {
+                        Abort();
+                        return;
+                    }
+
+                }
+
+                var outputReady = subscription.Outputs.WaitToReadAsync(_cts.Token)
+                    .AsTask();
+                await Task.WhenAny(outputReady, _termination.Task)
+                    .ConfigureAwait(false);
+                if (outputReady.IsCompletedSuccessfully
+                    && !outputReady.Result
+                    && !_termination.Task.IsCompleted)
+                {
+                    Abort();
                     return;
                 }
             }
@@ -272,6 +386,25 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
         catch (Exception exception)
         {
+            if (_session.IsFailed)
+            {
+                try
+                {
+                    var termination = await _termination.Task
+                        .WaitAsync(SendTimeout, _cts.Token)
+                        .ConfigureAwait(false);
+                    await FinalizeTerminationAsync(
+                        subscription,
+                        delivery,
+                        termination).ConfigureAwait(false);
+                }
+                catch
+                {
+                    Abort();
+                }
+                return;
+            }
+
             if (!_cts.IsCancellationRequested)
             {
                 _logger.Info(
@@ -280,6 +413,60 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                 Abort();
             }
         }
+    }
+
+    private async Task FinalizeTerminationAsync(
+        TerminalStateSubscription subscription,
+        TerminalDeliveryTracker delivery,
+        SessionTermination termination)
+    {
+        while (subscription.Outputs.TryRead(out var finalOutput))
+        {
+            if (!delivery.TryObserve(finalOutput.Sequence)
+                || finalOutput.Sequence > termination.FinalSequence
+                || !TryQueue(ServerMessage.Event(finalOutput)))
+            {
+                QueueUnverifiableTermination(
+                    termination,
+                    delivery.LastContinuousSequence);
+                return;
+            }
+        }
+
+        // Session termination rejects/completes pending Host ACKs. Queue those
+        // operation results before the terminal marker so the browser never
+        // loses a known result behind terminalEnded.
+        await WaitForClientOperationsAsync().ConfigureAwait(false);
+
+        if (!delivery.Reaches(termination.FinalSequence))
+        {
+            QueueUnverifiableTermination(
+                termination,
+                delivery.LastContinuousSequence);
+            return;
+        }
+
+        TryQueue(termination.Failed
+            ? ServerMessage.StateUnavailable(
+                termination.Reason,
+                termination.FinalSequence)
+            : ServerMessage.TerminalEnded(
+                termination.ExitCode!.Value,
+                termination.OutputComplete,
+                termination.FinalSequence));
+        _outbound.Writer.TryComplete();
+    }
+
+    private void QueueUnverifiableTermination(
+        SessionTermination termination,
+        long lastContinuousSequence)
+    {
+        TryQueue(ServerMessage.StateUnavailable(
+            termination.Reason.Length == 0
+                ? "Terminal event continuity could not be verified."
+                : termination.Reason,
+            lastContinuousSequence));
+        _outbound.Writer.TryComplete();
     }
 
     private void OnSizeChanged(object? sender, TerminalSizeUpdate update)
@@ -299,9 +486,30 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
     private void OnSessionTerminated(object? sender, EventArgs e)
     {
-        _logger.Info(
-            $"Terminal '{_terminalName}' ended; disconnecting remote client.");
-        Abort();
+        _clientOperationGate.Close();
+        var finalSequence = _session.LatestSequence;
+        if (_session.IsFailed)
+        {
+            _termination.TrySetResult(new SessionTermination(
+                finalSequence,
+                Failed: true,
+                ExitCode: null,
+                OutputComplete: false,
+                _session.FailureReason ?? "Terminal authority state is unavailable."));
+        }
+        else if (_session.ExitCode is { } exitCode)
+        {
+            _termination.TrySetResult(new SessionTermination(
+                finalSequence,
+                Failed: false,
+                exitCode,
+                _session.OutputComplete,
+                string.Empty));
+        }
+        else
+        {
+            Abort();
+        }
     }
 
     private bool TryQueue(ServerMessage message)
@@ -369,26 +577,34 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                     || !root.TryGetProperty("type", out var type))
                 {
                     TryQueue(ServerMessage.Error("protocolMismatch"));
-                    Abort();
+                    _outbound.Writer.TryComplete();
                     return;
                 }
 
                 switch (type.GetString())
                 {
                     case "input":
-                        await ProcessInputAsync(root).ConfigureAwait(false);
+                        ReceiveInput(root, isInterrupt: false);
+                        break;
+
+                    case "interrupt":
+                        // Interrupt is deliberately not serialized behind an
+                        // ordinary input ACK. TerminalSession cancels all queued
+                        // normal input and Host prioritizes the ETX after the
+                        // current 64 KiB write.
+                        ReceiveInput(root, isInterrupt: true);
                         break;
 
                     case "resize":
-                        if (root.TryGetProperty("cols", out var columns)
+                        if (_clientOperationGate.IsOpen
+                            && root.TryGetProperty("cols", out var columns)
                             && columns.TryGetInt32(out var columnCount)
                             && root.TryGetProperty("rows", out var rows)
                             && rows.TryGetInt32(out var rowCount))
                         {
-                            await _session.RequestResizeAsync(
-                                clientId,
+                            QueueResize(new RemoteResize(
                                 columnCount,
-                                rowCount).ConfigureAwait(false);
+                                rowCount));
                         }
                         break;
                 }
@@ -400,28 +616,182 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
     }
 
-    private async Task ProcessInputAsync(JsonElement root)
+    private void ReceiveInput(JsonElement root, bool isInterrupt)
     {
         if (!root.TryGetProperty("inputId", out var inputIdProperty)
             || !inputIdProperty.TryGetInt64(out var inputId)
-            || inputId <= _lastInputId
-            || inputId > MaxJavaScriptSafeInteger
-            || !root.TryGetProperty("data", out var dataProperty))
+            || inputId <= 0
+            || inputId > MaxJavaScriptSafeInteger)
         {
             return;
         }
 
-        var text = dataProperty.GetString();
-        if (string.IsNullOrEmpty(text)
-            || Encoding.UTF8.GetByteCount(text) > MaxInputBytes)
+        if (inputId <= _lastInputId)
         {
-            TryQueue(ServerMessage.InputAck(inputId, accepted: false));
+            TryQueue(isInterrupt
+                ? ServerMessage.InterruptAck(inputId, accepted: false)
+                : ServerMessage.InputAck(inputId, accepted: false));
             return;
         }
 
         _lastInputId = inputId;
-        var accepted = await _session.TrySendInputAsync(text).ConfigureAwait(false);
-        TryQueue(ServerMessage.InputAck(inputId, accepted));
+        string? text = null;
+        if (!isInterrupt)
+        {
+            if (!root.TryGetProperty("data", out var dataProperty))
+            {
+                TryQueue(ServerMessage.InputAck(inputId, accepted: false));
+                return;
+            }
+
+            text = dataProperty.GetString();
+            if (string.IsNullOrEmpty(text)
+                || Encoding.UTF8.GetByteCount(text) > MaxInputBytes)
+            {
+                TryQueue(ServerMessage.InputAck(inputId, accepted: false));
+                return;
+            }
+        }
+
+        StartClientOperation(inputId, text, isInterrupt);
+    }
+
+    private void StartClientOperation(long inputId, string? text, bool isInterrupt)
+    {
+        Task operationTask;
+        lock (_operationLock)
+        {
+            if (!_clientOperationGate.TryBegin(isInterrupt))
+            {
+                TryQueue(isInterrupt
+                    ? ServerMessage.InterruptAck(inputId, accepted: false)
+                    : ServerMessage.InputAck(inputId, accepted: false));
+                return;
+            }
+
+            operationTask = RunClientOperationAsync(
+                inputId,
+                text,
+                isInterrupt,
+                _cts.Token);
+            _clientOperations.Add(operationTask);
+        }
+
+        _ = operationTask.ContinueWith(
+            completed =>
+            {
+                lock (_operationLock)
+                {
+                    _clientOperations.Remove(completed);
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task RunClientOperationAsync(
+        long inputId,
+        string? text,
+        bool isInterrupt,
+        CancellationToken cancellationToken)
+    {
+        var accepted = false;
+        try
+        {
+            accepted = isInterrupt
+                ? await _session.TryInterruptAsync(cancellationToken)
+                    .ConfigureAwait(false)
+                : await _session.TrySendInputAsync(text!, cancellationToken)
+                    .ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            if (!_cts.IsCancellationRequested)
+            {
+                _logger.Info(
+                    $"Remote input operation for '{_terminalName}' failed: "
+                    + exception.Message);
+            }
+        }
+        finally
+        {
+            _clientOperationGate.End();
+
+            TryQueue(isInterrupt
+                ? ServerMessage.InterruptAck(inputId, accepted)
+                : ServerMessage.InputAck(inputId, accepted));
+        }
+    }
+
+    private void QueueResize(RemoteResize resize)
+    {
+        var signal = false;
+        lock (_resizeLock)
+        {
+            signal = _pendingResize is null;
+            _pendingResize = resize;
+        }
+
+        if (signal)
+        {
+            _resizeSignal.Release();
+        }
+    }
+
+    private async Task PumpResizeAsync(
+        Guid clientId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (true)
+            {
+                await _resizeSignal.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+
+                while (true)
+                {
+                    RemoteResize? resize;
+                    lock (_resizeLock)
+                    {
+                        resize = _pendingResize;
+                        _pendingResize = null;
+                    }
+
+                    if (resize is null)
+                    {
+                        break;
+                    }
+
+                    await _session.RequestResizeAsync(
+                        clientId,
+                        resize.Columns,
+                        resize.Rows,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    private async Task WaitForClientOperationsAsync()
+    {
+        Task[] operations;
+        lock (_operationLock)
+        {
+            operations = _clientOperations.ToArray();
+        }
+
+        try
+        {
+            await Task.WhenAll(operations).ConfigureAwait(false);
+        }
+        catch
+        {
+        }
     }
 
     private async Task SendAsync(ServerMessage message, CancellationToken cancellationToken)
@@ -429,12 +799,20 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(
             cancellationToken);
         timeoutCts.CancelAfter(SendTimeout);
-        var json = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions);
-        await _webSocket.SendAsync(
-            json,
-            WebSocketMessageType.Text,
-            endOfMessage: true,
-            timeoutCts.Token).ConfigureAwait(false);
+        await _socketGate.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+        try
+        {
+            var json = JsonSerializer.SerializeToUtf8Bytes(message, JsonOptions);
+            await _webSocket.SendAsync(
+                json,
+                WebSocketMessageType.Text,
+                endOfMessage: true,
+                timeoutCts.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            _socketGate.Release();
+        }
     }
 
     private async Task SendDirectAsync(
@@ -457,10 +835,18 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         try
         {
             using var closeCts = new CancellationTokenSource(CloseTimeout);
-            await _webSocket.CloseAsync(
-                status,
-                description,
-                closeCts.Token).ConfigureAwait(false);
+            await _socketGate.WaitAsync(closeCts.Token).ConfigureAwait(false);
+            try
+            {
+                await _webSocket.CloseAsync(
+                    status,
+                    description,
+                    closeCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                _socketGate.Release();
+            }
         }
         catch
         {
@@ -469,6 +855,7 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
     private void CancelBridge()
     {
+        _clientOperationGate.Close();
         try
         {
             _cts.Cancel();
@@ -525,8 +912,23 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
         }
 
         _webSocket.Dispose();
+        _resizeSignal.Dispose();
+        _socketGate.Dispose();
         _cts.Dispose();
     }
+
+    private sealed record RemoteOpenResult(
+        TerminalStateSubscription? Subscription,
+        string FailureReason);
+
+    private sealed record RemoteResize(int Columns, int Rows);
+
+    private sealed record SessionTermination(
+        long FinalSequence,
+        bool Failed,
+        int? ExitCode,
+        bool OutputComplete,
+        string Reason);
 
     private sealed record ServerMessage
     {
@@ -534,11 +936,11 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
 
         public int Version { get; init; } = ProtocolVersion;
 
-        public long? Sequence { get; init; }
+        public string? Sequence { get; init; }
 
-        public long? SnapshotSequence { get; init; }
+        public string? SnapshotSequence { get; init; }
 
-        public long? LatestSequence { get; init; }
+        public string? LatestSequence { get; init; }
 
         public byte[]? Data { get; init; }
 
@@ -566,8 +968,10 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             return new ServerMessage
             {
                 Type = "syncStart",
-                SnapshotSequence = snapshotSequence,
-                LatestSequence = latestSequence,
+                SnapshotSequence = snapshotSequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                LatestSequence = latestSequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
                 Cols = size.Columns,
                 Rows = size.Rows,
                 CanResize = canResize
@@ -579,18 +983,22 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             return new ServerMessage
             {
                 Type = "snapshot",
-                Sequence = sequence,
+                Sequence = sequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
                 Data = data
             };
         }
 
-        public static ServerMessage Output(TerminalOutput output)
+        public static ServerMessage Event(TerminalOutput output)
         {
             return new ServerMessage
             {
-                Type = "output",
-                Sequence = output.Sequence,
-                Data = output.Data
+                Type = output.IsResize ? "resize" : "output",
+                Sequence = output.Sequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                Data = output.IsResize ? null : output.Data,
+                Cols = output.Resize?.Columns,
+                Rows = output.Resize?.Rows
             };
         }
 
@@ -599,7 +1007,8 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             return new ServerMessage
             {
                 Type = "syncComplete",
-                Sequence = sequence
+                Sequence = sequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture)
             };
         }
 
@@ -628,6 +1037,44 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
             };
         }
 
+        public static ServerMessage InterruptAck(long inputId, bool accepted)
+        {
+            return new ServerMessage
+            {
+                Type = "interruptAck",
+                InputId = inputId,
+                Accepted = accepted
+            };
+        }
+
+        public static ServerMessage TerminalEnded(
+            int exitCode,
+            bool outputComplete,
+            long finalSequence)
+        {
+            return new ServerMessage
+            {
+                Type = "terminalEnded",
+                Sequence = finalSequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                ExitCode = exitCode,
+                OutputComplete = outputComplete
+            };
+        }
+
+        public static ServerMessage StateUnavailable(
+            string reason,
+            long finalSequence)
+        {
+            return new ServerMessage
+            {
+                Type = "stateUnavailable",
+                Sequence = finalSequence.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                Reason = reason
+            };
+        }
+
         public static ServerMessage Error(string reason)
         {
             return new ServerMessage
@@ -636,5 +1083,9 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                 Reason = reason
             };
         }
+
+        public int? ExitCode { get; init; }
+
+        public bool? OutputComplete { get; init; }
     }
 }

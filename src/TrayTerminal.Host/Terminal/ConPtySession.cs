@@ -10,7 +10,7 @@ internal sealed class ConPtySession : IDisposable
     private const uint CreateUnicodeEnvironment = 0x00000400;
     private const uint ExtendedStartupInfoPresent = 0x00080000;
 
-    private readonly IntPtr _pseudoConsole;
+    private IntPtr _pseudoConsole;
     private readonly Process _process;
     private readonly SafeFileHandle? _jobHandle;
     private bool _disposed;
@@ -186,6 +186,28 @@ internal sealed class ConPtySession : IDisposable
         return _process.ExitCode;
     }
 
+    public void CompleteProcessExit()
+    {
+        // Closing HPCON after the client exits releases the output writer owned
+        // by ConPTY. The App-facing output pump can then read the final buffered
+        // bytes and observe EOF instead of being canceled at process exit.
+        try
+        {
+            Input.Dispose();
+        }
+        catch
+        {
+        }
+
+        var pseudoConsole = Interlocked.Exchange(
+            ref _pseudoConsole,
+            IntPtr.Zero);
+        if (pseudoConsole != IntPtr.Zero)
+        {
+            NativeMethods.ClosePseudoConsole(pseudoConsole);
+        }
+    }
+
     public void KillProcessTree()
     {
         try
@@ -215,7 +237,13 @@ internal sealed class ConPtySession : IDisposable
         Input.Dispose();
         _process.Dispose();
         _jobHandle?.Dispose();
-        NativeMethods.ClosePseudoConsole(_pseudoConsole);
+        var pseudoConsole = Interlocked.Exchange(
+            ref _pseudoConsole,
+            IntPtr.Zero);
+        if (pseudoConsole != IntPtr.Zero)
+        {
+            NativeMethods.ClosePseudoConsole(pseudoConsole);
+        }
     }
 
     private static void ThrowIfFalse(bool result, string operation)

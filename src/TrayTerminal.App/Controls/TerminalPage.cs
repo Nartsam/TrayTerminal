@@ -11,9 +11,11 @@ namespace TrayTerminal.App.Controls;
 
 public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDisposable
 {
+    private NewTerminalRequest _request;
     private readonly TerminalSession _session;
     private readonly TerminalView _terminalView;
     private readonly TextBlock _status;
+    private readonly System.Windows.Controls.Button _recreateButton;
     private bool _disposed;
 
     public TerminalPage(
@@ -21,11 +23,17 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         PortablePaths paths,
         FileLogger logger,
         WebView2EnvironmentManager webView2EnvironmentManager,
+        TerminalAuthorityHost terminalAuthorityHost,
         int fontSize)
     {
+        _request = request;
         Title = request.Title;
         TerminalFontSize = fontSize;
-        _session = new TerminalSession(request, paths, logger);
+        _session = new TerminalSession(
+            request,
+            paths,
+            logger,
+            terminalAuthorityHost);
         _terminalView = new TerminalView(
             paths,
             _session,
@@ -39,6 +47,14 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             FontSize = 12,
             Padding = new Thickness(10, 4, 10, 4)
         };
+        _recreateButton = new System.Windows.Controls.Button
+        {
+            Content = "重建终端",
+            Margin = new Thickness(8, 2, 8, 2),
+            Padding = new Thickness(10, 2, 10, 2),
+            Visibility = Visibility.Collapsed
+        };
+        _recreateButton.Click += (_, _) => RecreateRequested?.Invoke(this, EventArgs.Empty);
 
         var border = new Border
         {
@@ -48,9 +64,14 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             Child = _terminalView
         };
 
+        var statusBar = new DockPanel();
+        DockPanel.SetDock(_recreateButton, Dock.Right);
+        statusBar.Children.Add(_recreateButton);
+        statusBar.Children.Add(_status);
+
         var root = new DockPanel();
-        DockPanel.SetDock(_status, Dock.Bottom);
-        root.Children.Add(_status);
+        DockPanel.SetDock(statusBar, Dock.Bottom);
+        root.Children.Add(statusBar);
         root.Children.Add(border);
         Content = root;
 
@@ -62,11 +83,20 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             Dispatcher.BeginInvoke(() => _status.Text = $"进程已退出，代码 {exitCode}");
             Exited?.Invoke(this, exitCode);
         };
-        _session.Failed += (_, message) => Dispatcher.BeginInvoke(() => _status.Text = message);
-        _terminalView.OutputPumpStopped += () => Dispatcher.BeginInvoke(() => _status.Text = "终端输出已中断，建议重建标签页");
+        _session.Failed += (_, message) => Dispatcher.BeginInvoke(() =>
+        {
+            _status.Text = message;
+            _recreateButton.Visibility = Visibility.Visible;
+        });
+        _terminalView.OutputPumpStopped += () => Dispatcher.BeginInvoke(() =>
+        {
+            _status.Text = "终端输出已中断，建议重建标签页";
+        });
     }
 
     public event EventHandler<int>? Exited;
+
+    public event EventHandler? RecreateRequested;
 
     public string Title { get; private set; }
 
@@ -79,6 +109,8 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     public bool IsRunning => _session.IsRunning;
 
     public TerminalSession Session => _session;
+
+    public NewTerminalRequest Request => _request;
 
     public async Task StartAsync()
     {
@@ -100,6 +132,7 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     public void SetTitle(string title)
     {
         Title = title;
+        _request = _request with { Title = title };
     }
 
     public async Task<BackgroundImageUpdateResult> SetBackgroundImageAsync(

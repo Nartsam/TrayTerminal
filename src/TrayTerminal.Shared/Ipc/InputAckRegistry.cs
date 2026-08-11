@@ -38,7 +38,7 @@ public sealed class InputAckRegistry
         return false;
     }
 
-    public bool TryAcknowledge(long requestId)
+    public bool TryComplete(long requestId, bool accepted)
     {
         TaskCompletionSource<bool>? source;
         lock (_lock)
@@ -46,7 +46,7 @@ public sealed class InputAckRegistry
             _pending.TryGetValue(requestId, out source);
         }
 
-        return source is not null && source.TrySetResult(true);
+        return source is not null && source.TrySetResult(accepted);
     }
 
     public void Remove(long requestId)

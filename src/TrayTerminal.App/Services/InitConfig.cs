@@ -44,7 +44,9 @@ public static class InitConfig
             var profileType = parts[1].Trim();
             var title = parts[2].Trim();
 
-            if (string.IsNullOrEmpty(profileType) || string.IsNullOrEmpty(title))
+            if (string.IsNullOrEmpty(profileType)
+                || string.IsNullOrEmpty(title)
+                || title.Any(char.IsControl))
             {
                 continue;
             }

@@ -20,21 +20,42 @@ internal static class Program
         {
             var options = HostOptions.Parse(args);
             using var cts = new CancellationTokenSource();
-            using var pipe = new NamedPipeClientStream(".", options.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            using var outputPipe = new NamedPipeClientStream(
+                ".",
+                options.OutputPipeName,
+                PipeDirection.Out,
+                PipeOptions.Asynchronous);
+            using var controlPipe = new NamedPipeClientStream(
+                ".",
+                options.ControlPipeName,
+                PipeDirection.InOut,
+                PipeOptions.Asynchronous);
 
-            await pipe.ConnectAsync(15_000, cts.Token).ConfigureAwait(false);
-            await IpcProtocol.WriteAsync(pipe, new IpcMessage(IpcMessageType.Hello, IpcProtocol.EncodeText(options.Nonce)), cts.Token).ConfigureAwait(false);
+            await Task.WhenAll(
+                outputPipe.ConnectAsync(15_000, cts.Token),
+                controlPipe.ConnectAsync(15_000, cts.Token)).ConfigureAwait(false);
+            await IpcProtocol.WriteAsync(
+                outputPipe,
+                new IpcMessage(IpcMessageType.Hello, IpcProtocol.EncodeText(options.Nonce)),
+                cts.Token).ConfigureAwait(false);
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                new IpcMessage(IpcMessageType.Hello, IpcProtocol.EncodeText(options.Nonce)),
+                cts.Token).ConfigureAwait(false);
 
             try
             {
                 using var session = TerminalHostSession.Start(options, logger);
-                return await session.RunAsync(pipe, cts.Token).ConfigureAwait(false);
+                return await session.RunAsync(
+                    outputPipe,
+                    controlPipe,
+                    cts.Token).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
                 logger.Error(exception, "Terminal session failed after IPC handshake.");
                 await IpcProtocol.WriteAsync(
-                    pipe,
+                    controlPipe,
                     new IpcMessage(IpcMessageType.Error, IpcProtocol.EncodeText(exception.Message)),
                     CancellationToken.None).ConfigureAwait(false);
                 return 1;
