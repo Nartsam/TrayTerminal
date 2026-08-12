@@ -16,6 +16,8 @@ internal sealed class HostOptions
 
     public required string WorkingDirectory { get; init; }
 
+    public required string ProfileId { get; init; }
+
     public int Columns { get; init; } = 120;
 
     public int Rows { get; init; } = 30;
@@ -49,6 +51,9 @@ internal sealed class HostOptions
             ExecutablePath = DecodeRequired(values, "exe"),
             Arguments = DecodeRequired(values, "args"),
             WorkingDirectory = DecodeRequired(values, "cwd"),
+            ProfileId = values.TryGetValue("profile-id", out var profileId)
+                ? Decode(profileId)
+                : string.Empty,
             Columns = int.TryParse(values.GetValueOrDefault("cols"), out var columns) ? Math.Clamp(columns, 20, 500) : 120,
             Rows = int.TryParse(values.GetValueOrDefault("rows"), out var rows) ? Math.Clamp(rows, 5, 200) : 30
         };
@@ -68,7 +73,11 @@ internal sealed class HostOptions
 
     private static string DecodeRequired(Dictionary<string, string> values, string key)
     {
-        var value = Required(values, key);
+        return Decode(Required(values, key));
+    }
+
+    private static string Decode(string value)
+    {
         if (value == ".")
         {
             return string.Empty;

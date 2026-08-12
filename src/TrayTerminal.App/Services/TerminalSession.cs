@@ -23,6 +23,7 @@ public sealed class TerminalSession : IAsyncDisposable
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan OperationAckTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CloseCheckTimeout = TimeSpan.FromSeconds(1);
     private const int MaxMissedHeartbeats = 3;
 
     private readonly NewTerminalRequest _request;
@@ -33,12 +34,14 @@ public sealed class TerminalSession : IAsyncDisposable
     private readonly SemaphoreSlim _controlSendGate = new(1, 1);
     private readonly SemaphoreSlim _inputGate = new(1, 1);
     private readonly SemaphoreSlim _resizeGate = new(1, 1);
+    private readonly SemaphoreSlim _closeCheckGate = new(1, 1);
     private readonly object _subscribeLock = new();
     private readonly object _sizeLock = new();
     private readonly object _inputQueueLock = new();
     private readonly object _resizeRequestLock = new();
     private readonly object _sizeApplyLock = new();
     private readonly object _authorityRemovalLock = new();
+    private readonly object _closeCheckLock = new();
     private readonly TaskCompletionSource _completion = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _outputCompleted = new(
@@ -69,6 +72,10 @@ public sealed class TerminalSession : IAsyncDisposable
     private TerminalSizeUpdate? _pendingSizeUpdate;
     private Task? _sizeApplyTask;
     private Task _authorityRemovalTask = Task.CompletedTask;
+    private TaskCompletionSource<TerminalCloseAssessment>? _pendingCloseCheck;
+    private TaskCompletionSource? _interruptDrainCompletion;
+    private long _pendingCloseCheckRequestId;
+    private int _inputFrozen;
 
     public TerminalSession(
         NewTerminalRequest request,
@@ -244,6 +251,12 @@ public sealed class TerminalSession : IAsyncDisposable
             return true;
         }
 
+        var generation = Volatile.Read(ref _inputGeneration);
+        if (Volatile.Read(ref _inputFrozen) != 0)
+        {
+            return false;
+        }
+
         var inputByteCount = Encoding.UTF8.GetByteCount(text);
         if (inputByteCount > MaxInputOperationBytes)
         {
@@ -266,7 +279,6 @@ public sealed class TerminalSession : IAsyncDisposable
             _queuedInputBytes += inputByteCount;
         }
 
-        var generation = Volatile.Read(ref _inputGeneration);
         var gateEntered = false;
         using var operationCts = CancellationTokenSource.CreateLinkedTokenSource(
             GetSessionToken(),
@@ -276,7 +288,8 @@ public sealed class TerminalSession : IAsyncDisposable
         {
             await _inputGate.WaitAsync(operationToken);
             gateEntered = true;
-            if (generation != Volatile.Read(ref _inputGeneration))
+            if (Volatile.Read(ref _inputFrozen) != 0
+                || generation != Volatile.Read(ref _inputGeneration))
             {
                 return false;
             }
@@ -284,7 +297,8 @@ public sealed class TerminalSession : IAsyncDisposable
             var bytes = Encoding.UTF8.GetBytes(text);
             for (var offset = 0; offset < bytes.Length; offset += InputChunkSize)
             {
-                if (generation != Volatile.Read(ref _inputGeneration))
+                if (Volatile.Read(ref _inputFrozen) != 0
+                    || generation != Volatile.Read(ref _inputGeneration))
                 {
                     return false;
                 }
@@ -356,6 +370,11 @@ public sealed class TerminalSession : IAsyncDisposable
     public async Task<bool> TryInterruptAsync(
         CancellationToken cancellationToken = default)
     {
+        if (Volatile.Read(ref _inputFrozen) != 0)
+        {
+            return false;
+        }
+
         lock (_inputQueueLock)
         {
             if (_queuedInputOperations + _queuedInterrupts
@@ -381,6 +400,10 @@ public sealed class TerminalSession : IAsyncDisposable
                 GetSessionToken(),
                 cancellationToken);
             var operationToken = operationCts.Token;
+            if (Volatile.Read(ref _inputFrozen) != 0)
+            {
+                return false;
+            }
             if (!await SendControlAsync(
                     new IpcMessage(
                         IpcMessageType.Interrupt,
@@ -411,6 +434,264 @@ public sealed class TerminalSession : IAsyncDisposable
         lock (_inputQueueLock)
         {
             _queuedInterrupts--;
+            if (_queuedInterrupts == 0)
+            {
+                _interruptDrainCompletion?.TrySetResult();
+                _interruptDrainCompletion = null;
+            }
+        }
+    }
+
+    public async Task<TerminalCloseCheckLease> BeginCloseCheckAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var stage = "not-started";
+        if (_disposed)
+        {
+            var disposedAssessment = new TerminalCloseAssessment(
+                TerminalCloseStatus.Idle);
+            LogCloseCheck(disposedAssessment, stopwatch, "already-disposed", 0);
+            return new TerminalCloseCheckLease(disposedAssessment);
+        }
+
+        var closeGateEntered = false;
+        var inputGateEntered = false;
+        long requestId = 0;
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                GetSessionToken());
+            timeoutCts.CancelAfter(CloseCheckTimeout);
+            var closeCheckToken = timeoutCts.Token;
+
+            stage = "waiting-close-gate";
+            await _closeCheckGate.WaitAsync(closeCheckToken);
+            closeGateEntered = true;
+            // Invalidate operations that reserved capacity but have not entered
+            // the input gate. Only writes already acknowledged by Host may
+            // precede the close-check frame on the ordered control pipe.
+            Interlocked.Exchange(ref _inputFrozen, 1);
+            Interlocked.Increment(ref _inputGeneration);
+            stage = "draining-ordinary-input";
+            await _inputGate.WaitAsync(closeCheckToken);
+            inputGateEntered = true;
+            stage = "draining-interrupt-input";
+            await GetInterruptDrainTask().WaitAsync(closeCheckToken);
+
+            TerminalCloseAssessment assessment;
+            if (!IsRunning)
+            {
+                stage = "session-stopped";
+                assessment = new TerminalCloseAssessment(
+                    IsFailed
+                        ? TerminalCloseStatus.SessionUnavailable
+                        : TerminalCloseStatus.Idle);
+            }
+            else
+            {
+                stage = "registering-request";
+                requestId = NextRequestId();
+                var source = new TaskCompletionSource<TerminalCloseAssessment>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+                lock (_closeCheckLock)
+                {
+                    _pendingCloseCheckRequestId = requestId;
+                    _pendingCloseCheck = source;
+                }
+
+                try
+                {
+                    stage = "sending-request";
+                    if (!await SendControlAsync(
+                            new IpcMessage(
+                                IpcMessageType.CloseCheck,
+                                IpcProtocol.EncodeRequestId(requestId)),
+                            closeCheckToken))
+                    {
+                        stage = "request-send-failed";
+                        assessment = new TerminalCloseAssessment(
+                            TerminalCloseStatus.SessionUnavailable);
+                    }
+                    else
+                    {
+                        stage = "waiting-host-result";
+                        assessment = await source.Task.WaitAsync(closeCheckToken);
+                        stage = "host-result-received";
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    if (!IsRunning && !IsFailed)
+                    {
+                        stage = "session-exited-during-check";
+                        assessment = new TerminalCloseAssessment(
+                            TerminalCloseStatus.Idle);
+                    }
+                    else if (!cancellationToken.IsCancellationRequested)
+                    {
+                        stage += "-timed-out";
+                        assessment = new TerminalCloseAssessment(
+                            TerminalCloseStatus.CloseCheckTimedOut);
+                    }
+                    else
+                    {
+                        stage += "-canceled";
+                        assessment = new TerminalCloseAssessment(
+                            TerminalCloseStatus.SessionUnavailable);
+                    }
+                }
+                finally
+                {
+                    lock (_closeCheckLock)
+                    {
+                        if (_pendingCloseCheckRequestId == requestId)
+                        {
+                            _pendingCloseCheckRequestId = 0;
+                            _pendingCloseCheck = null;
+                        }
+                    }
+                }
+            }
+
+            LogCloseCheck(assessment, stopwatch, stage, requestId);
+            return new TerminalCloseCheckLease(
+                assessment,
+                resume => EndCloseCheckAsync(
+                    requestId,
+                    resume,
+                    inputGateEntered,
+                    closeGateEntered));
+        }
+        catch (Exception exception)
+        {
+            if (closeGateEntered)
+            {
+                Interlocked.Exchange(ref _inputFrozen, 0);
+            }
+            if (inputGateEntered)
+            {
+                ReleaseGate(_inputGate);
+            }
+            if (closeGateEntered)
+            {
+                ReleaseGate(_closeCheckGate);
+            }
+            TerminalCloseAssessment assessment;
+            if (exception is OperationCanceledException
+                && !cancellationToken.IsCancellationRequested
+                && IsRunning)
+            {
+                stage += "-timed-out";
+                assessment = new TerminalCloseAssessment(
+                    TerminalCloseStatus.CloseCheckTimedOut);
+            }
+            else
+            {
+                stage += "-failed";
+                assessment = new TerminalCloseAssessment(
+                    TerminalCloseStatus.SessionUnavailable);
+            }
+            if (exception is not OperationCanceledException
+                and not ObjectDisposedException)
+            {
+                _logger.Error(exception, "Terminal close check failed.");
+            }
+            LogCloseCheck(assessment, stopwatch, stage, requestId);
+            return new TerminalCloseCheckLease(assessment);
+        }
+    }
+
+    private void LogCloseCheck(
+        TerminalCloseAssessment assessment,
+        Stopwatch stopwatch,
+        string stage,
+        long requestId)
+    {
+        var title = _request.Title
+            .Replace('\r', ' ')
+            .Replace('\n', ' ');
+        if (title.Length > 128)
+        {
+            title = title[..128];
+        }
+        _logger.Info(
+            $"Close check for '{title}' ({_request.Profile.Id}): "
+            + $"status={assessment.Status}, detail={assessment.Detail}, "
+            + $"elapsedMs={stopwatch.ElapsedMilliseconds}, stage={stage}, "
+            + $"requestId={requestId}, running={IsRunning}, failed={IsFailed}.");
+    }
+
+    private async ValueTask EndCloseCheckAsync(
+        long requestId,
+        bool resume,
+        bool inputGateEntered,
+        bool closeGateEntered)
+    {
+        var resumeDelivered = requestId == 0 || !IsRunning;
+        try
+        {
+            if (resume && requestId != 0 && IsRunning)
+            {
+                using var timeoutCts = new CancellationTokenSource(
+                    CloseCheckTimeout);
+                resumeDelivered = await SendControlAsync(
+                    new IpcMessage(
+                        IpcMessageType.CloseCheckEnd,
+                        IpcProtocol.EncodeRequestId(requestId)),
+                    timeoutCts.Token);
+            }
+        }
+        finally
+        {
+            if (resume && resumeDelivered)
+            {
+                Interlocked.Exchange(ref _inputFrozen, 0);
+            }
+            else if (resume && IsRunning)
+            {
+                // Do not let App accept input that Host may still reject as part
+                // of the close transaction. A broken control pipe will fail the
+                // session independently; until then, staying frozen is safer.
+                _logger.Error(
+                    new IOException("Close-check resume was not delivered."),
+                    "Terminal input remains frozen after a close-check failure.");
+            }
+            if (inputGateEntered)
+            {
+                ReleaseGate(_inputGate);
+            }
+            if (closeGateEntered)
+            {
+                ReleaseGate(_closeCheckGate);
+            }
+        }
+    }
+
+    private static void ReleaseGate(SemaphoreSlim gate)
+    {
+        try
+        {
+            gate.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private Task GetInterruptDrainTask()
+    {
+        lock (_inputQueueLock)
+        {
+            if (_queuedInterrupts == 0)
+            {
+                return Task.CompletedTask;
+            }
+
+            _interruptDrainCompletion ??= new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            return _interruptDrainCompletion.Task;
         }
     }
 
@@ -734,6 +1015,7 @@ public sealed class TerminalSession : IAsyncDisposable
         _controlSendGate.Dispose();
         _inputGate.Dispose();
         _resizeGate.Dispose();
+        _closeCheckGate.Dispose();
         CompleteTermination();
     }
 
@@ -816,6 +1098,8 @@ public sealed class TerminalSession : IAsyncDisposable
             Encode(_request.Profile.Arguments),
             "--cwd",
             Encode(_request.Profile.WorkingDirectory),
+            "--profile-id",
+            Encode(_request.Profile.Id),
             "--cols",
             columns.ToString(),
             "--rows",
@@ -1081,6 +1365,21 @@ public sealed class TerminalSession : IAsyncDisposable
                                     out var source))
                             {
                                 source.TrySetResult(result.Accepted);
+                            }
+                        }
+                        break;
+                    }
+
+                    case IpcMessageType.CloseCheckResult:
+                    {
+                        var result = IpcProtocol.DecodeCloseCheckResult(
+                            message.Value.Payload);
+                        lock (_closeCheckLock)
+                        {
+                            if (_pendingCloseCheckRequestId == result.RequestId)
+                            {
+                                _pendingCloseCheck?.TrySetResult(
+                                    result.Assessment);
                             }
                         }
                         break;
@@ -1367,6 +1666,17 @@ public sealed class TerminalSession : IAsyncDisposable
                 source.TrySetResult(false);
             }
             _pendingResizes.Clear();
+        }
+
+        lock (_closeCheckLock)
+        {
+            _pendingCloseCheck?.TrySetResult(
+                new TerminalCloseAssessment(
+                    IsFailed
+                        ? TerminalCloseStatus.SessionUnavailable
+                        : TerminalCloseStatus.Idle));
+            _pendingCloseCheck = null;
+            _pendingCloseCheckRequestId = 0;
         }
 
         _completion.TrySetResult();

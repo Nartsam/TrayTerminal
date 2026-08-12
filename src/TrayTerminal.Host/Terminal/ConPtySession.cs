@@ -8,11 +8,13 @@ namespace TrayTerminal.Host.Terminal;
 internal sealed class ConPtySession : IDisposable
 {
     private const uint CreateUnicodeEnvironment = 0x00000400;
+    private const uint CreateSuspended = 0x00000004;
     private const uint ExtendedStartupInfoPresent = 0x00080000;
 
     private IntPtr _pseudoConsole;
     private readonly Process _process;
     private readonly SafeFileHandle? _jobHandle;
+    private readonly bool _promptTrackingEnabled;
     private bool _disposed;
 
     private ConPtySession(
@@ -20,13 +22,15 @@ internal sealed class ConPtySession : IDisposable
         Stream input,
         Stream output,
         Process process,
-        SafeFileHandle? jobHandle)
+        SafeFileHandle? jobHandle,
+        bool promptTrackingEnabled)
     {
         _pseudoConsole = pseudoConsole;
         Input = input;
         Output = output;
         _process = process;
         _jobHandle = jobHandle;
+        _promptTrackingEnabled = promptTrackingEnabled;
     }
 
     public int ProcessId => _process.Id;
@@ -35,7 +39,16 @@ internal sealed class ConPtySession : IDisposable
 
     public Stream Output { get; }
 
-    public static ConPtySession Start(string executablePath, string arguments, string workingDirectory, int columns, int rows)
+    public bool PromptTrackingEnabled => _promptTrackingEnabled;
+
+    public static ConPtySession Start(
+        string executablePath,
+        string arguments,
+        string workingDirectory,
+        string profileId,
+        string markerToken,
+        int columns,
+        int rows)
     {
         if (!File.Exists(executablePath))
         {
@@ -51,12 +64,24 @@ internal sealed class ConPtySession : IDisposable
         SafeFileHandle? jobHandle = null;
         Stream? inputStream = null;
         Stream? outputStream = null;
+        Process? process = null;
         var pseudoConsole = IntPtr.Zero;
         var attributeList = IntPtr.Zero;
+        var environmentBlock = IntPtr.Zero;
         var processInfo = default(NativeMethods.PROCESS_INFORMATION);
         var success = false;
         try
         {
+            var launch = ShellIntegration.Prepare(
+                profileId,
+                arguments,
+                markerToken);
+            if (launch.CommandPrompt is not null)
+            {
+                environmentBlock = NativeMethods.CreateEnvironmentBlock(
+                    launch.CommandPrompt);
+            }
+
             ThrowIfFalse(NativeMethods.CreatePipe(out inputRead, out inputWrite, IntPtr.Zero, 0), "Create input pipe");
             ThrowIfFalse(NativeMethods.CreatePipe(out outputRead, out outputWrite, IntPtr.Zero, 0), "Create output pipe");
 
@@ -91,7 +116,9 @@ internal sealed class ConPtySession : IDisposable
 
             startupInfo.lpAttributeList = attributeList;
 
-            var commandLine = NativeMethods.BuildCommandLine(executablePath, arguments);
+            var commandLine = NativeMethods.BuildCommandLine(
+                executablePath,
+                launch.Arguments);
             ThrowIfFalse(
                 NativeMethods.CreateProcess(
                     null,
@@ -99,8 +126,12 @@ internal sealed class ConPtySession : IDisposable
                     IntPtr.Zero,
                     IntPtr.Zero,
                     false,
-                    ExtendedStartupInfoPresent | CreateUnicodeEnvironment,
-                    IntPtr.Zero,
+                    // The root process cannot create an untracked child between
+                    // CreateProcess and its Job Object assignment.
+                    ExtendedStartupInfoPresent
+                        | CreateUnicodeEnvironment
+                        | CreateSuspended,
+                    environmentBlock,
                     workingDirectory,
                     ref startupInfo,
                     out processInfo),
@@ -109,7 +140,13 @@ internal sealed class ConPtySession : IDisposable
             jobHandle = NativeMethods.TryCreateKillOnCloseJob();
             if (jobHandle is not null)
             {
-                NativeMethods.AssignProcessToJobObject(jobHandle, processInfo.hProcess);
+                if (!NativeMethods.AssignProcessToJobObject(
+                        jobHandle,
+                        processInfo.hProcess))
+                {
+                    jobHandle.Dispose();
+                    jobHandle = null;
+                }
             }
 
             // CreatePipe returns synchronous handles. Passing isAsync:false avoids
@@ -119,24 +156,34 @@ internal sealed class ConPtySession : IDisposable
             outputStream = new FileStream(outputRead, FileAccess.Read, 4096, false);
             outputRead = null;
 
-            var process = Process.GetProcessById((int)processInfo.dwProcessId);
+            process = Process.GetProcessById((int)processInfo.dwProcessId);
+            ThrowIfFalse(
+                NativeMethods.ResumeThread(processInfo.hThread) != uint.MaxValue,
+                "ResumeThread");
             var session = new ConPtySession(
                 pseudoConsole,
                 inputStream,
                 outputStream,
                 process,
-                jobHandle);
+                jobHandle,
+                launch.PromptTrackingEnabled);
             pseudoConsole = IntPtr.Zero;
             inputStream = null;
             outputStream = null;
+            process = null;
             jobHandle = null;
             success = true;
             return session;
         }
         catch
         {
+            if (processInfo.hProcess != IntPtr.Zero)
+            {
+                NativeMethods.TerminateProcess(processInfo.hProcess, 1);
+            }
             inputStream?.Dispose();
             outputStream?.Dispose();
+            process?.Dispose();
             jobHandle?.Dispose();
             if (pseudoConsole != IntPtr.Zero)
             {
@@ -159,6 +206,11 @@ internal sealed class ConPtySession : IDisposable
             {
                 NativeMethods.DeleteProcThreadAttributeList(attributeList);
                 Marshal.FreeHGlobal(attributeList);
+            }
+
+            if (environmentBlock != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(environmentBlock);
             }
 
             if (processInfo.hThread != IntPtr.Zero)
@@ -184,6 +236,19 @@ internal sealed class ConPtySession : IDisposable
     {
         await _process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
         return _process.ExitCode;
+    }
+
+    public bool TryGetActiveProcessCount(out uint activeProcesses)
+    {
+        if (_disposed || _jobHandle is null || _jobHandle.IsInvalid)
+        {
+            activeProcesses = 0;
+            return false;
+        }
+
+        return NativeMethods.TryGetActiveProcessCount(
+            _jobHandle,
+            out activeProcesses);
     }
 
     public void CompleteProcessExit()

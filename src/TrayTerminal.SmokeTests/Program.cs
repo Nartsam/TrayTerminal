@@ -39,6 +39,7 @@ internal static class Program
             ("Portable paths stay under base directory", TestPortablePaths),
             ("IPC resize and exit payloads round-trip", TestPayloadRoundTrip),
             ("IPC stream frames round-trip", TestStreamRoundTrip),
+            ("Prompt markers and input ledger prove only conservative idle", TestPromptActivityTracking),
             ("Terminal snapshot boundary has no gaps or duplicates", TestTerminalSnapshotBoundary),
             ("Terminal state overflow invalidates and recovers", TestTerminalStateOverflowRecovery),
             ("Resize invalidates snapshots until matching checkpoint", TestResizeSnapshotRace),
@@ -51,7 +52,9 @@ internal static class Program
             ("Authority response null fields are parsed without timeout", TestAuthorityResponseParsing),
             ("Remote operations wait for sync and reserve interrupt capacity", TestRemoteOperationGate),
             ("Terminal end follows its final continuous event", TestTerminalDeliveryBoundary),
-            ("Host interrupt reaches ConPTY before complete exit", TestHostInterruptIntegration)
+            ("Host interrupt reaches ConPTY before complete exit", TestHostInterruptIntegration),
+            ("Host proves idle only after the CMD root prompt", TestHostCloseAssessmentIntegration),
+            ("Host tracks in-process PowerShell commands", TestPowerShellCloseAssessmentIntegration)
         };
 
         foreach (var test in tests)
@@ -129,6 +132,30 @@ internal static class Program
         Assert(
             exitStatus == (123, true),
             "Exit completion payload mismatch.");
+        var closeCheck = IpcProtocol.DecodeCloseCheckResult(
+            IpcProtocol.EncodeCloseCheckResult(
+                9,
+                new TerminalCloseAssessment(
+                    TerminalCloseStatus.ActiveProcesses,
+                    2)));
+        Assert(
+            closeCheck == (
+                9,
+                new TerminalCloseAssessment(
+                    TerminalCloseStatus.ActiveProcesses,
+                    2)),
+            "Close-check result payload mismatch.");
+        var closeCheckTimeout = IpcProtocol.DecodeCloseCheckResult(
+            IpcProtocol.EncodeCloseCheckResult(
+                10,
+                new TerminalCloseAssessment(
+                    TerminalCloseStatus.CloseCheckTimedOut)));
+        Assert(
+            closeCheckTimeout == (
+                10,
+                new TerminalCloseAssessment(
+                    TerminalCloseStatus.CloseCheckTimedOut)),
+            "Close-check timeout payload mismatch.");
 
         var text = "hello 你好";
         Assert(IpcProtocol.DecodeText(IpcProtocol.EncodeText(text)) == text, "Text payload mismatch.");
@@ -142,6 +169,98 @@ internal static class Program
         Assert(
             IpcProtocol.DecodeRequestId(IpcProtocol.EncodeRequestId(42)) == 42,
             "Input acknowledgement request ID mismatch.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestPromptActivityTracking()
+    {
+        const string token = "0123456789ABCDEF";
+        var tracker = new TerminalActivityTracker();
+        var filter = new TerminalPromptFilter(token, tracker.RecordPrompt);
+        var marker = Encoding.ASCII.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0));
+        var prefix = Encoding.UTF8.GetBytes("before");
+        var suffix = Encoding.UTF8.GetBytes("after");
+        var first = prefix.Concat(marker[..7]).ToArray();
+        var second = marker[7..].Concat(suffix).ToArray();
+        var filtered = filter.Process(first)
+            .Concat(filter.Process(second))
+            .Concat(filter.Flush())
+            .ToArray();
+        Assert(
+            Encoding.UTF8.GetString(filtered) == "beforeafter",
+            "Prompt marker was not removed across output chunks.");
+
+        var initial = tracker.GetSnapshot();
+        Assert(
+            initial.PromptObserved
+                && initial.PendingSubmissions == 0
+                && !initial.HasUnresolvedInput,
+            "Initial prompt did not establish a clean baseline.");
+
+        tracker.RecordInput("\u001b[O"u8);
+        tracker.RecordInput("\u001b[I"u8);
+        var afterFocusReports = tracker.GetSnapshot();
+        Assert(
+            !afterFocusReports.HasUnresolvedInput
+                && afterFocusReports.IgnoredFocusReports == 2,
+            "xterm focus reports were incorrectly treated as user input.");
+
+        tracker.RecordInput("\u001b[A"u8);
+        Assert(
+            tracker.GetSnapshot().HasUnresolvedInput,
+            "A non-focus escape sequence was incorrectly ignored.");
+        tracker.RecordPrompt(activeShellJobs: 0);
+        Assert(
+            tracker.GetSnapshot().HasUnresolvedInput,
+            "A prompt incorrectly cleared unmatched escape input.");
+
+        var mixedInput = new TerminalActivityTracker();
+        mixedInput.RecordPrompt(activeShellJobs: 0);
+        mixedInput.RecordInput("\u001b[Ox"u8);
+        Assert(
+            mixedInput.GetSnapshot().HasUnresolvedInput,
+            "Input containing a focus report and user text was incorrectly ignored.");
+
+        tracker.RecordInput("first\rsecond\r"u8);
+        tracker.RecordPrompt(activeShellJobs: 0);
+        var onePending = tracker.GetSnapshot();
+        Assert(
+            onePending.PendingSubmissions == 1,
+            "One prompt incorrectly completed multiple queued commands.");
+        tracker.RecordPrompt(activeShellJobs: 0);
+        var idle = tracker.GetSnapshot();
+        Assert(
+            idle.PendingSubmissions == 0
+                && !idle.HasUnresolvedInput
+                && idle.ActiveShellJobs == 0,
+            "Matched prompts did not restore the idle candidate.");
+
+        tracker.RecordInput("partial"u8);
+        tracker.RecordPrompt(activeShellJobs: 0);
+        Assert(
+            tracker.GetSnapshot().HasUnresolvedInput,
+            "A prompt incorrectly cleared unmatched input.");
+
+        var startupRace = new TerminalActivityTracker();
+        startupRace.RecordInput("queued\r"u8);
+        startupRace.RecordPrompt(activeShellJobs: 0);
+        Assert(
+            startupRace.GetSnapshot().PendingSubmissions == 1,
+            "The delayed startup prompt incorrectly completed queued input.");
+
+        var jobTracker = new TerminalActivityTracker();
+        var jobFilter = new TerminalPromptFilter(token, jobTracker.RecordPrompt);
+        jobFilter.Process(Encoding.ASCII.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0)));
+        jobTracker.RecordInput("Start-Job { work }\r"u8);
+        jobFilter.Process(Encoding.ASCII.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 2)));
+        var activeJobs = jobTracker.GetSnapshot();
+        Assert(
+            activeJobs.PendingSubmissions == 0
+                && activeJobs.ActiveShellJobs == 2,
+            "PowerShell prompt marker did not retain active Job evidence.");
         return Task.CompletedTask;
     }
 
@@ -625,12 +744,17 @@ internal static class Program
                 TaskCreationOptions.RunContinuationsAsynchronously);
             var interruptAcked = new TaskCompletionSource<bool>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
+            var closeCheckReceived = new TaskCompletionSource<TerminalCloseAssessment>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            var frozenInputRejected = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             var outputTask = Task.Run(async () =>
             {
                 using var captured = new MemoryStream();
                 var eventOrder = new List<(string Type, long RequestId)>();
                 bool? complete = null;
                 var paused = false;
+                var keyRecorded = false;
                 while (complete is null)
                 {
                     var message = await IpcProtocol.ReadAsync(outputPipe, timeout.Token)
@@ -638,12 +762,15 @@ internal static class Program
                     if (message.Type == IpcMessageType.Output)
                     {
                         captured.Write(message.Payload);
-                        eventOrder.Add((
-                            Encoding.UTF8.GetString(message.Payload)
-                                .Contains("KEY:03", StringComparison.Ordinal)
-                                    ? "key"
-                                    : "output",
-                            0));
+                        var eventType = "output";
+                        if (!keyRecorded
+                            && ContainsProbeKeyOutput(
+                                Encoding.UTF8.GetString(captured.ToArray())))
+                        {
+                            keyRecorded = true;
+                            eventType = "key";
+                        }
+                        eventOrder.Add((eventType, 0));
                         if (Encoding.UTF8.GetString(captured.ToArray())
                             .Contains("READY", StringComparison.Ordinal))
                         {
@@ -689,6 +816,23 @@ internal static class Program
                             interruptAcked.TrySetResult(result.Accepted);
                         }
                     }
+                    else if (message.Type == IpcMessageType.InputAck)
+                    {
+                        var result = IpcProtocol.DecodeInputResult(message.Payload);
+                        if (result.RequestId == 78)
+                        {
+                            frozenInputRejected.TrySetResult(!result.Accepted);
+                        }
+                    }
+                    else if (message.Type == IpcMessageType.CloseCheckResult)
+                    {
+                        var result = IpcProtocol.DecodeCloseCheckResult(
+                            message.Payload);
+                        if (result.RequestId == 70)
+                        {
+                            closeCheckReceived.TrySetResult(result.Assessment);
+                        }
+                    }
                     else if (message.Type == IpcMessageType.ResizeAck)
                     {
                         var result = IpcProtocol.DecodeInputResult(message.Payload);
@@ -711,6 +855,35 @@ internal static class Program
             // reader is intentionally paused. Resize coalescing and interrupt ACK
             // must remain independent from that blocked data path.
             await Task.Delay(500, timeout.Token);
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                new IpcMessage(
+                    IpcMessageType.CloseCheck,
+                    IpcProtocol.EncodeRequestId(70)),
+                timeout.Token);
+            var closeAssessment = await closeCheckReceived.Task.WaitAsync(
+                TimeSpan.FromSeconds(3),
+                timeout.Token);
+            Assert(
+                closeAssessment.Status == TerminalCloseStatus.PromptUnavailable,
+                "An unsupported shell was not treated as an unknown close state.");
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                new IpcMessage(
+                    IpcMessageType.Input,
+                    IpcProtocol.EncodeInput(78, "x"u8)),
+                timeout.Token);
+            Assert(
+                await frozenInputRejected.Task.WaitAsync(
+                    TimeSpan.FromSeconds(3),
+                    timeout.Token),
+                "Host accepted input while a close check was active.");
+            await IpcProtocol.WriteAsync(
+                controlPipe,
+                new IpcMessage(
+                    IpcMessageType.CloseCheckEnd,
+                    IpcProtocol.EncodeRequestId(70)),
+                timeout.Token);
             const long finalResizeRequestId = 20;
             for (long requestId = 1; requestId <= finalResizeRequestId; requestId++)
             {
@@ -737,9 +910,10 @@ internal static class Program
             var output = await outputTask;
             var control = await controlTask;
             Assert(control.interruptAccepted == true, "Host did not ACK the ConPTY interrupt write.");
-            Assert(output.Item1.Contains("KEY:03", StringComparison.Ordinal),
+            Assert(ContainsProbeKeyOutput(output.Item1),
                 "The probe did not receive exactly one ETX byte through ConPTY. "
-                + $"Captured: {Convert.ToBase64String(Encoding.UTF8.GetBytes(output.Item1))}");
+                + $"Captured tail: {Convert.ToBase64String(Encoding.UTF8.GetBytes(
+                    output.Item1[^Math.Min(2048, output.Item1.Length)..]))}");
             Assert(output.Item2, "Host marked final ConPTY output incomplete.");
             Assert(control.Value.ExitCode == 0 && control.Value.OutputComplete,
                 "Host exit status did not confirm a complete output drain.");
@@ -760,6 +934,286 @@ internal static class Program
         {
             // If an assertion fails before the data reader resumes, killing the
             // Host must still be able to release the probe process tree.
+            if (!host.HasExited)
+            {
+                host.Kill(entireProcessTree: true);
+            }
+        }
+    }
+
+    private static bool ContainsProbeKeyOutput(string output)
+    {
+        var markerIndex = output.LastIndexOf("KEY:", StringComparison.Ordinal);
+        if (markerIndex < 0)
+        {
+            return false;
+        }
+
+        var markerTail = output.AsSpan(
+            markerIndex,
+            Math.Min(256, output.Length - markerIndex));
+        return markerTail.IndexOf(":03", StringComparison.Ordinal) >= 0;
+    }
+
+    private static Task TestHostCloseAssessmentIntegration()
+    {
+        var executablePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            "System32",
+            "cmd.exe");
+        return RunShellCloseAssessmentIntegration(
+            "cmd",
+            executablePath,
+            string.Empty,
+            "ping -n 3 127.0.0.1 >nul\r");
+    }
+
+    private static Task TestPowerShellCloseAssessmentIntegration()
+    {
+        var executablePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe");
+        return RunShellCloseAssessmentIntegration(
+            "windows-powershell",
+            executablePath,
+            "-NoLogo",
+            "Start-Sleep -Seconds 2\r");
+    }
+
+    private static async Task RunShellCloseAssessmentIntegration(
+        string profileId,
+        string executablePath,
+        string shellArguments,
+        string testCommand)
+    {
+        var hostPath = FindSiblingProjectExecutable(
+            "TrayTerminal.Host",
+            "TrayTerminal.Host.exe");
+        Assert(File.Exists(hostPath), $"Host executable not found: {hostPath}");
+        Assert(
+            File.Exists(executablePath),
+            $"Shell executable not found: {executablePath}");
+
+        var outputPipeName = $"TrayTerminal-Test-Output-{Guid.NewGuid():N}";
+        var controlPipeName = $"TrayTerminal-Test-Control-{Guid.NewGuid():N}";
+        var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+        await using var outputPipe = new NamedPipeServerStream(
+            outputPipeName,
+            PipeDirection.In,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+        await using var controlPipe = new NamedPipeServerStream(
+            controlPipeName,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous);
+
+        var arguments = string.Join(
+            ' ',
+            "--output-pipe", outputPipeName,
+            "--control-pipe", controlPipeName,
+            "--nonce", nonce,
+            "--exe", EncodeHostArgument(executablePath),
+            "--args", EncodeHostArgument(shellArguments),
+            "--cwd", EncodeHostArgument(AppContext.BaseDirectory),
+            "--profile-id", EncodeHostArgument(profileId),
+            "--cols", "80",
+            "--rows", "24");
+        using var host = Process.Start(new ProcessStartInfo
+        {
+            FileName = hostPath,
+            Arguments = arguments,
+            WorkingDirectory = Path.GetDirectoryName(hostPath)!,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }) ?? throw new InvalidOperationException(
+            $"Could not start {profileId} Host close-assessment test.");
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(
+                TimeSpan.FromSeconds(20));
+            await Task.WhenAll(
+                outputPipe.WaitForConnectionAsync(timeout.Token),
+                controlPipe.WaitForConnectionAsync(timeout.Token));
+            var hellos = await Task.WhenAll(
+                IpcProtocol.ReadAsync(outputPipe, timeout.Token),
+                IpcProtocol.ReadAsync(controlPipe, timeout.Token));
+            Assert(
+                hellos.All(hello => hello is { Type: IpcMessageType.Hello }
+                    && IpcProtocol.DecodeText(hello.Value.Payload) == nonce),
+                "CMD Host nonce handshake failed.");
+
+            var captured = new MemoryStream();
+            var outputTask = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var message = await IpcProtocol.ReadAsync(
+                        outputPipe,
+                        timeout.Token)
+                        ?? throw new EndOfStreamException(
+                            "CMD output ended before its completion boundary.");
+                    if (message.Type == IpcMessageType.Output)
+                    {
+                        captured.Write(message.Payload);
+                    }
+                    else if (message.Type == IpcMessageType.OutputCompleted)
+                    {
+                        return message.Payload is [1];
+                    }
+                }
+            }, timeout.Token);
+
+            async Task<TerminalCloseAssessment> CheckAsync(long requestId)
+            {
+                await IpcProtocol.WriteAsync(
+                    controlPipe,
+                    new IpcMessage(
+                        IpcMessageType.CloseCheck,
+                        IpcProtocol.EncodeRequestId(requestId)),
+                    timeout.Token);
+                while (true)
+                {
+                    var message = await IpcProtocol.ReadAsync(
+                        controlPipe,
+                        timeout.Token)
+                        ?? throw new EndOfStreamException(
+                            "CMD control pipe ended during close check.");
+                    if (message.Type != IpcMessageType.CloseCheckResult)
+                    {
+                        continue;
+                    }
+
+                    var result = IpcProtocol.DecodeCloseCheckResult(
+                        message.Payload);
+                    if (result.RequestId == requestId)
+                    {
+                        return result.Assessment;
+                    }
+                }
+            }
+
+            async Task EndCheckAsync(long requestId)
+            {
+                await IpcProtocol.WriteAsync(
+                    controlPipe,
+                    new IpcMessage(
+                        IpcMessageType.CloseCheckEnd,
+                        IpcProtocol.EncodeRequestId(requestId)),
+                    timeout.Token);
+            }
+
+            async Task<bool> SendInputAsync(long requestId, string input)
+            {
+                await IpcProtocol.WriteAsync(
+                    controlPipe,
+                    new IpcMessage(
+                        IpcMessageType.Input,
+                        IpcProtocol.EncodeInput(
+                            requestId,
+                            Encoding.UTF8.GetBytes(input))),
+                    timeout.Token);
+                while (true)
+                {
+                    var message = await IpcProtocol.ReadAsync(
+                        controlPipe,
+                        timeout.Token)
+                        ?? throw new EndOfStreamException(
+                            "CMD control pipe ended before input acknowledgement.");
+                    if (message.Type is not IpcMessageType.InputAck)
+                    {
+                        continue;
+                    }
+
+                    var result = IpcProtocol.DecodeInputResult(message.Payload);
+                    if (result.RequestId == requestId)
+                    {
+                        return result.Accepted;
+                    }
+                }
+            }
+
+            TerminalCloseAssessment initial = default;
+            long checkRequestId = 100;
+            for (var attempt = 0; attempt < 50; attempt++)
+            {
+                initial = await CheckAsync(checkRequestId);
+                await EndCheckAsync(checkRequestId++);
+                if (initial.IsIdle)
+                {
+                    break;
+                }
+                await Task.Delay(100, timeout.Token);
+            }
+            var startupOutput = Encoding.UTF8.GetString(captured.ToArray());
+            if (startupOutput.Length > 2048)
+            {
+                startupOutput = startupOutput[^2048..];
+            }
+            Assert(
+                initial.IsIdle,
+                $"{profileId} startup prompt never produced an idle proof: {initial.Status}. "
+                + $"Output tail: {startupOutput}");
+
+            Assert(
+                await SendInputAsync(200, testCommand),
+                $"{profileId} test command input was rejected.");
+            var active = await CheckAsync(checkRequestId);
+            await EndCheckAsync(checkRequestId++);
+            Assert(
+                active.HasActiveTask,
+                $"Running {profileId} command was not active: {active.Status}.");
+
+            TerminalCloseAssessment completed = default;
+            for (var attempt = 0; attempt < 30; attempt++)
+            {
+                await Task.Delay(150, timeout.Token);
+                completed = await CheckAsync(checkRequestId);
+                await EndCheckAsync(checkRequestId++);
+                if (completed.IsIdle)
+                {
+                    break;
+                }
+            }
+            Assert(
+                completed.IsIdle,
+                $"Completed {profileId} command never returned to idle: {completed.Status}.");
+
+            Assert(
+                await SendInputAsync(201, "exit\r"),
+                $"{profileId} exit input was rejected.");
+            (int ExitCode, bool OutputComplete)? exit = null;
+            while (exit is null)
+            {
+                var message = await IpcProtocol.ReadAsync(
+                    controlPipe,
+                    timeout.Token)
+                    ?? throw new EndOfStreamException(
+                        "CMD control pipe ended before exit status.");
+                if (message.Type == IpcMessageType.Exit)
+                {
+                    exit = IpcProtocol.DecodeExitStatus(message.Payload);
+                }
+            }
+
+            Assert(await outputTask, "CMD output was not completely drained.");
+            Assert(
+                exit.Value == (0, true),
+                "CMD Host did not report a complete successful exit.");
+            Assert(
+                !Encoding.UTF8.GetString(captured.ToArray())
+                    .Contains(nonce, StringComparison.Ordinal),
+                "Shell integration marker leaked into terminal output.");
+            await host.WaitForExitAsync(timeout.Token);
+        }
+        finally
+        {
             if (!host.HasExited)
             {
                 host.Kill(entireProcessTree: true);

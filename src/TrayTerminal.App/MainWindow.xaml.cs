@@ -48,6 +48,8 @@ public partial class MainWindow : Window
     private bool _backgroundReloadInProgress;
     private RemoteAccessService? _remoteAccess;
     private bool _forceClose;
+    private bool _shutdownApproved;
+    private bool _shutdownCheckInProgress;
     private int _untitledIndex = 1;
 
     public MainWindow(PortablePaths paths, FileLogger logger)
@@ -834,14 +836,22 @@ public partial class MainWindow : Window
     private async Task CloseTabAsync(TerminalPage page)
     {
         ReloadTabPresets();
-        if (page.IsRunning)
+        await using var closeCheck = await page.BeginCloseCheckAsync();
+        if (!closeCheck.Assessment.IsIdle)
         {
-            if (!AppMessageDialog.Confirm(this, "该标签的终端仍在运行，是否强制关闭？", "关闭", "取消"))
+            if (!AppMessageDialog.ConfirmDestructive(
+                    this,
+                    BuildSingleTabCloseMessage(
+                        page.Title,
+                        closeCheck.Assessment),
+                    "强制关闭",
+                    "取消"))
             {
                 return;
             }
         }
 
+        closeCheck.Commit();
         await page.DisposeAsync();
         var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
         if (item is not null)
@@ -1037,42 +1047,207 @@ public partial class MainWindow : Window
 
     private void OnClosing(object? sender, CancelEventArgs e)
     {
+        if (_shutdownApproved)
+        {
+            foreach (var page in GetTerminalPages())
+            {
+                page.KillForShutdown();
+            }
+            return;
+        }
+
+        e.Cancel = true;
+        if (_shutdownCheckInProgress)
+        {
+            return;
+        }
+
         if (!_forceClose)
         {
             var choice = AppMessageDialog.ChooseInline(this, "选择操作：", "退出程序", "隐藏到托盘");
             if (choice == 1)
             {
-                e.Cancel = true;
                 HideToTray();
                 return;
             }
             if (choice != 0)
             {
-                e.Cancel = true;
                 return;
             }
         }
 
-        var runningPages = Tabs.Items
+        _shutdownCheckInProgress = true;
+        IsEnabled = false;
+        _ = ConfirmShutdownAsync();
+    }
+
+    private async Task ConfirmShutdownAsync()
+    {
+        var pages = GetTerminalPages();
+        var checks = Array.Empty<PageCloseCheck>();
+        try
+        {
+            checks = await Task.WhenAll(
+                pages.Select(BeginPageCloseCheckAsync));
+            IsEnabled = true;
+
+            var blocked = checks
+                .Where(check => !check.Lease.Assessment.IsIdle)
+                .ToArray();
+            if (blocked.Length > 0
+                && !AppMessageDialog.ConfirmDestructive(
+                    this,
+                    BuildApplicationCloseMessage(blocked),
+                    "强制退出",
+                    "取消"))
+            {
+                return;
+            }
+
+            foreach (var check in checks)
+            {
+                check.Lease.Commit();
+            }
+
+            _shutdownApproved = true;
+            Close();
+        }
+        catch (Exception exception)
+        {
+            _shutdownApproved = false;
+            _logger.Error(exception, "Application close check failed.");
+            if (IsVisible)
+            {
+                IsEnabled = true;
+                AppMessageDialog.Info(
+                    this,
+                    "无法完成终端关闭检查，已取消退出。请重试；若问题持续，可逐个检查并关闭标签页。");
+            }
+        }
+        finally
+        {
+            foreach (var check in checks.Reverse())
+            {
+                await check.Lease.DisposeAsync();
+            }
+
+            _shutdownCheckInProgress = false;
+            _forceClose = false;
+            if (!_shutdownApproved)
+            {
+                IsEnabled = true;
+            }
+        }
+    }
+
+    private async Task<PageCloseCheck> BeginPageCloseCheckAsync(
+        TerminalPage page)
+    {
+        try
+        {
+            return new PageCloseCheck(
+                page,
+                await page.BeginCloseCheckAsync());
+        }
+        catch (Exception exception)
+        {
+            _logger.Error(
+                exception,
+                $"Failed to check whether terminal '{page.Title}' can close safely.");
+            return new PageCloseCheck(
+                page,
+                new TerminalCloseCheckLease(
+                    new TerminalCloseAssessment(
+                        TerminalCloseStatus.SessionUnavailable)));
+        }
+    }
+
+    private TerminalPage[] GetTerminalPages()
+    {
+        return Tabs.Items
             .Cast<TabItem>()
             .Select(tab => tab.Content)
             .OfType<TerminalPage>()
-            .Where(page => page.IsRunning)
-            .ToList();
-
-        if (runningPages.Count > 0)
-        {
-            if (!AppMessageDialog.Confirm(this, $"仍有 {runningPages.Count} 个终端在运行，是否强制退出？", "退出", "取消"))
-            {
-                e.Cancel = true;
-                _forceClose = false;
-                return;
-            }
-        }
-
-        foreach (var page in Tabs.Items.Cast<TabItem>().Select(tab => tab.Content).OfType<TerminalPage>())
-        {
-            page.KillForShutdown();
-        }
+            .ToArray();
     }
+
+    private static string BuildSingleTabCloseMessage(
+        string title,
+        TerminalCloseAssessment assessment)
+    {
+        var reason = FormatCloseReason(assessment);
+
+        return $"标签页“{TruncateTitle(title)}”尚不能安全关闭：\n{reason}。\n\n"
+            + "关闭将退出 Shell，并终止仍属于该会话的任务。是否仍要强制关闭？";
+    }
+
+    private static string BuildApplicationCloseMessage(
+        IReadOnlyCollection<PageCloseCheck> blocked)
+    {
+        const int maxDisplayedTabs = 8;
+        var activeCount = blocked.Count(check =>
+            check.Lease.Assessment.HasActiveTask);
+        var unknownCount = blocked.Count - activeCount;
+        var lines = new List<string>
+        {
+            $"有 {blocked.Count} 个标签页尚不能安全关闭：",
+            string.Empty
+        };
+        if (activeCount > 0)
+        {
+            lines.Add($"检测到活动任务：{activeCount} 个");
+        }
+        if (unknownCount > 0)
+        {
+            lines.Add($"无法确认是否空闲：{unknownCount} 个");
+        }
+        lines.Add(string.Empty);
+        foreach (var check in blocked.Take(maxDisplayedTabs))
+        {
+            lines.Add(
+                $"• “{TruncateTitle(check.Page.Title)}”："
+                + FormatCloseReason(check.Lease.Assessment));
+        }
+        if (blocked.Count > maxDisplayedTabs)
+        {
+            lines.Add($"• 另外 {blocked.Count - maxDisplayedTabs} 个标签页未显示");
+        }
+        lines.Add(string.Empty);
+        lines.Add("退出将终止这些终端会话。是否仍要强制退出？");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string FormatCloseReason(TerminalCloseAssessment assessment)
+    {
+        return assessment.Status switch
+        {
+            TerminalCloseStatus.ActiveProcesses =>
+                $"检测到 {assessment.Detail} 个仍存活的子进程",
+            TerminalCloseStatus.ActiveShellJobs =>
+                $"检测到 {assessment.Detail} 个未完成的 PowerShell Job",
+            TerminalCloseStatus.ActiveCommand =>
+                $"有 {assessment.Detail} 条已提交命令尚未返回根 Shell 提示符",
+            TerminalCloseStatus.UnknownInput =>
+                "存在尚未由后续根 Shell 提示符确认的输入或 Ctrl+C",
+            TerminalCloseStatus.PromptUnavailable =>
+                "未识别到可信的根 Shell 提示符",
+            TerminalCloseStatus.ProcessTrackingUnavailable =>
+                "无法查询该会话的 Job Object 进程计数",
+            TerminalCloseStatus.CloseCheckTimedOut =>
+                "关闭检查超过 1 秒",
+            _ => "终端 Host 或 IPC 状态查询不可用"
+        };
+    }
+
+    private static string TruncateTitle(string title)
+    {
+        const int maxTitleLength = 48;
+        return title.Length <= maxTitleLength
+            ? title
+            : title[..(maxTitleLength - 1)] + "…";
+    }
+
+    private sealed record PageCloseCheck(
+        TerminalPage Page,
+        TerminalCloseCheckLease Lease);
 }

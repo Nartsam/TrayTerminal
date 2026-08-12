@@ -157,6 +157,12 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         await _session.SendInputAsync(text);
     }
 
+    public Task<TerminalCloseCheckLease> BeginCloseCheckAsync(
+        CancellationToken cancellationToken = default)
+    {
+        return _session.BeginCloseCheckAsync(cancellationToken);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)

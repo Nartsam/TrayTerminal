@@ -15,8 +15,25 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 启动自动建标签：通过 `Data\Config\init.txt` 指定程序启动时自动创建的标签列表。
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
 - 托盘模式：点击”隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示”显示”或”隐藏”。
-- 关闭行为：点击窗口关闭按钮时会询问是退出程序还是隐藏到托盘；托盘右键”退出”则直接退出。关闭仍在运行的标签或退出程序时会提示确认，确认后会强制结束该终端及子进程。
+- 关闭行为：点击窗口关闭按钮时会询问是退出程序还是隐藏到托盘；托盘右键”退出”跳过该选择，但仍执行相同的终端安全检查。只有已证实回到根 Shell 提示符、没有活动子进程或未完成 PowerShell Job、也没有未确认输入的标签才会无提示关闭；活动或状态不确定时会安全默认到“取消”，确认后才强制结束该终端及子进程。
 - 远程访问：可通过浏览器在同一局域网内的另一台设备上查看和操作指定的终端标签。需在 `settings.txt` 中配置端口、令牌和允许的终端名称后启用。
+
+### 关闭安全判定
+
+单独关闭标签、窗口退出和托盘退出共用同一套三态判定：`已证实空闲`、`检测到活动任务`、`无法确认`。只有第一种状态直接关闭，后两种都要求用户明确确认；应用整体退出时会按这两类列出标签名称，取消后恢复全部标签，不会先关闭其中一部分。
+
+关闭检查按需执行，不持续轮询。检查开始后会冻结该会话的本地和远程输入，排空此前已接受的 Host 输入，并在最多 1 秒内同时验证以下证据：
+
+- CMD、Windows PowerShell 或 PowerShell 7 已输出由 TrayTerminal 注入的当前会话提示符标记；标记会在 Host 中剥离，不进入本地、远程或权威终端状态。
+- 自上一个可信提示符以来的输入和命令提交已经与后续提示符保守匹配；多条提前输入的命令不会被一个提示符一次性清空。
+- 会话 Job Object 中只剩根 Shell。交互式子程序、SSH、数据库客户端、后台子进程和嵌套 Shell 都会继续触发警告。
+- PowerShell 没有 `Running`、`Blocked`、`Disconnected` 等未进入终态的 Job；`Completed`、`Failed`、`Stopped` Job 的未读取历史输出不阻止关闭。
+
+Job Object 关联失败、Shell 标记被用户配置覆盖、IPC 异常、检查超时或存在无法匹配的输入时一律按“无法确认”处理。判定只面向正常、非恶意程序；不尝试抵抗主动伪造标记或刻意逃逸进程跟踪。为了保证不会把运行中的任务误判为空闲，输入过但没有足够完成证据的终端可能继续提示，这是预期的保守降级。
+
+xterm 在 Shell 启用 VT 焦点报告后会通过输入通道自动发送 `ESC[I` / `ESC[O`。这两条完整、精确匹配的协议响应不属于用户输入，关闭对话框造成的失焦也不应污染空闲判定；除此之外的转义序列、文字、粘贴、回车和 Ctrl+C 仍按用户输入保守记账。
+
+关闭提示会逐个列出标签及具体原因，例如未识别到根 Shell 提示符、Job Object 进程计数不可用或检查超过 1 秒。每次按需检查还会分别写入 App 与 Host 日志；Host 日志包含提示符、待完成提交、未确认输入、PowerShell Job 和活动进程计数的快照，便于区分保守拒绝的具体来源。
 
 ## 运行时数据
 
@@ -225,16 +242,18 @@ src/
 - `Services/RemoteAccessService.cs`：内置轻量 HTTP + WebSocket 服务器，管理远程访问生命周期；只依赖 .NET 桌面运行时，不依赖 ASP.NET Core Runtime。
 - `Services/RemoteTerminalBridge.cs`：单个远程浏览器 WebSocket 连接到终端会话的桥接器。
 - `Services/TerminalSession.cs`：主进程侧终端会话，启动普通或管理员 Host，维护独立 output/control 命名管道，把 Host 输出和 resize boundary 先提交给权威状态，再广播本地与远程副本。
+- `Services/TerminalCloseCheckLease.cs`：单次关闭检查租约；在确认框完成前保持输入冻结，取消时恢复 Host 和本地输入，提交关闭时保持冻结直到会话销毁。
 - `Assets/remote-terminal.html`：远程浏览器加载的 xterm.js 终端页面，通过 WebSocket 通信。
 
 ### `src/TrayTerminal.Host`
 
 - `TrayTerminal.Host.csproj`：隐藏窗口的 Host 项目，输出 `TrayTerminal.Host.exe`。
 - `Program.cs`：Host 入口，解析参数，连接主进程命名管道，完成 nonce 握手，然后启动终端会话。
-- `HostOptions.cs`：Host 命令行参数模型和解析逻辑，Base64 编码 shell 路径、参数和工作目录，避免空格与特殊字符破坏参数传递。
+- `HostOptions.cs`：Host 命令行参数模型和解析逻辑，Base64 编码 shell 路径、参数、工作目录和 Profile ID，避免空格与特殊字符破坏参数传递。
 - `Terminal/NativeMethods.cs`：ConPTY、CreateProcess、Job Object 等 Win32 API P/Invoke 声明和辅助方法。
-- `Terminal/ConPtySession.cs`：创建伪控制台、启动 shell、处理 resize、等待退出、强制结束进程树。
-- `Terminal/TerminalHostSession.cs`：Host 侧会话调度器，在 ConPTY 和命名管道之间泵入输入、输出、resize、kill、exit 消息。
+- `Terminal/ConPtySession.cs`：创建伪控制台，以挂起状态启动 Shell 并先关联 kill-on-close Job Object，处理 resize、活动进程查询、等待退出和强制结束进程树。
+- `Terminal/ShellIntegration.cs`：为内置 CMD/PowerShell Profile 生成仅当前进程有效的提示符集成；不修改用户 Profile、注册表或全局环境变量。
+- `Terminal/TerminalHostSession.cs`：Host 侧会话调度器，在 ConPTY 和命名管道之间泵入输入、输出、resize、kill、exit 消息，并执行输入冻结、提示符解析和关闭状态证明。
 
 ### `src/TrayTerminal.Shared`
 
@@ -244,13 +263,16 @@ src/
 - `Ipc/IpcMessage.cs`：IPC 消息结构，包含类型和二进制载荷。
 - `Ipc/IpcMessageType.cs`：IPC 消息类型枚举，例如 Hello、Input、Output、Resize、Exit、Kill。
 - `Ipc/IpcProtocol.cs`：IPC 二进制帧协议的读写和常用载荷编码。
+- `Terminal/TerminalActivityTracker.cs`：有界的输入提交与提示符保守记账状态机。
+- `Terminal/TerminalCloseAssessment.cs`：关闭检查三态结果及具体原因模型。
+- `Terminal/TerminalPromptFilter.cs`：跨输出分块识别并剥离带随机令牌的 Shell 提示符标记。
 - `Terminal/TerminalProfile.cs`：终端 Profile 模型，描述显示名、可执行文件、启动参数和工作目录。
 - `Terminal/TerminalProfileCatalog.cs`：检测可用终端类型，当前支持 CMD、Windows PowerShell、PowerShell 7。
 
 ### `src/TrayTerminal.SmokeTests`
 
 - `TrayTerminal.SmokeTests.csproj`：轻量 smoke test 控制台项目。
-- `Program.cs`：测试便携路径边界、IPC 编解码、快照/事件连续性、恢复 generation barrier、远端同步门与共享操作上限、resize ownership，以及真实 Host/ConPTY 的输出背压、resize 顺序和 ETX 写入。
+- `Program.cs`：测试便携路径边界、IPC 编解码、快照/事件连续性、恢复 generation barrier、远端同步门与共享操作上限、resize ownership，以及真实 Host/ConPTY 的输出背压、resize 顺序、ETX 写入、关闭期间输入拒绝、CMD 子进程和 PowerShell 进程内命令判定。
 
 ### 构建输出
 

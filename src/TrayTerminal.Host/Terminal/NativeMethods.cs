@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -8,6 +9,7 @@ internal static class NativeMethods
 {
     public const int ProcThreadAttributePseudoConsole = 0x00020016;
     private const int JobObjectExtendedLimitInformation = 9;
+    private const int JobObjectBasicAccountingInformation = 1;
     private const uint JobObjectLimitKillOnJobClose = 0x00002000;
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -71,6 +73,20 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool AssignProcessToJobObject(SafeFileHandle job, IntPtr process);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(
+        SafeFileHandle hJob,
+        int jobObjectInfoClass,
+        out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION lpJobObjectInfo,
+        uint cbJobObjectInfoLength,
+        IntPtr lpReturnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
     public static StringBuilder BuildCommandLine(string executablePath, string arguments)
     {
         var commandLine = Quote(executablePath);
@@ -115,6 +131,51 @@ internal static class NativeMethods
         {
             Marshal.FreeHGlobal(buffer);
         }
+    }
+
+    public static bool TryGetActiveProcessCount(
+        SafeFileHandle job,
+        out uint activeProcesses)
+    {
+        var length = (uint)Marshal.SizeOf<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>();
+        if (QueryInformationJobObject(
+                job,
+                JobObjectBasicAccountingInformation,
+                out var info,
+                length,
+                IntPtr.Zero))
+        {
+            activeProcesses = info.ActiveProcesses;
+            return true;
+        }
+
+        activeProcesses = 0;
+        return false;
+    }
+
+    public static IntPtr CreateEnvironmentBlock(string commandPrompt)
+    {
+        var environment = new SortedDictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase);
+        foreach (DictionaryEntry entry in Environment.GetEnvironmentVariables())
+        {
+            if (entry.Key is string key && entry.Value is string value)
+            {
+                environment[key] = value;
+            }
+        }
+
+        environment["PROMPT"] = commandPrompt;
+        var builder = new StringBuilder();
+        foreach (var (key, value) in environment)
+        {
+            builder.Append(key);
+            builder.Append('=');
+            builder.Append(value);
+            builder.Append('\0');
+        }
+        builder.Append('\0');
+        return Marshal.StringToHGlobalUni(builder.ToString());
     }
 
     private static string Quote(string value)
@@ -233,5 +294,18 @@ internal static class NativeMethods
         public nuint JobMemoryLimit;
         public nuint PeakProcessMemoryUsed;
         public nuint PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
     }
 }

@@ -15,5 +15,8 @@ public enum IpcMessageType : byte
     InterruptAck = 11,
     ResizeBoundary = 12,
     OutputCompleted = 13,
-    ResizeAck = 14
+    ResizeAck = 14,
+    CloseCheck = 15,
+    CloseCheckResult = 16,
+    CloseCheckEnd = 17
 }

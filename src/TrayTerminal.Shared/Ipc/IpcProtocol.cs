@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Pipes;
 using System.Text;
+using TrayTerminal.Shared.Terminal;
 
 namespace TrayTerminal.Shared.Ipc;
 
@@ -123,6 +124,43 @@ public static class IpcProtocol
         return (
             BinaryPrimitives.ReadInt64LittleEndian(payload),
             payload[sizeof(long)] == 1);
+    }
+
+    public static byte[] EncodeCloseCheckResult(
+        long requestId,
+        TerminalCloseAssessment assessment)
+    {
+        var payload = new byte[sizeof(long) + sizeof(byte) + sizeof(int)];
+        BinaryPrimitives.WriteInt64LittleEndian(payload, requestId);
+        payload[sizeof(long)] = (byte)assessment.Status;
+        BinaryPrimitives.WriteInt32LittleEndian(
+            payload.AsSpan(sizeof(long) + sizeof(byte)),
+            Math.Max(0, assessment.Detail));
+        return payload;
+    }
+
+    public static (long RequestId, TerminalCloseAssessment Assessment)
+        DecodeCloseCheckResult(byte[] payload)
+    {
+        if (payload.Length != sizeof(long) + sizeof(byte) + sizeof(int)
+            || !Enum.IsDefined((TerminalCloseStatus)payload[sizeof(long)]))
+        {
+            throw new InvalidDataException(
+                $"Close-check result payload is invalid, got {payload.Length} bytes.");
+        }
+
+        var detail = BinaryPrimitives.ReadInt32LittleEndian(
+            payload.AsSpan(sizeof(long) + sizeof(byte)));
+        if (detail < 0)
+        {
+            throw new InvalidDataException("Close-check detail cannot be negative.");
+        }
+
+        return (
+            BinaryPrimitives.ReadInt64LittleEndian(payload),
+            new TerminalCloseAssessment(
+                (TerminalCloseStatus)payload[sizeof(long)],
+                detail));
     }
 
     public static byte[] EncodeResize(int columns, int rows)

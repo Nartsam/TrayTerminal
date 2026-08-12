@@ -11,6 +11,23 @@ namespace TrayTerminal.App.Dialogs;
 public partial class AppMessageDialog : Window
 {
     public AppMessageDialog(string message, string[] buttonLabels, Window? owner = null, bool inline = false)
+        : this(
+            message,
+            buttonLabels,
+            owner,
+            inline,
+            defaultButtonIndex: buttonLabels.Length - 1,
+            cancelButtonIndex: -1)
+    {
+    }
+
+    private AppMessageDialog(
+        string message,
+        string[] buttonLabels,
+        Window? owner,
+        bool inline,
+        int defaultButtonIndex,
+        int cancelButtonIndex)
     {
         InitializeComponent();
         if (owner is not null)
@@ -21,11 +38,19 @@ public partial class AppMessageDialog : Window
 
         if (inline)
         {
-            BuildInlineLayout(message, buttonLabels);
+            BuildInlineLayout(
+                message,
+                buttonLabels,
+                defaultButtonIndex,
+                cancelButtonIndex);
         }
         else
         {
-            BuildStackedLayout(message, buttonLabels);
+            BuildStackedLayout(
+                message,
+                buttonLabels,
+                defaultButtonIndex,
+                cancelButtonIndex);
         }
     }
 
@@ -34,6 +59,22 @@ public partial class AppMessageDialog : Window
     public static bool Confirm(Window owner, string message, string yesLabel = "确定", string noLabel = "取消")
     {
         var dialog = new AppMessageDialog(message, [noLabel, yesLabel], owner);
+        return dialog.ShowDialog() == true && dialog.ClickedIndex == 1;
+    }
+
+    public static bool ConfirmDestructive(
+        Window owner,
+        string message,
+        string yesLabel = "确定",
+        string noLabel = "取消")
+    {
+        var dialog = new AppMessageDialog(
+            message,
+            [noLabel, yesLabel],
+            owner,
+            inline: false,
+            defaultButtonIndex: 0,
+            cancelButtonIndex: 0);
         return dialog.ShowDialog() == true && dialog.ClickedIndex == 1;
     }
 
@@ -74,7 +115,11 @@ public partial class AppMessageDialog : Window
         BuildPreviewLayout(message, preview, buttonLabels);
     }
 
-    private void BuildStackedLayout(string message, string[] buttonLabels)
+    private void BuildStackedLayout(
+        string message,
+        string[] buttonLabels,
+        int defaultButtonIndex,
+        int cancelButtonIndex)
     {
         RootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         RootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -90,11 +135,19 @@ public partial class AppMessageDialog : Window
 
         var panel = new StackPanel { Orientation = WpfOrientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
         Grid.SetRow(panel, 1);
-        AddButtons(panel, buttonLabels);
+        AddButtons(
+            panel,
+            buttonLabels,
+            defaultButtonIndex,
+            cancelButtonIndex);
         RootGrid.Children.Add(panel);
     }
 
-    private void BuildInlineLayout(string message, string[] buttonLabels)
+    private void BuildInlineLayout(
+        string message,
+        string[] buttonLabels,
+        int defaultButtonIndex,
+        int cancelButtonIndex)
     {
         var panel = new StackPanel { Orientation = WpfOrientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
 
@@ -106,7 +159,11 @@ public partial class AppMessageDialog : Window
             Margin = new Thickness(0, 0, 16, 0)
         };
         panel.Children.Add(text);
-        AddButtons(panel, buttonLabels);
+        AddButtons(
+            panel,
+            buttonLabels,
+            defaultButtonIndex,
+            cancelButtonIndex);
 
         RootGrid.Children.Add(panel);
     }
@@ -148,11 +205,19 @@ public partial class AppMessageDialog : Window
 
         var panel = new StackPanel { Orientation = WpfOrientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };
         Grid.SetRow(panel, 2);
-        AddButtons(panel, buttonLabels);
+        AddButtons(
+            panel,
+            buttonLabels,
+            defaultButtonIndex: buttonLabels.Length - 1,
+            cancelButtonIndex: -1);
         RootGrid.Children.Add(panel);
     }
 
-    private void AddButtons(WpfPanel panel, string[] buttonLabels)
+    private void AddButtons(
+        WpfPanel panel,
+        string[] buttonLabels,
+        int defaultButtonIndex,
+        int cancelButtonIndex)
     {
         for (var i = 0; i < buttonLabels.Length; i++)
         {
@@ -169,10 +234,8 @@ public partial class AppMessageDialog : Window
                 ClickedIndex = index;
                 DialogResult = true;
             };
-            if (i == buttonLabels.Length - 1)
-            {
-                button.IsDefault = true;
-            }
+            button.IsDefault = i == defaultButtonIndex;
+            button.IsCancel = i == cancelButtonIndex;
             panel.Children.Add(button);
         }
     }

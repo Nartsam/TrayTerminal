@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.IO.Pipes;
 using TrayTerminal.Shared;
 using TrayTerminal.Shared.Ipc;
+using TrayTerminal.Shared.Terminal;
 
 namespace TrayTerminal.Host.Terminal;
 
@@ -17,13 +19,28 @@ internal sealed class TerminalHostSession : IDisposable
     private readonly object _resizeLock = new();
     private readonly Queue<PendingInput> _ordinaryInputs = new();
     private readonly Queue<PendingInput> _interrupts = new();
+    private readonly TerminalActivityTracker _activityTracker = new();
+    private readonly TerminalPromptFilter? _promptFilter;
     private PendingResize? _pendingResize;
+    private TaskCompletionSource? _inputDrainCompletion;
     private bool _acceptingResizes = true;
+    private bool _acceptingInputs = true;
+    private bool _inputWriteActive;
+    private long? _closeCheckRequestId;
 
-    private TerminalHostSession(ConPtySession conPty, FileLogger logger)
+    private TerminalHostSession(
+        ConPtySession conPty,
+        FileLogger logger,
+        string markerToken)
     {
         _conPty = conPty;
         _logger = logger;
+        if (conPty.PromptTrackingEnabled)
+        {
+            _promptFilter = new TerminalPromptFilter(
+                markerToken,
+                _activityTracker.RecordPrompt);
+        }
     }
 
     public static TerminalHostSession Start(HostOptions options, FileLogger logger)
@@ -32,11 +49,13 @@ internal sealed class TerminalHostSession : IDisposable
             options.ExecutablePath,
             options.Arguments,
             options.WorkingDirectory,
+            options.ProfileId,
+            options.Nonce,
             options.Columns,
             options.Rows);
 
         logger.Info($"Started terminal process {conPty.ProcessId}: {options.ExecutablePath}");
-        return new TerminalHostSession(conPty, logger);
+        return new TerminalHostSession(conPty, logger, options.Nonce);
     }
 
     public async Task<int> RunAsync(
@@ -184,15 +203,30 @@ internal sealed class TerminalHostSession : IDisposable
                 readTask = null;
                 if (read == 0)
                 {
+                    if (_promptFilter is not null)
+                    {
+                        var remaining = _promptFilter.Flush();
+                        if (remaining.Length > 0)
+                        {
+                            await SendOutputAsync(
+                                outputPipe,
+                                remaining,
+                                cancellationToken).ConfigureAwait(false);
+                        }
+                    }
                     return;
                 }
 
-                await IpcProtocol.WriteAsync(
-                    outputPipe,
-                    new IpcMessage(
-                        IpcMessageType.Output,
-                        buffer.AsSpan(0, read).ToArray()),
-                    cancellationToken).ConfigureAwait(false);
+                var output = _promptFilter is null
+                    ? buffer.AsSpan(0, read).ToArray()
+                    : _promptFilter.Process(buffer.AsSpan(0, read));
+                if (output.Length > 0)
+                {
+                    await SendOutputAsync(
+                        outputPipe,
+                        output,
+                        cancellationToken).ConfigureAwait(false);
+                }
                 continue;
             }
 
@@ -304,6 +338,22 @@ internal sealed class TerminalHostSession : IDisposable
                     _conPty.KillProcessTree();
                     return;
 
+                case IpcMessageType.CloseCheck:
+                {
+                    var requestId = IpcProtocol.DecodeRequestId(
+                        message.Value.Payload);
+                    await HandleCloseCheckAsync(
+                        controlPipe,
+                        requestId,
+                        cancellationToken).ConfigureAwait(false);
+                    break;
+                }
+
+                case IpcMessageType.CloseCheckEnd:
+                    EndCloseCheck(IpcProtocol.DecodeRequestId(
+                        message.Value.Payload));
+                    break;
+
                 case IpcMessageType.Heartbeat:
                     await SendControlAsync(
                         controlPipe,
@@ -318,12 +368,14 @@ internal sealed class TerminalHostSession : IDisposable
     {
         lock (_inputLock)
         {
-            if (_ordinaryInputs.Count + _interrupts.Count >= MaxQueuedInputChunks)
+            if (!_acceptingInputs
+                || _ordinaryInputs.Count + _interrupts.Count >= MaxQueuedInputChunks)
             {
                 return false;
             }
 
             _ordinaryInputs.Enqueue(input);
+            _activityTracker.RecordInput(input.Data.Span);
         }
 
         _inputSignal.Release();
@@ -374,6 +426,11 @@ internal sealed class TerminalHostSession : IDisposable
         bool accepted;
         lock (_inputLock)
         {
+            if (!_acceptingInputs)
+            {
+                return new InterruptEnqueueResult([], Accepted: false);
+            }
+
             canceled = _ordinaryInputs.Select(input => input.RequestId).ToArray();
             _ordinaryInputs.Clear();
             accepted = _interrupts.Count < MaxQueuedInputChunks;
@@ -383,6 +440,7 @@ internal sealed class TerminalHostSession : IDisposable
                     requestId,
                     new byte[] { 0x03 },
                     IsInterrupt: true));
+                _activityTracker.RecordInput([0x03]);
             }
         }
 
@@ -413,6 +471,7 @@ internal sealed class TerminalHostSession : IDisposable
                         ? _ordinaryInputs.Dequeue()
                         : null;
                 }
+                _inputWriteActive = input is not null;
             }
 
             if (input is null)
@@ -420,19 +479,191 @@ internal sealed class TerminalHostSession : IDisposable
                 continue;
             }
 
-            await _conPty.Input.WriteAsync(
-                input.Data,
-                cancellationToken).ConfigureAwait(false);
-            await _conPty.Input.FlushAsync(cancellationToken).ConfigureAwait(false);
-            await SendInputResultAsync(
-                controlPipe,
-                input.IsInterrupt
-                    ? IpcMessageType.InterruptAck
-                    : IpcMessageType.InputAck,
-                input.RequestId,
-                accepted: true,
-                cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _conPty.Input.WriteAsync(
+                    input.Data,
+                    cancellationToken).ConfigureAwait(false);
+                await _conPty.Input.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await SendInputResultAsync(
+                    controlPipe,
+                    input.IsInterrupt
+                        ? IpcMessageType.InterruptAck
+                        : IpcMessageType.InputAck,
+                    input.RequestId,
+                    accepted: true,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                lock (_inputLock)
+                {
+                    _inputWriteActive = false;
+                    CompleteInputDrainIfReady();
+                }
+            }
         }
+    }
+
+    private async Task HandleCloseCheckAsync(
+        PipeStream controlPipe,
+        long requestId,
+        CancellationToken cancellationToken)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        Task drainTask;
+        var accepted = false;
+        lock (_inputLock)
+        {
+            if (_closeCheckRequestId is null)
+            {
+                accepted = true;
+                _closeCheckRequestId = requestId;
+                _acceptingInputs = false;
+                if (!_inputWriteActive
+                    && _ordinaryInputs.Count == 0
+                    && _interrupts.Count == 0)
+                {
+                    drainTask = Task.CompletedTask;
+                }
+                else
+                {
+                    // One completion source is sufficient because Host accepts
+                    // only one active close transaction per session.
+                    _inputDrainCompletion = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously);
+                    drainTask = _inputDrainCompletion.Task;
+                }
+            }
+            else
+            {
+                drainTask = Task.CompletedTask;
+            }
+        }
+
+        TerminalCloseAssessment assessment;
+        TerminalShellActivitySnapshot shell = default;
+        var processCountAvailable = false;
+        uint activeProcesses = 0;
+        if (!accepted)
+        {
+            assessment = new TerminalCloseAssessment(
+                TerminalCloseStatus.SessionUnavailable);
+        }
+        else
+        {
+            await drainTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+            assessment = AssessCloseState(
+                out shell,
+                out processCountAvailable,
+                out activeProcesses);
+        }
+
+        _logger.Info(
+            $"Close check {requestId}: status={assessment.Status}, "
+            + $"detail={assessment.Detail}, elapsedMs={stopwatch.ElapsedMilliseconds}, "
+            + $"accepted={accepted}, promptTracking={_conPty.PromptTrackingEnabled}, "
+            + $"promptObserved={shell.PromptObserved}, "
+            + $"pendingSubmissions={shell.PendingSubmissions}, "
+            + $"unresolvedInput={shell.HasUnresolvedInput}, "
+            + $"activeShellJobs={shell.ActiveShellJobs}, "
+            + $"ignoredFocusReports={shell.IgnoredFocusReports}, "
+            + $"processCountAvailable={processCountAvailable}, "
+            + $"activeProcesses={activeProcesses}.");
+
+        await SendControlAsync(
+            controlPipe,
+            new IpcMessage(
+                IpcMessageType.CloseCheckResult,
+                IpcProtocol.EncodeCloseCheckResult(requestId, assessment)),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private void EndCloseCheck(long requestId)
+    {
+        lock (_inputLock)
+        {
+            if (_closeCheckRequestId != requestId)
+            {
+                return;
+            }
+
+            _closeCheckRequestId = null;
+            _inputDrainCompletion = null;
+            _acceptingInputs = true;
+        }
+    }
+
+    private TerminalCloseAssessment AssessCloseState(
+        out TerminalShellActivitySnapshot shell,
+        out bool processCountAvailable,
+        out uint activeProcesses)
+    {
+        shell = _activityTracker.GetSnapshot();
+        processCountAvailable = _conPty.TryGetActiveProcessCount(
+            out activeProcesses);
+        if (processCountAvailable && activeProcesses > 1)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.ActiveProcesses,
+                (int)Math.Min(int.MaxValue, activeProcesses - 1));
+        }
+
+        if (shell.ActiveShellJobs > 0)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.ActiveShellJobs,
+                shell.ActiveShellJobs);
+        }
+
+        if (shell.PendingSubmissions > 0)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.ActiveCommand,
+                (int)Math.Min(int.MaxValue, shell.PendingSubmissions));
+        }
+
+        if (shell.HasUnresolvedInput)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.UnknownInput);
+        }
+
+        if (!_conPty.PromptTrackingEnabled || !shell.PromptObserved)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.PromptUnavailable);
+        }
+
+        if (!processCountAvailable || activeProcesses != 1)
+        {
+            return new TerminalCloseAssessment(
+                TerminalCloseStatus.ProcessTrackingUnavailable);
+        }
+
+        return new TerminalCloseAssessment(TerminalCloseStatus.Idle);
+    }
+
+    private void CompleteInputDrainIfReady()
+    {
+        if (!_acceptingInputs
+            && !_inputWriteActive
+            && _ordinaryInputs.Count == 0
+            && _interrupts.Count == 0)
+        {
+            _inputDrainCompletion?.TrySetResult();
+        }
+    }
+
+    private static Task SendOutputAsync(
+        PipeStream outputPipe,
+        byte[] output,
+        CancellationToken cancellationToken)
+    {
+        return IpcProtocol.WriteAsync(
+            outputPipe,
+            new IpcMessage(IpcMessageType.Output, output),
+            cancellationToken);
     }
 
     private Task SendInputResultAsync(
