@@ -11,11 +11,9 @@ namespace TrayTerminal.App.Controls;
 
 public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDisposable
 {
-    private NewTerminalRequest _request;
     private readonly TerminalSession _session;
     private readonly TerminalView _terminalView;
     private readonly TextBlock _status;
-    private readonly System.Windows.Controls.Button _recreateButton;
     private bool _disposed;
 
     public TerminalPage(
@@ -26,7 +24,6 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         TerminalAuthorityHost terminalAuthorityHost,
         int fontSize)
     {
-        _request = request;
         Title = request.Title;
         TerminalFontSize = fontSize;
         _session = new TerminalSession(
@@ -47,14 +44,6 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             FontSize = 12,
             Padding = new Thickness(10, 4, 10, 4)
         };
-        _recreateButton = new System.Windows.Controls.Button
-        {
-            Content = "重建终端",
-            Margin = new Thickness(8, 2, 8, 2),
-            Padding = new Thickness(10, 2, 10, 2),
-            Visibility = Visibility.Collapsed
-        };
-        _recreateButton.Click += (_, _) => RecreateRequested?.Invoke(this, EventArgs.Empty);
 
         var border = new Border
         {
@@ -64,14 +53,9 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             Child = _terminalView
         };
 
-        var statusBar = new DockPanel();
-        DockPanel.SetDock(_recreateButton, Dock.Right);
-        statusBar.Children.Add(_recreateButton);
-        statusBar.Children.Add(_status);
-
         var root = new DockPanel();
-        DockPanel.SetDock(statusBar, Dock.Bottom);
-        root.Children.Add(statusBar);
+        DockPanel.SetDock(_status, Dock.Bottom);
+        root.Children.Add(_status);
         root.Children.Add(border);
         Content = root;
 
@@ -86,17 +70,19 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         _session.Failed += (_, message) => Dispatcher.BeginInvoke(() =>
         {
             _status.Text = message;
-            _recreateButton.Visibility = Visibility.Visible;
+        });
+        _session.AuthorityDegraded += (_, reason) => Dispatcher.BeginInvoke(() =>
+        {
+            _status.Text = $"{(_session.IsAdministrator ? "管理员终端" : "终端")}运行中；"
+                + $"状态同步已停用，远程访问不可用（{reason}）";
         });
         _terminalView.OutputPumpStopped += () => Dispatcher.BeginInvoke(() =>
         {
-            _status.Text = "终端输出已中断，建议重建标签页";
+            _status.Text = "终端显示已中断，终端进程可能仍在运行";
         });
     }
 
     public event EventHandler<int>? Exited;
-
-    public event EventHandler? RecreateRequested;
 
     public string Title { get; private set; }
 
@@ -110,16 +96,16 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
 
     public TerminalSession Session => _session;
 
-    public NewTerminalRequest Request => _request;
-
     public async Task StartAsync()
     {
         await _terminalView.InitializeAsync();
         var size = _session.CurrentSize;
         await _session.StartAsync(size.Columns, size.Rows);
-        if (_session.IsRunning)
+        if (_session.IsRunning && !_session.IsAuthorityDegraded)
         {
-            _status.Text = _session.IsAdministrator ? "管理员终端运行中" : "终端运行中";
+            _status.Text = _session.ElevationDeclined
+                ? "已取消管理员授权，已改为普通权限终端运行"
+                : _session.IsAdministrator ? "管理员终端运行中" : "终端运行中";
         }
     }
 
@@ -132,7 +118,6 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     public void SetTitle(string title)
     {
         Title = title;
-        _request = _request with { Title = title };
     }
 
     public async Task<BackgroundImageUpdateResult> SetBackgroundImageAsync(

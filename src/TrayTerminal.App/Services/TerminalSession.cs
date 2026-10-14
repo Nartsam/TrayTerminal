@@ -25,6 +25,9 @@ public sealed class TerminalSession : IAsyncDisposable
     private static readonly TimeSpan OperationAckTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan CloseCheckTimeout = TimeSpan.FromSeconds(1);
     private const int MaxMissedHeartbeats = 3;
+    private const int ErrorCancelled = 1223;
+    private static readonly byte[] DegradedRecoveryNotice = Encoding.UTF8.GetBytes(
+        "\u001b[0m\u001b[33m[TrayTerminal] 状态同步已停用，显示已重置；终端进程仍在运行。\u001b[0m\r\n");
 
     private readonly NewTerminalRequest _request;
     private readonly PortablePaths _paths;
@@ -42,6 +45,10 @@ public sealed class TerminalSession : IAsyncDisposable
     private readonly object _sizeApplyLock = new();
     private readonly object _authorityRemovalLock = new();
     private readonly object _closeCheckLock = new();
+    // Serializes event sequencing, delivery to local replicas, and the switch to
+    // degraded mode, so a recovering replica can never observe a sequence whose
+    // delivery has not been queued yet.
+    private readonly object _commitLock = new();
     private readonly TaskCompletionSource _completion = new(
         TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<bool> _outputCompleted = new(
@@ -76,6 +83,8 @@ public sealed class TerminalSession : IAsyncDisposable
     private TaskCompletionSource? _interruptDrainCompletion;
     private long _pendingCloseCheckRequestId;
     private int _inputFrozen;
+    private int _authorityDegraded;
+    private long _degradedSequence;
 
     public TerminalSession(
         NewTerminalRequest request,
@@ -100,9 +109,17 @@ public sealed class TerminalSession : IAsyncDisposable
 
     public event EventHandler? Terminated;
 
+    /// <summary>
+    /// Raised once when the authority can no longer prove this terminal's state.
+    /// The terminal keeps running; only remote replicas are disconnected.
+    /// </summary>
+    public event EventHandler<string>? AuthorityDegraded;
+
     public bool IsRunning { get; private set; }
 
     public bool IsFailed => Volatile.Read(ref _failed) != 0;
+
+    public bool IsAuthorityDegraded => Volatile.Read(ref _authorityDegraded) != 0;
 
     public string? FailureReason { get; private set; }
 
@@ -110,7 +127,13 @@ public sealed class TerminalSession : IAsyncDisposable
 
     public bool OutputComplete { get; private set; }
 
-    public bool IsAdministrator => _request.RunAsAdministrator;
+    public bool IsAdministrator => _request.RunAsAdministrator && !ElevationDeclined;
+
+    /// <summary>
+    /// True when an administrator terminal fell back to normal privileges
+    /// because the user declined the UAC prompt.
+    /// </summary>
+    public bool ElevationDeclined { get; private set; }
 
     public Task Completion => _completion.Task;
 
@@ -175,7 +198,6 @@ public sealed class TerminalSession : IAsyncDisposable
             1,
             PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous);
-        _cts = new CancellationTokenSource(ConnectTimeout);
 
         try
         {
@@ -185,6 +207,9 @@ public sealed class TerminalSession : IAsyncDisposable
                 nonce,
                 initialSize.Columns,
                 initialSize.Rows);
+            // Start the deadline only now: time spent answering the UAC prompt
+            // must not count toward the Host connection timeout.
+            _cts = new CancellationTokenSource(ConnectTimeout);
             await Task.WhenAll(
                 _outputPipe.WaitForConnectionAsync(_cts.Token),
                 _controlPipe.WaitForConnectionAsync(_cts.Token));
@@ -217,12 +242,6 @@ public sealed class TerminalSession : IAsyncDisposable
             await CleanupAfterFailedStartAsync(killHost: true);
             CompleteTermination();
             throw new TimeoutException("Timed out waiting for terminal host to connect.");
-        }
-        catch (Win32Exception exception) when (exception.NativeErrorCode == 1223)
-        {
-            Failed?.Invoke(this, "已取消管理员授权");
-            await CleanupAfterFailedStartAsync(killHost: false);
-            CompleteTermination();
         }
         catch
         {
@@ -709,11 +728,22 @@ public sealed class TerminalSession : IAsyncDisposable
     public bool HasRecoverableState => _stateHub.HasRecoverableState;
 
     public AuthorityAvailability AuthorityAvailability =>
-        Volatile.Read(ref _authorityCreated) == 0
+        IsAuthorityDegraded || Volatile.Read(ref _authorityCreated) == 0
             ? AuthorityAvailability.Failed
             : _authority.GetSessionAvailability(_authoritySessionId);
 
-    public long LatestSequence => _stateHub.LatestSequence;
+    public long LatestSequence
+    {
+        get
+        {
+            lock (_commitLock)
+            {
+                return IsAuthorityDegraded
+                    ? _degradedSequence
+                    : _stateHub.LatestSequence;
+            }
+        }
+    }
 
     public Guid RegisterTerminalClient(
         TerminalClientKind kind,
@@ -820,9 +850,28 @@ public sealed class TerminalSession : IAsyncDisposable
     {
         lock (_sizeLock)
         {
-            if (_stateHub.TryGetRecoveryState(out state)
+            if (!IsAuthorityDegraded
+                && _stateHub.TryGetRecoveryState(out state)
                 && state is not null)
             {
+                return true;
+            }
+
+            if (IsAuthorityDegraded)
+            {
+                // Without an authority there is no provable history. Restart the
+                // replica from a blank screen at the latest delivered sequence so
+                // it keeps following live output.
+                lock (_commitLock)
+                {
+                    state = new TerminalInitialState(
+                        new TerminalSnapshot(
+                            _degradedSequence,
+                            DegradedRecoveryNotice,
+                            _sizeCoordinator.CurrentSize),
+                        [],
+                        _degradedSequence);
+                }
                 return true;
             }
 
@@ -1057,24 +1106,50 @@ public sealed class TerminalSession : IAsyncDisposable
             nonce,
             columns,
             rows);
+        if (_request.RunAsAdministrator)
+        {
+            try
+            {
+                _hostProcess = Process.Start(CreateHostStartInfo(args, elevated: true))
+                    ?? throw new InvalidOperationException("Unable to start terminal host.");
+                _logger.Info(
+                    $"Started elevated host process {_hostProcess.Id} for {_request.Profile.DisplayName}.");
+                return;
+            }
+            catch (Win32Exception exception) when (exception.NativeErrorCode == ErrorCancelled)
+            {
+                // Declining UAC should still give the user a working terminal,
+                // just without elevation, instead of an empty tab.
+                ElevationDeclined = true;
+                _logger.Info(
+                    $"Administrator elevation for '{_request.Title}' was declined; "
+                    + "starting it with normal privileges.");
+            }
+        }
+
+        _hostProcess = Process.Start(CreateHostStartInfo(args, elevated: false))
+            ?? throw new InvalidOperationException("Unable to start terminal host.");
+        _logger.Info(
+            $"Started host process {_hostProcess.Id} for {_request.Profile.DisplayName}.");
+    }
+
+    private ProcessStartInfo CreateHostStartInfo(string args, bool elevated)
+    {
         var startInfo = new ProcessStartInfo
         {
             FileName = _paths.HostExecutablePath,
             Arguments = args,
             WorkingDirectory = _paths.BaseDirectory,
-            UseShellExecute = _request.RunAsAdministrator,
+            UseShellExecute = elevated,
             CreateNoWindow = true
         };
 
-        if (_request.RunAsAdministrator)
+        if (elevated)
         {
             startInfo.Verb = "runas";
         }
 
-        _hostProcess = Process.Start(startInfo)
-            ?? throw new InvalidOperationException("Unable to start terminal host.");
-        _logger.Info(
-            $"Started host process {_hostProcess.Id} for {_request.Profile.DisplayName}.");
+        return startInfo;
     }
 
     private string BuildHostArguments(
@@ -1172,38 +1247,16 @@ public sealed class TerminalSession : IAsyncDisposable
         {
             if (!_disposed)
             {
-                FailSession($"终端权威输出中断：{exception.Message}", exception);
+                FailSession($"终端输出连接中断：{exception.Message}", exception);
             }
         }
     }
 
-    private async Task CommitAuthorityOutputAsync(
+    private Task CommitAuthorityOutputAsync(
         byte[] data,
         CancellationToken cancellationToken)
     {
-        var sequence = _stateHub.LatestSequence + 1;
-        var commit = await _authority.ProcessOutputAsync(
-            _authoritySessionId,
-            sequence,
-            data,
-            cancellationToken);
-        if (!TryApplyAuthorityCheckpoint(commit)
-            || !_stateHub.TryCommitAuthorityEvent(
-                commit.Sequence,
-                data,
-                resize: null,
-                commit.SnapshotSequence == commit.Sequence
-                    ? commit.Snapshot
-                    : null,
-                commit.Size,
-                out var output)
-            || output is null)
-        {
-            throw new InvalidDataException(
-                "Authority output could not be committed atomically.");
-        }
-
-        InvokeOutput(output);
+        return CommitTerminalEventAsync(data, resize: null, cancellationToken);
     }
 
     private async Task CommitAuthorityResizeAsync(
@@ -1212,29 +1265,7 @@ public sealed class TerminalSession : IAsyncDisposable
     {
         var (requestId, columns, rows) = IpcProtocol.DecodeResizeRequest(payload);
         var size = TerminalSize.Clamp(columns, rows);
-        var sequence = _stateHub.LatestSequence + 1;
-        var commit = await _authority.ResizeAsync(
-            _authoritySessionId,
-            sequence,
-            size,
-            cancellationToken);
-        if (!TryApplyAuthorityCheckpoint(commit)
-            || !_stateHub.TryCommitAuthorityEvent(
-                commit.Sequence,
-                [],
-                size,
-                commit.SnapshotSequence == commit.Sequence
-                    ? commit.Snapshot
-                    : null,
-                size,
-                out var output)
-            || output is null)
-        {
-            throw new InvalidDataException(
-                "Authority resize could not be committed atomically.");
-        }
-
-        InvokeOutput(output);
+        await CommitTerminalEventAsync([], size, cancellationToken);
         lock (_resizeRequestLock)
         {
             if (_pendingResizes.TryGetValue(requestId, out var source))
@@ -1242,6 +1273,156 @@ public sealed class TerminalSession : IAsyncDisposable
                 source.TrySetResult(true);
             }
         }
+    }
+
+    private async Task CommitTerminalEventAsync(
+        byte[] data,
+        TerminalSize? resize,
+        CancellationToken cancellationToken)
+    {
+        TerminalAuthorityCommit? commit = null;
+        Exception? authorityFailure = null;
+        if (!IsAuthorityDegraded)
+        {
+            // Only this output loop commits events, so the hub sequence cannot
+            // advance while the authority processes this one.
+            var sequence = _stateHub.LatestSequence + 1;
+            try
+            {
+                commit = resize is { } size
+                    ? await _authority.ResizeAsync(
+                        _authoritySessionId,
+                        sequence,
+                        size,
+                        cancellationToken)
+                    : await _authority.ProcessOutputAsync(
+                        _authoritySessionId,
+                        sequence,
+                        data,
+                        cancellationToken);
+            }
+            catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                authorityFailure = exception;
+            }
+        }
+
+        string? degradedReason = null;
+        lock (_commitLock)
+        {
+            if (!IsAuthorityDegraded)
+            {
+                if (commit is not null
+                    && TryApplyAuthorityCheckpoint(commit)
+                    && _stateHub.TryCommitAuthorityEvent(
+                        commit.Sequence,
+                        data,
+                        resize,
+                        commit.SnapshotSequence == commit.Sequence
+                            ? commit.Snapshot
+                            : null,
+                        resize ?? commit.Size,
+                        out var output)
+                    && output is not null)
+                {
+                    InvokeOutput(output);
+                    return;
+                }
+
+                var reason = DescribeAuthorityFailure(authorityFailure);
+                if (TryEnterDegradedModeLocked(reason))
+                {
+                    degradedReason = reason;
+                }
+            }
+
+            // A state-sync failure must never cost the user's running task.
+            // Local replicas keep receiving ordered output; it just can no longer
+            // be proven to remote browsers.
+            InvokeOutput(new TerminalOutput(++_degradedSequence, data, resize));
+        }
+
+        if (degradedReason is not null)
+        {
+            OnAuthorityDegraded(degradedReason, authorityFailure);
+        }
+    }
+
+    private void DegradeAuthority(string reason, Exception? exception)
+    {
+        bool degraded;
+        lock (_commitLock)
+        {
+            degraded = TryEnterDegradedModeLocked(reason);
+        }
+
+        if (degraded)
+        {
+            OnAuthorityDegraded(reason, exception);
+        }
+    }
+
+    private bool TryEnterDegradedModeLocked(string reason)
+    {
+        if (IsAuthorityDegraded)
+        {
+            return false;
+        }
+
+        // Continue numbering after the last authority-committed event, and end
+        // every remote subscription exactly at that boundary.
+        _degradedSequence = _stateHub.LatestSequence;
+        Volatile.Write(ref _authorityDegraded, 1);
+        _stateHub.Fail(new TerminalStateUnavailableException(reason));
+        return true;
+    }
+
+    private void OnAuthorityDegraded(string reason, Exception? exception)
+    {
+        StartAuthorityRemoval();
+        if (_disposed || IsFailed || _completion.Task.IsCompleted)
+        {
+            return;
+        }
+
+        _logger.Error(
+            exception ?? new TerminalAuthorityException(reason),
+            $"Terminal state sync for '{_request.Title}' was disabled; "
+            + $"the terminal keeps running without remote access: {reason}");
+        AuthorityDegraded?.Invoke(this, reason);
+    }
+
+    private static string DescribeAuthorityFailure(Exception? exception)
+    {
+        return exception switch
+        {
+            null => "终端状态提交被拒绝",
+            TimeoutException => "状态同步超时",
+            TerminalAuthorityException authority =>
+                DescribeAuthorityFailure(authority.Message),
+            _ => $"状态同步异常（{exception.Message}）"
+        };
+    }
+
+    private static string DescribeAuthorityFailure(string reason)
+    {
+        if (reason.StartsWith("stateAmplificationUnsupported", StringComparison.Ordinal))
+        {
+            return "输出包含状态同步不支持的控制序列";
+        }
+
+        if (reason.StartsWith("stateTooLarge", StringComparison.Ordinal))
+        {
+            return "终端状态超过 8 MiB 同步上限";
+        }
+
+        if (reason.StartsWith("authorityTimeout", StringComparison.Ordinal)
+            || reason.StartsWith("authorityRecoveryTimeout", StringComparison.Ordinal))
+        {
+            return "状态同步超时";
+        }
+
+        return $"状态同步异常（{reason}）";
     }
 
     private bool TryApplyAuthorityCheckpoint(TerminalAuthorityCommit commit)
@@ -1503,8 +1684,8 @@ public sealed class TerminalSession : IAsyncDisposable
     {
         if (args.SessionId == _authoritySessionId)
         {
-            FailSession(
-                $"终端权威状态不可恢复：{args.Reason}",
+            DegradeAuthority(
+                DescribeAuthorityFailure(args.Reason),
                 new TerminalAuthorityException(args.Reason));
         }
     }

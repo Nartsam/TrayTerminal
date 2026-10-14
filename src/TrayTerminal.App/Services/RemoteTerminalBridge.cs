@@ -365,6 +365,13 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                     .AsTask();
                 await Task.WhenAny(outputReady, _termination.Task)
                     .ConfigureAwait(false);
+                if (outputReady.IsFaulted && !_termination.Task.IsCompleted)
+                {
+                    // Surface why the hub ended this subscription. Waiting on a
+                    // faulted reader again would complete immediately and spin.
+                    await outputReady.ConfigureAwait(false);
+                }
+
                 if (outputReady.IsCompletedSuccessfully
                     && !outputReady.Result
                     && !_termination.Task.IsCompleted)
@@ -383,6 +390,20 @@ public sealed class RemoteTerminalBridge : IAsyncDisposable
                 $"Remote client for '{_terminalName}' exceeded its bounded "
                 + "terminal output subscription; disconnecting it.");
             Abort();
+        }
+        catch (TerminalStateUnavailableException exception)
+            when (!_session.IsFailed)
+        {
+            // The terminal keeps running locally, but its state can no longer be
+            // proven. End this replica at its last continuous event so the page
+            // stops reconnecting instead of rendering an unverifiable screen.
+            _logger.Info(
+                $"Remote state sync for '{_terminalName}' was disabled; "
+                + $"disconnecting its client: {exception.Message}");
+            TryQueue(ServerMessage.StateUnavailable(
+                exception.Message,
+                delivery.LastContinuousSequence));
+            _outbound.Writer.TryComplete();
         }
         catch (Exception exception)
         {

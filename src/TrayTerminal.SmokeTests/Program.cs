@@ -1036,8 +1036,10 @@ internal static class Program
 
         try
         {
+            // Generous because the user's PowerShell profile runs before the
+            // first prompt (conda/VS dev-shell profiles take several seconds).
             using var timeout = new CancellationTokenSource(
-                TimeSpan.FromSeconds(20));
+                TimeSpan.FromSeconds(60));
             await Task.WhenAll(
                 outputPipe.WaitForConnectionAsync(timeout.Token),
                 controlPipe.WaitForConnectionAsync(timeout.Token));
@@ -1141,7 +1143,8 @@ internal static class Program
 
             TerminalCloseAssessment initial = default;
             long checkRequestId = 100;
-            for (var attempt = 0; attempt < 50; attempt++)
+            // Up to 30 seconds for the startup prompt; returns as soon as it is idle.
+            for (var attempt = 0; attempt < 300; attempt++)
             {
                 initial = await CheckAsync(checkRequestId);
                 await EndCheckAsync(checkRequestId++);

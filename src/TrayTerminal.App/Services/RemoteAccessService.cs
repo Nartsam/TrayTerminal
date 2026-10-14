@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
@@ -20,11 +21,15 @@ public sealed class RemoteAccessService : IAsyncDisposable
     private const int MaxHeaderBytes = 32 * 1024;
     private const int MaxConcurrentBridges = 32;
     private const int MaxConcurrentRequests = 64;
+    // Browsers percent-encode "/" inside a terminal name, so no encoded name can
+    // start with this multi-segment prefix. Names may therefore contain dots.
+    private const string AssetRoutePrefix = "/assets/";
     private static readonly TimeSpan WebSocketKeepAliveInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan WebSocketKeepAliveTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan HeaderReadTimeout = TimeSpan.FromSeconds(10);
     private static readonly byte[] HeaderTerminator = "\r\n\r\n"u8.ToArray();
+    private static readonly Lazy<HashSet<string>> LocalMachineNames = new(CreateLocalMachineNames);
 
     private readonly Func<string, TerminalPage?> _findTerminalPage;
     private readonly FileLogger _logger;
@@ -173,6 +178,16 @@ public sealed class RemoteAccessService : IAsyncDisposable
                     return;
                 }
 
+                if (target.Path.StartsWith(AssetRoutePrefix, StringComparison.Ordinal))
+                {
+                    await ServeAssetAsync(
+                        stream,
+                        assetsDir,
+                        target.Path[AssetRoutePrefix.Length..],
+                        ct).ConfigureAwait(false);
+                    return;
+                }
+
                 var path = NormalizePath(target.Path);
                 if (path is null)
                 {
@@ -187,12 +202,8 @@ public sealed class RemoteAccessService : IAsyncDisposable
                     return;
                 }
 
-                if (Path.HasExtension(path))
-                {
-                    await ServeAssetAsync(stream, assetsDir, path, ct).ConfigureAwait(false);
-                    return;
-                }
-
+                // Every other path is a terminal name, even one that looks like a
+                // file name such as "api.v2"; the page reads it from its own URL.
                 await ServeAssetAsync(stream, assetsDir, "remote-terminal.html", ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -220,6 +231,18 @@ public sealed class RemoteAccessService : IAsyncDisposable
         {
             await WriteTextResponseAsync(stream, 400, "Bad Request", "Invalid WebSocket request.", ct)
                 .ConfigureAwait(false);
+            return;
+        }
+
+        if (!IsTrustedWebSocketOrigin(request, out var originRejection))
+        {
+            _logger.Info(
+                $"Rejected remote WebSocket for terminal '{terminalName}': {originRejection}.");
+            await RejectWebSocketAsync(
+                stream,
+                key,
+                "originRejected",
+                ct).ConfigureAwait(false);
             return;
         }
 
@@ -483,6 +506,92 @@ public sealed class RemoteAccessService : IAsyncDisposable
             && upgrade.Equals("websocket", StringComparison.OrdinalIgnoreCase)
             && request.Headers.TryGetValue("Connection", out var connection)
             && connection.Contains("upgrade", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Accepts WebSocket upgrades only from TrayTerminal's own remote page.
+    /// Browsers let any website open a cross-origin WebSocket, but always attach
+    /// an Origin header that page scripts cannot forge, so a page from another
+    /// site is rejected even when no token is configured. The Host must also name
+    /// this machine directly; otherwise a DNS-rebinding domain that resolves to
+    /// this machine would look same-origin. Non-browser clients send no Origin
+    /// and cannot be driven by a web page, so they are still allowed.
+    /// </summary>
+    private static bool IsTrustedWebSocketOrigin(HttpRequest request, out string reason)
+    {
+        if (!request.Headers.TryGetValue("Host", out var hostHeader)
+            || hostHeader.Length == 0
+            || hostHeader.IndexOfAny(['/', '\\', '?', '#', '@', ' ', ',']) >= 0
+            || !Uri.TryCreate($"http://{hostHeader}/", UriKind.Absolute, out var host))
+        {
+            reason = "missing or malformed Host header";
+            return false;
+        }
+
+        if (!IsLocalHostName(host))
+        {
+            reason = $"Host '{Truncate(hostHeader)}' is not an IP address, localhost or this machine's name";
+            return false;
+        }
+
+        if (!request.Headers.TryGetValue("Origin", out var originHeader))
+        {
+            reason = string.Empty;
+            return true;
+        }
+
+        if (!Uri.TryCreate(originHeader, UriKind.Absolute, out var origin)
+            || origin.Scheme != Uri.UriSchemeHttp
+            || !string.Equals(origin.Host, host.Host, StringComparison.OrdinalIgnoreCase)
+            || origin.Port != host.Port)
+        {
+            reason = $"Origin '{Truncate(originHeader)}' does not match Host '{Truncate(hostHeader)}'";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
+    private static bool IsLocalHostName(Uri host)
+    {
+        return host.HostNameType is UriHostNameType.IPv4 or UriHostNameType.IPv6
+            || host.IsLoopback
+            || LocalMachineNames.Value.Contains(host.IdnHost.TrimEnd('.'));
+    }
+
+    private static HashSet<string> CreateLocalMachineNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string? name)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                names.Add(name);
+                names.Add(name + ".local");
+            }
+        }
+
+        Add(Environment.MachineName);
+        try
+        {
+            var properties = IPGlobalProperties.GetIPGlobalProperties();
+            Add(properties.HostName);
+            if (!string.IsNullOrWhiteSpace(properties.DomainName))
+            {
+                Add($"{properties.HostName}.{properties.DomainName}");
+            }
+        }
+        catch (NetworkInformationException)
+        {
+        }
+
+        return names;
+    }
+
+    private static string Truncate(string value)
+    {
+        return value.Length <= 200 ? value : value[..200] + "…";
     }
 
     private static bool TryValidateWebSocketRequest(HttpRequest request, out string key)

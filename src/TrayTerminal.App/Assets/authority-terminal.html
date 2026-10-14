@@ -57,6 +57,11 @@
       const serializeAddon = new SerializeAddon.SerializeAddon();
       try {
         terminal.loadAddon(serializeAddon);
+        // OSC 8 hyperlinks are presentation metadata that SerializeAddon never
+        // emits. Consuming them here keeps link data out of authority memory,
+        // while the link text itself is still parsed. Live replicas receive
+        // the raw stream and keep their links; restored ones show plain text.
+        terminal.parser.registerOscHandler(8, () => true);
         return {
           terminal,
           serializeAddon,
@@ -64,8 +69,6 @@
           parserState: 0,
           controlStringBytes: 0,
           controlStringAllowsBell: false,
-          controlStringIsOsc: false,
-          controlStringPrefix: '',
           utf8Remaining: 0,
           utf8Lead: 0,
           stateBudgetBytes: 0,
@@ -134,8 +137,6 @@
               engine.parserState = 2;
               engine.controlStringBytes = 0;
               engine.controlStringAllowsBell = value === 0x9d;
-              engine.controlStringIsOsc = value === 0x9d;
-              engine.controlStringPrefix = '';
             }
             break;
           case 1:
@@ -150,8 +151,6 @@
               engine.parserState = 2;
               engine.controlStringBytes = 0;
               engine.controlStringAllowsBell = value === 0x5d;
-              engine.controlStringIsOsc = value === 0x5d;
-              engine.controlStringPrefix = '';
             } else {
               engine.parserState = value === 0x1b ? 1 : 0;
             }
@@ -162,27 +161,9 @@
               engine.parserState = 0;
               engine.controlStringBytes = 0;
               engine.controlStringAllowsBell = false;
-              engine.controlStringIsOsc = false;
-              engine.controlStringPrefix = '';
             } else if (value === 0x1b) {
               engine.parserState = 3;
             } else {
-              if (engine.controlStringIsOsc && engine.controlStringPrefix !== null) {
-                if (engine.controlStringPrefix.length < 16) {
-                  engine.controlStringPrefix += String.fromCharCode(value);
-                }
-                if (value === 0x3b) {
-                  if (/^0*8;$/.test(engine.controlStringPrefix)) {
-                    // SerializeAddon can repeat an OSC 8 URI for many screen
-                    // rows, amplifying a small stored URI beyond its input size.
-                    // Reject hyperlinks before xterm can commit that state.
-                    throw new Error('stateAmplificationUnsupported');
-                  }
-                  engine.controlStringPrefix = null;
-                } else if (value < 0x30 || value > 0x39) {
-                  engine.controlStringPrefix = null;
-                }
-              }
               if (++engine.controlStringBytes > maxStateBytes) {
                 throw new Error('stateTooLarge');
               }
@@ -193,8 +174,6 @@
               engine.parserState = 0;
               engine.controlStringBytes = 0;
               engine.controlStringAllowsBell = false;
-              engine.controlStringIsOsc = false;
-              engine.controlStringPrefix = '';
             } else {
               engine.controlStringBytes += 2;
               if (engine.controlStringBytes > maxStateBytes) {

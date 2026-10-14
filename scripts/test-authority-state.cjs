@@ -385,6 +385,30 @@ async function main() {
   }
   assert.equal(failed, true, 'combining-cell growth was not bounded');
 
+  // ConPTY forwards OSC 8 hyperlinks from ordinary CLIs. They must keep the
+  // session alive and leave only the link text in the authority state.
+  assert.equal((await invoke({
+    type: 'create', sessionId: 'link', sequence: '0', cols: 80, rows: 24
+  })).ok, true);
+  const hyperlink = await invoke({
+    type: 'output',
+    sessionId: 'link',
+    sequence: '1',
+    data: Buffer.from(
+      '\x1b]8;id=1;https://example.com\x1b\\link-text\x1b]8;;\x1b\\ after\r\n' +
+      '\x1b]08;;https://example.com\x07zero-padded\x1b]8;;\x07\r\n').toString('base64'),
+    cols: 80,
+    rows: 24,
+    checkpoint: true
+  });
+  assert.equal(hyperlink.ok, true, `OSC 8 hyperlink failed the session: ${hyperlink.reason}`);
+  assert.equal(hyperlink.checkpointSafe, true, 'completed OSC 8 must permit a checkpoint');
+  const linkSnapshot = Buffer.from(hyperlink.snapshot, 'base64').toString('utf8');
+  assert.match(linkSnapshot, /link-text after/, 'OSC 8 link text was lost');
+  assert.match(linkSnapshot, /zero-padded/, 'zero-padded OSC 8 link text was lost');
+  assert.doesNotMatch(linkSnapshot, /example\.com|\x1b\]0*8;/, 'OSC 8 metadata leaked into authority state');
+  await invoke({ type: 'dispose', sessionId: 'link', sequence: '1' });
+
   assert.equal((await invoke({
     type: 'create', sessionId: 'amp', sequence: '0', cols: 80, rows: 24
   })).ok, true);

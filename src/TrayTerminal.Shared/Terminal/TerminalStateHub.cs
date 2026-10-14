@@ -471,3 +471,15 @@ public sealed class TerminalSubscriberTooSlowException : Exception
     {
     }
 }
+
+/// <summary>
+/// Ends state subscriptions when the authority can no longer prove the terminal
+/// state, while the terminal process itself keeps running.
+/// </summary>
+public sealed class TerminalStateUnavailableException : Exception
+{
+    public TerminalStateUnavailableException(string message)
+        : base(message)
+    {
+    }
+}

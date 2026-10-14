@@ -4,10 +4,13 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="./xterm/xterm.css" />
-  <script src="./xterm/xterm.js"></script>
-  <script src="./remote-protocol.js"></script>
-  <script src="./terminal-input-policy.js"></script>
+  <!-- Absolute /assets/ URLs keep every terminal-name URL, including names with
+       dots or encoded slashes, from being mistaken for a static file. -->
+  <link rel="icon" href="/assets/app.ico" />
+  <link rel="stylesheet" href="/assets/xterm/xterm.css" />
+  <script src="/assets/xterm/xterm.js"></script>
+  <script src="/assets/remote-protocol.js"></script>
+  <script src="/assets/terminal-input-policy.js"></script>
   <title>TrayTerminal Remote</title>
   <style>
     html, body {
@@ -582,13 +585,20 @@
             if (message.reason === 'stateUnavailable') {
               terminalStateUnavailable = true;
               showStatus(
-                '终端状态已无法安全恢复；请在主程序中重建该标签页。',
+                '该终端的状态无法同步到远程浏览器，远程连接已停止；请在主程序中查看该标签页。',
                 true,
                 'connection');
               socket.close(1000, 'Terminal state is unavailable');
             } else if (message.reason === 'temporaryUnavailable') {
               showStatus('终端状态暂不可用，正在等待自动重连…', false, 'connection');
               socket.close(1013, 'Terminal state is temporarily unavailable');
+            } else if (message.reason === 'originRejected') {
+              explicitRejection = true;
+              showStatus(
+                '连接已被拒绝：请直接用本机 IP 地址、localhost 或计算机名打开 http://<地址>:<端口>/<终端名称>。',
+                true,
+                'connection');
+              socket.close(1008, 'Connection rejected');
             } else if (message.reason === 'renamed' ||
                        message.reason === 'protocolMismatch' ||
                        message.reason === 'authRejected' ||
@@ -609,7 +619,11 @@
             }
             terminalStateUnavailable = true;
             showStatus(
-              '终端状态已无法安全恢复；请在主程序中手动重建该标签页。',
+              '远程同步已停止' +
+                (typeof message.reason === 'string' && message.reason
+                  ? '：' + message.reason
+                  : '') +
+                '。请在主程序中查看该标签页。',
               true,
               'connection');
             socket.close(1000, 'Terminal state unavailable');
