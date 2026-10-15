@@ -53,6 +53,11 @@
       background: transparent !important;
     }
 
+    /* Chromium can focus the scrollable viewport independently of xterm's input. */
+    .xterm-viewport:focus {
+      outline: none;
+    }
+
     /* Thin translucent scroll bar without arrow buttons. Setting scrollbar-color
        would make Chromium ignore these rules, so it is deliberately not used. */
     .xterm-viewport::-webkit-scrollbar,

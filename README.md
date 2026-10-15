@@ -426,6 +426,7 @@ publish\TrayTerminal\TrayTerminal.exe
 - 提示符标记格式为 `ESC ] 633 ; TrayTerminal ; <令牌> ; <PowerShell Job 数> [; <当前目录>] ESC \`。CMD 通过子进程环境里的 `PROMPT`（`$P`）、PowerShell 通过包装后的 `prompt` 函数（`CurrentFileSystemLocation.ProviderPath`）输出目录；目录只能用这种由 Shell 自己在提示符处上报的方式获取，因为 PowerShell 的 `Set-Location` 不会改变进程工作目录，读取进程信息拿到的是错的。Host 只在目录变化时通过 control 管发送 `WorkingDirectory` 消息，App 保存在 `TerminalSession.CurrentWorkingDirectory`。超过 4096 字节或含控制字符的目录段不视为标记，原样作为输出透传。
 - 终端底色 `#0C0E11` 同时写在 `App.xaml` 的 `TerminalBackgroundBrush`、`terminal.html` 的 `html` 背景和 `TerminalView` 的 WebView2 `DefaultBackgroundColor` 三处，修改时要一起改，否则选中标签、终端和加载瞬间的底色会对不上。
 - `terminal.html` 的滚动条只用 `::-webkit-scrollbar` 设置样式；Chromium 在元素设置了 `scrollbar-color`/`scrollbar-width` 后会忽略这些规则，所以本地页面不要加这两个属性（远程页面只在不支持 `::-webkit-scrollbar` 的浏览器里使用它们）。`estimateSize` 计算列数时会减去滚动条宽度，避免最后一列被滚动条遮住。
+- `terminal.html` 单独为 `.xterm-viewport:focus` 设置 `outline: none`，避免 Chromium 将内部滚动区域聚焦时绘制黑白轮廓。xterm 自带的焦点样式只覆盖外层 `.xterm`；这项覆盖保留在应用页面中，不修改第三方 `xterm.css`，也不改变输入焦点或滚动行为。
 - `App.xaml` 里的 TextBox 模板不要把 `Padding` 绑定到 `PART_ContentHost` 的 `Margin`：TextBox 会自己应用 `Padding` 和滚动条可见性，绑定后边距会加倍。
 - `TerminalTabControl` 重写了 `OnKeyDown`，不处理 Home/End：WebView2 会把这两个键作为加速键转发给 WPF，`TabControl` 默认用它们跳到首/末标签并吞掉按键。拖放依赖控件自身的 `AllowDrop = true`：标签项的逻辑父级是 `TabControl` 而不是模板里的标题行，`AllowDrop` 沿逻辑树继承，只给标题行设置会导致标签上收不到任何拖放事件。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
