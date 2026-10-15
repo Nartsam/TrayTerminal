@@ -1,6 +1,7 @@
 <Window x:Class="TrayTerminal.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="clr-namespace:TrayTerminal.App.Controls"
         Title="TrayTerminal"
         Width="1100"
         Height="720"
@@ -67,10 +68,10 @@
             </Grid>
         </Border>
 
-        <TabControl x:Name="Tabs"
-                    Background="{StaticResource WindowBackgroundBrush}"
-                    BorderThickness="0"
-                    Padding="8" />
+        <controls:TerminalTabControl x:Name="Tabs"
+                                     Background="{StaticResource WindowBackgroundBrush}"
+                                     BorderThickness="0"
+                                     Padding="8" />
     </DockPanel>
     </Grid>
 </Window>

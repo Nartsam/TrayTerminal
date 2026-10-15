@@ -8,9 +8,13 @@ public partial class RenameTabDialog : Window
     {
         InitializeComponent();
         TitleTextBox.Text = currentTitle;
-        TitleTextBox.SelectAll();
-        TitleTextBox.Focus();
+        TextBoxSelection.SelectAllOnDoubleClick(TitleTextBox);
         OkButton.Click += (_, _) => Confirm();
+        Loaded += (_, _) =>
+        {
+            TitleTextBox.Focus();
+            TitleTextBox.SelectAll();
+        };
     }
 
     public string? NewTitle { get; private set; }

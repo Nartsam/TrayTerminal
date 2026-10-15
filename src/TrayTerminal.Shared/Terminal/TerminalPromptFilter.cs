@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace TrayTerminal.Shared.Terminal;
@@ -7,14 +8,22 @@ public sealed class TerminalPromptFilter
 {
     private const string MarkerName = "TrayTerminal";
     private const int MaxJobCountDigits = 10;
+    // Long enough for deep Windows paths. Anything larger is not a marker this
+    // program emitted and is passed through as ordinary output.
+    private const int MaxWorkingDirectoryBytes = 4096;
     private readonly byte[] _prefix;
     private readonly Action<int> _promptObserved;
+    private readonly Action<string>? _workingDirectoryObserved;
     private readonly List<byte> _candidate;
     private ParserState _state;
     private int _jobCount;
     private int _jobCountDigits;
+    private int _workingDirectoryStart;
 
-    public TerminalPromptFilter(string token, Action<int> promptObserved)
+    public TerminalPromptFilter(
+        string token,
+        Action<int> promptObserved,
+        Action<string>? workingDirectoryObserved = null)
     {
         if (string.IsNullOrEmpty(token)
             || token.Any(ch => !char.IsAsciiLetterOrDigit(ch)))
@@ -24,6 +33,7 @@ public sealed class TerminalPromptFilter
 
         _prefix = Encoding.ASCII.GetBytes($"\u001b]633;{MarkerName};{token};");
         _promptObserved = promptObserved;
+        _workingDirectoryObserved = workingDirectoryObserved;
         _candidate = new List<byte>(_prefix.Length + MaxJobCountDigits + 2);
     }
 
@@ -55,9 +65,13 @@ public sealed class TerminalPromptFilter
         return remaining;
     }
 
-    public static string BuildMarker(string token, int activeShellJobs)
+    public static string BuildMarker(
+        string token,
+        int activeShellJobs,
+        string? workingDirectory = null)
     {
-        return $"\u001b]633;{MarkerName};{token};{Math.Max(0, activeShellJobs)}\u001b\\";
+        var directory = workingDirectory is null ? string.Empty : ";" + workingDirectory;
+        return $"\u001b]633;{MarkerName};{token};{Math.Max(0, activeShellJobs)}{directory}\u001b\\";
     }
 
     private void ProcessByte(byte value, ArrayBufferWriter<byte> output)
@@ -114,6 +128,37 @@ public sealed class TerminalPromptFilter
                 return;
             }
 
+            // Shells append ";<current directory>" after the job count.
+            if (value == (byte)';' && _jobCountDigits > 0)
+            {
+                _candidate.Add(value);
+                _workingDirectoryStart = _candidate.Count;
+                _state = ParserState.WorkingDirectory;
+                return;
+            }
+
+            FlushCandidate(output);
+            ProcessByte(value, output);
+            return;
+        }
+
+        if (_state == ParserState.WorkingDirectory)
+        {
+            if (value == 0x1b)
+            {
+                _candidate.Add(value);
+                _state = ParserState.Terminator;
+                return;
+            }
+
+            // Windows paths never contain C0 controls.
+            if (value >= 0x20
+                && _candidate.Count - _workingDirectoryStart < MaxWorkingDirectoryBytes)
+            {
+                _candidate.Add(value);
+                return;
+            }
+
             FlushCandidate(output);
             ProcessByte(value, output);
             return;
@@ -122,8 +167,25 @@ public sealed class TerminalPromptFilter
         if (value == (byte)'\\')
         {
             var activeShellJobs = _jobCount;
+            string? workingDirectory = null;
+            if (_workingDirectoryStart > 0)
+            {
+                // The candidate ends with ESC; the directory lies between ';' and it.
+                var length = _candidate.Count - 1 - _workingDirectoryStart;
+                if (length > 0)
+                {
+                    workingDirectory = Encoding.UTF8.GetString(
+                        CollectionsMarshal.AsSpan(_candidate)
+                            .Slice(_workingDirectoryStart, length));
+                }
+            }
+
             ResetCandidate();
             _promptObserved(activeShellJobs);
+            if (workingDirectory is not null)
+            {
+                _workingDirectoryObserved?.Invoke(workingDirectory);
+            }
             return;
         }
 
@@ -148,6 +210,7 @@ public sealed class TerminalPromptFilter
         _state = ParserState.Prefix;
         _jobCount = 0;
         _jobCountDigits = 0;
+        _workingDirectoryStart = 0;
     }
 
     private static void WriteByte(ArrayBufferWriter<byte> output, byte value)
@@ -160,6 +223,7 @@ public sealed class TerminalPromptFilter
     {
         Prefix,
         JobCount,
+        WorkingDirectory,
         Terminator
     }
 }

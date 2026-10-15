@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="新建标签"
-        Width="420"
-        Height="280"
+        Width="540"
+        SizeToContent="Height"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource WindowBackgroundBrush}"
@@ -24,11 +24,10 @@
                  Margin="0,0,0,14" />
 
         <TextBlock Grid.Row="2" Text="终端类型" Margin="0,0,0,6" />
-        <ComboBox x:Name="ProfileComboBox"
-                  Grid.Row="3"
-                  Height="40"
-                  VerticalAlignment="Top"
-                  DisplayMemberPath="DisplayName" />
+        <!-- One equal-width button per detected profile; filled in code. -->
+        <UniformGrid x:Name="ProfileButtons"
+                     Grid.Row="3"
+                     Rows="1" />
 
         <StackPanel Grid.Row="4" Margin="0,22,0,0">
             <CheckBox x:Name="AdminCheckBox"

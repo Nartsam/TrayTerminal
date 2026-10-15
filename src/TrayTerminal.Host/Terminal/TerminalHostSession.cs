@@ -27,6 +27,9 @@ internal sealed class TerminalHostSession : IDisposable
     private bool _acceptingInputs = true;
     private bool _inputWriteActive;
     private long? _closeCheckRequestId;
+    // Both fields are touched only by the output pump, which runs the filter.
+    private string? _observedWorkingDirectory;
+    private string? _reportedWorkingDirectory;
 
     private TerminalHostSession(
         ConPtySession conPty,
@@ -39,7 +42,8 @@ internal sealed class TerminalHostSession : IDisposable
         {
             _promptFilter = new TerminalPromptFilter(
                 markerToken,
-                _activityTracker.RecordPrompt);
+                _activityTracker.RecordPrompt,
+                directory => _observedWorkingDirectory = directory);
         }
     }
 
@@ -66,7 +70,10 @@ internal sealed class TerminalHostSession : IDisposable
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         using var outputCts = CancellationTokenSource.CreateLinkedTokenSource(
             linkedCts.Token);
-        var outputTask = PumpTerminalEventsAsync(outputPipe, outputCts.Token);
+        var outputTask = PumpTerminalEventsAsync(
+            outputPipe,
+            controlPipe,
+            outputCts.Token);
         var controlTask = PumpControlAsync(controlPipe, linkedCts.Token);
         var inputTask = PumpConPtyInputAsync(controlPipe, linkedCts.Token);
         var exitTask = _conPty.WaitForExitAsync(linkedCts.Token);
@@ -178,6 +185,7 @@ internal sealed class TerminalHostSession : IDisposable
 
     private async Task PumpTerminalEventsAsync(
         PipeStream outputPipe,
+        PipeStream controlPipe,
         CancellationToken cancellationToken)
     {
         var buffer = new byte[8192];
@@ -225,6 +233,22 @@ internal sealed class TerminalHostSession : IDisposable
                     await SendOutputAsync(
                         outputPipe,
                         output,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                // Every prompt repeats the directory; forward only changes.
+                if (_observedWorkingDirectory is { } directory
+                    && !string.Equals(
+                        directory,
+                        _reportedWorkingDirectory,
+                        StringComparison.Ordinal))
+                {
+                    _reportedWorkingDirectory = directory;
+                    await SendControlAsync(
+                        controlPipe,
+                        new IpcMessage(
+                            IpcMessageType.WorkingDirectory,
+                            IpcProtocol.EncodeText(directory)),
                         cancellationToken).ConfigureAwait(false);
                 }
                 continue;

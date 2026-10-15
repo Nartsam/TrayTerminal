@@ -4,11 +4,15 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 
 ## 软件功能
 
-- 多标签终端：启动后默认创建一个终端，也可以点击左上角”添加新终端”创建更多标签。
+- 多标签终端：启动后默认创建一个终端，也可以点击左上角”添加新终端”创建更多标签。新建对话框打开时“标题”已全选，可直接输入新名称；双击输入框也会全选。终端类型以一排按钮呈现，默认选中本次运行中上一次创建时选的类型（重启后回到第一个），“以管理员模式启动”每次默认不勾选。
 - 终端类型：默认检测 CMD、Windows PowerShell；如果 `pwsh.exe` 在 `PATH` 中，会自动加入 PowerShell 7。
 - 管理员终端：新建标签时勾选”以管理员模式启动”，会通过 UAC 启动提权的 Host 进程。如果在 UAC 弹窗中选择“否”，该标签会改为以普通权限启动，并在标签左下角状态栏提示；`config.txt` 中的 `run`/`fill` 预设仍会照常应用到这个普通权限终端。
-- 标签排序：拖动顶部标签可以调整终端在界面中的显示顺序。
-- 标签重命名：双击标签标题可以修改名称。
+- 标签栏：所有标签固定显示在一行。放不下时，可用鼠标滚轮（包括触控板横向滑动）或两侧箭头按钮左右滚动，每次点击箭头会完整露出下一个被遮住的标签；右端“全部标签”下拉按钮列出所有标签，点击即可切换。这些按钮只在标签放不下时出现。选中的标签会自动滚动到可见位置。
+- 标签排序：拖动顶部标签可以调整顺序。拖动时被拖的标签半透明，绿色竖线指示松手后的落点；拖到标签栏两端附近会自动滚动，拖出标签栏则不会移动。松手后，被移动的标签会短暂高亮。
+- 标签右键菜单：
+  - “重命名”：与双击标签标题相同，修改标签名称。
+  - “打开所在目录”：在资源管理器中打开该终端最近一次显示提示符时所在的目录。CMD 和 PowerShell 执行 `cd` 后会自动跟随；PowerShell 切到注册表等非文件系统位置时，保留上一个文件系统目录；还没出现过提示符时使用启动目录；目录已被删除时打开最近一个仍存在的上级目录，并在状态栏说明。在终端里进入 SSH、WSL、Python 或嵌套 Shell 后，其内部的目录变化无法感知。
+- 快捷键：终端内的 Home/End（包括 Shift、Ctrl 组合）交给终端，用于行首和行尾跳转；Ctrl+Tab、Ctrl+Shift+Tab 切换到下一个或上一个标签。
 - 标签背景：应用会自动创建 `Data\Backgrounds` 文件夹。放入与标签名相同的 `.png`、`.jpg`、`.jpeg` 图片后，创建或重命名标签时会自动匹配为当前终端背景。匹配顺序为 `.png`、`.jpg`、`.jpeg`；旧的程序根目录 `Backgrounds` 不再作为同名图片的自动匹配目录。
 - 壁纸重载：右上角“重载壁纸”按钮会重新读取当前标签在 `config.txt` 中的 `bg`、`cover` 和 `Data\Backgrounds` 同名图片设置，不会重新应用 `cd`、`run` 或 `fill`。找不到目标图片时会清除当前壁纸；读取失败时会保留原壁纸。
 - 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令、背景图片和背景遮罩；创建、关闭、重命名标签等相关操作前会重新加载配置。
@@ -228,7 +232,7 @@ src/
 
 - `TrayTerminal.App.csproj`：WPF 主程序项目，引用 WebView2、Shared，并在构建后复制 Host 输出。
 - `app.manifest`：应用清单，声明 Windows 桌面程序运行信息。
-- `App.xaml`：全局 WPF 资源和暗色控件样式。
+- `App.xaml`：全局 WPF 资源和暗色控件样式，包括单行标签栏模板、右键/下拉菜单和新建对话框的类型按钮。
 - `App.xaml.cs`：应用启动入口，初始化便携目录、日志、当前工作目录和主窗口。
 - `MainWindow.xaml`：主窗口布局，包含顶部工具栏、字号选择、隐藏按钮和标签容器。
 - `MainWindow.xaml.cs`：标签创建、重命名、配置重载、背景匹配、托盘行为、关闭确认等主界面逻辑。
@@ -239,6 +243,7 @@ src/
 - `Assets/xterm/xterm.css`、`xterm.js`：锁定的 `@xterm/xterm` 5.5.0 官方静态文件。
 - `Assets/xterm/addon-serialize.js`：锁定的 `@xterm/addon-serialize` 0.13.0，用于生成可恢复 VT 快照；具体来源、SHA-256 和 MIT 许可证见同目录 `THIRD-PARTY-NOTICES.md`、`LICENSE`。
 - `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、状态栏、TerminalSession 和 TerminalView。
+- `Controls/TerminalTabControl.cs`：单行可滚动的标签栏（模板在 `App.xaml`），包含滚轮/箭头滚动、全部标签列表、拖动排序的落点指示与边缘自动滚动，并把 Home/End 留给终端。
 - `Controls/TerminalView.cs`：WebView2 终端控件，负责加载 `terminal.html`，把前端输入/resize 转给后端，把后端输出写回 xterm.js。
 - `Dialogs/AppMessageDialog.xaml`：自定义消息对话框界面，替代系统 MessageBox（无系统音效）。
 - `Dialogs/AppMessageDialog.xaml.cs`：自定义消息对话框逻辑，支持确认、提示和多选操作。
@@ -247,6 +252,7 @@ src/
 - `Dialogs/NewTerminalRequest.cs`：创建终端所需的标题、Profile、管理员标志。
 - `Dialogs/RenameTabDialog.xaml`：重命名标签对话框界面。
 - `Dialogs/RenameTabDialog.xaml.cs`：重命名标签对话框逻辑和空名称校验。
+- `Dialogs/TextBoxSelection.cs`：让输入框双击时全选而不是只选一个词，新建和重命名对话框共用。
 - `Services/InitConfig.cs`：容错解析 `Data\Config\init.txt`，返回启动时需自动创建的标签列表。
 - `Services/TabPresetConfig.cs`：容错解析 `Data\Config\config.txt`，返回按标签名索引的预设配置。
 - `Services/RemoteSettings.cs`：读取 `settings.txt` 中的远程访问配置（端口、令牌、允许列表）。
@@ -278,14 +284,14 @@ src/
 - `Ipc/IpcProtocol.cs`：IPC 二进制帧协议的读写和常用载荷编码。
 - `Terminal/TerminalActivityTracker.cs`：有界的输入提交与提示符保守记账状态机。
 - `Terminal/TerminalCloseAssessment.cs`：关闭检查三态结果及具体原因模型。
-- `Terminal/TerminalPromptFilter.cs`：跨输出分块识别并剥离带随机令牌的 Shell 提示符标记。
+- `Terminal/TerminalPromptFilter.cs`：跨输出分块识别并剥离带随机令牌的 Shell 提示符标记，并解析标记中附带的当前目录。
 - `Terminal/TerminalProfile.cs`：终端 Profile 模型，描述显示名、可执行文件、启动参数和工作目录。
 - `Terminal/TerminalProfileCatalog.cs`：检测可用终端类型，当前支持 CMD、Windows PowerShell、PowerShell 7。
 
 ### `src/TrayTerminal.SmokeTests`
 
 - `TrayTerminal.SmokeTests.csproj`：轻量 smoke test 控制台项目。
-- `Program.cs`：测试便携路径边界、IPC 编解码、快照/事件连续性、恢复 generation barrier、远端同步门与共享操作上限、resize ownership，以及真实 Host/ConPTY 的输出背压、resize 顺序、ETX 写入、关闭期间输入拒绝、CMD 子进程和 PowerShell 进程内命令判定。
+- `Program.cs`：测试便携路径边界、IPC 编解码、快照/事件连续性、恢复 generation barrier、远端同步门与共享操作上限、resize ownership，以及真实 Host/ConPTY 的输出背压、resize 顺序、ETX 写入、关闭期间输入拒绝、CMD 子进程和 PowerShell 进程内命令判定，以及提示符标记中的当前目录解析与 CMD/PowerShell 切换到含中文和空格目录后的真实上报。
 - `TerminalSessionTests.cs`：直接验证会话合并 resize 请求时不丢失尺寸或 owner 变化、旧请求不覆盖新请求，以及大输入部分写入后被中断时的返回结果。
 
 ### 构建输出
@@ -412,6 +418,8 @@ publish\TrayTerminal\TrayTerminal.exe
 - App 与 Host 必须在同一目录下运行，主程序通过 `PortablePaths.HostExecutablePath` 查找 `TrayTerminal.Host.exe`。
 - `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。解析器以 section header（顶格、以 `:` 结尾的行）和缩进属性（`key: value`）为单位组织配置；section 内部的空行会被忽略，不会截断后续属性，但属性行必须保持缩进，否则会被误判为新 section。
 - App 与 Host 的 IPC 协议在 `TrayTerminal.Shared.Ipc`。每个会话有一条 Host→App 单向 output 管和一条双向 control 管，两条管都必须完成随机 nonce 握手；输出反压绝不能阻塞 input ACK、heartbeat、kill 或独立 interrupt。resize 由 control 管请求、Host 应用后在 output 管写入 boundary，因而与输出处于同一事件顺序。
+- 提示符标记格式为 `ESC ] 633 ; TrayTerminal ; <令牌> ; <PowerShell Job 数> [; <当前目录>] ESC \`。CMD 通过子进程环境里的 `PROMPT`（`$P`）、PowerShell 通过包装后的 `prompt` 函数（`CurrentFileSystemLocation.ProviderPath`）输出目录；目录只能用这种由 Shell 自己在提示符处上报的方式获取，因为 PowerShell 的 `Set-Location` 不会改变进程工作目录，读取进程信息拿到的是错的。Host 只在目录变化时通过 control 管发送 `WorkingDirectory` 消息，App 保存在 `TerminalSession.CurrentWorkingDirectory`。超过 4096 字节或含控制字符的目录段不视为标记，原样作为输出透传。
+- `TerminalTabControl` 重写了 `OnKeyDown`，不处理 Home/End：WebView2 会把这两个键作为加速键转发给 WPF，`TabControl` 默认用它们跳到首/末标签并吞掉按键。拖放依赖控件自身的 `AllowDrop = true`：标签项的逻辑父级是 `TabControl` 而不是模板里的标题行，`AllowDrop` 沿逻辑树继承，只给标题行设置会导致标签上收不到任何拖放事件。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
 - `ConPtySession.Start` 在每个 Win32 创建步骤之间都必须保持失败路径可释放：管道句柄、伪控制台、attribute list、Job Object 和 FileStream 的所有权转移不要简化，否则反复创建失败的终端可能泄漏句柄。
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。

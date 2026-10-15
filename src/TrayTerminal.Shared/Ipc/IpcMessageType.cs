@@ -18,5 +18,6 @@ public enum IpcMessageType : byte
     ResizeAck = 14,
     CloseCheck = 15,
     CloseCheckResult = 16,
-    CloseCheckEnd = 17
+    CloseCheckEnd = 17,
+    WorkingDirectory = 18
 }

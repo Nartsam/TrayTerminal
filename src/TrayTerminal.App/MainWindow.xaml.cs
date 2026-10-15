@@ -1,10 +1,8 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Media3D;
 using System.Windows.Threading;
 using TrayTerminal.App.Controls;
 using TrayTerminal.App.Dialogs;
@@ -17,12 +15,9 @@ using DrawingIcon = System.Drawing.Icon;
 using MediaBrush = System.Windows.Media.Brush;
 using NotifyIcon = System.Windows.Forms.NotifyIcon;
 using ToolStripMenuItem = System.Windows.Forms.ToolStripMenuItem;
-using WpfDataObject = System.Windows.DataObject;
-using WpfDragEventArgs = System.Windows.DragEventArgs;
-using WpfDragDropEffects = System.Windows.DragDropEffects;
+using ContextMenu = System.Windows.Controls.ContextMenu;
+using MenuItem = System.Windows.Controls.MenuItem;
 using WpfCursors = System.Windows.Input.Cursors;
-using WpfMouseEventArgs = System.Windows.Input.MouseEventArgs;
-using WpfPoint = System.Windows.Point;
 
 namespace TrayTerminal.App;
 
@@ -42,8 +37,8 @@ public partial class MainWindow : Window
     private readonly ToolStripMenuItem _trayVisibilityMenuItem;
     private readonly DispatcherTimer _statusIdleTimer;
     private Dictionary<string, TabPreset> _presets = new(StringComparer.Ordinal);
-    private WpfPoint? _tabDragStartPoint;
-    private TabItem? _draggedTab;
+    // The new-tab dialog preselects the last type chosen there in this run.
+    private string? _lastDialogProfileId;
     private bool _syncingFontSize;
     private bool _backgroundReloadInProgress;
     private RemoteAccessService? _remoteAccess;
@@ -84,6 +79,7 @@ public partial class MainWindow : Window
         NewTabButton.Click += async (_, _) => await CreateTabFromDialogAsync();
         ReloadBackgroundButton.Click += async (_, _) => await ReloadSelectedBackgroundAsync();
         HideToTrayButton.Click += (_, _) => HideToTray();
+        Tabs.TabTitleProvider = tab => (tab.Content as TerminalPage)?.Title ?? string.Empty;
         Tabs.SelectionChanged += (_, args) =>
         {
             if (args.Source == Tabs)
@@ -279,13 +275,17 @@ public partial class MainWindow : Window
         }
         else
         {
-            var dialog = new NewTerminalDialog(_profiles, $"终端 {_untitledIndex++}") { Owner = this };
+            var dialog = new NewTerminalDialog(
+                _profiles,
+                $"终端 {_untitledIndex++}",
+                _lastDialogProfileId) { Owner = this };
             if (dialog.ShowDialog() != true || dialog.Request is null)
             {
                 return;
             }
 
             request = dialog.Request;
+            _lastDialogProfileId = request.Profile.Id;
         }
 
         await CreateTabCoreAsync(request);
@@ -357,7 +357,8 @@ public partial class MainWindow : Window
             Header = CreateTabHeader(request.Title, page),
             Content = page
         };
-        ConfigureTabDragReorder(item);
+        // A right click opens this menu without selecting the tab.
+        item.ContextMenu = CreateTabContextMenu(page);
 
         Tabs.Items.Add(item);
         Tabs.SelectedItem = item;
@@ -570,97 +571,72 @@ public partial class MainWindow : Window
         return panel;
     }
 
-    private void ConfigureTabDragReorder(TabItem item)
+    private ContextMenu CreateTabContextMenu(TerminalPage page)
     {
-        item.AllowDrop = true;
-        item.PreviewMouseLeftButtonDown += OnTabPreviewMouseLeftButtonDown;
-        item.PreviewMouseMove += OnTabPreviewMouseMove;
-        item.DragOver += OnTabDragOver;
-        item.Drop += OnTabDrop;
+        var rename = new MenuItem { Header = "重命名" };
+        rename.Click += async (_, _) => await RenameTabAsync(page);
+        var openDirectory = new MenuItem { Header = "打开所在目录" };
+        openDirectory.Click += async (_, _) => await OpenWorkingDirectoryAsync(page);
+
+        var menu = new ContextMenu();
+        menu.Items.Add(rename);
+        menu.Items.Add(openDirectory);
+        return menu;
     }
 
-    private void OnTabPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs args)
+    private async Task OpenWorkingDirectoryAsync(TerminalPage page)
     {
-        _tabDragStartPoint = null;
-        _draggedTab = null;
-
-        if (sender is not TabItem tab || FindAncestor<ControlsButton>(args.OriginalSource as DependencyObject) is not null)
+        var directory = page.Session.CurrentWorkingDirectory;
+        // Existence checks on network paths can block for a long time.
+        var existing = await Task.Run(() => FindNearestExistingDirectory(directory));
+        if (existing is null)
         {
+            SetStatusText($"目录“{directory}”已不存在，也找不到可打开的上级目录");
             return;
         }
 
-        _draggedTab = tab;
-        _tabDragStartPoint = args.GetPosition(Tabs);
-    }
-
-    private void OnTabPreviewMouseMove(object sender, WpfMouseEventArgs args)
-    {
-        if (_draggedTab is null || _tabDragStartPoint is not { } startPoint || args.LeftButton != MouseButtonState.Pressed)
+        try
         {
-            return;
-        }
-
-        var currentPoint = args.GetPosition(Tabs);
-        if (Math.Abs(currentPoint.X - startPoint.X) < SystemParameters.MinimumHorizontalDragDistance &&
-            Math.Abs(currentPoint.Y - startPoint.Y) < SystemParameters.MinimumVerticalDragDistance)
-        {
-            return;
-        }
-
-        var data = new WpfDataObject(typeof(TabItem), _draggedTab);
-        DragDrop.DoDragDrop(_draggedTab, data, WpfDragDropEffects.Move);
-        _tabDragStartPoint = null;
-        _draggedTab = null;
-    }
-
-    private void OnTabDragOver(object sender, WpfDragEventArgs args)
-    {
-        args.Effects = sender is TabItem target
-            && args.Data.GetDataPresent(typeof(TabItem))
-            && !ReferenceEquals(args.Data.GetData(typeof(TabItem)), target)
-                ? WpfDragDropEffects.Move
-                : WpfDragDropEffects.None;
-        args.Handled = true;
-    }
-
-    private void OnTabDrop(object sender, WpfDragEventArgs args)
-    {
-        if (sender is not TabItem target || args.Data.GetData(typeof(TabItem)) is not TabItem source)
-        {
-            return;
-        }
-
-        MoveTab(source, target, args.GetPosition(target).X > target.ActualWidth / 2);
-        args.Handled = true;
-    }
-
-    private void MoveTab(TabItem source, TabItem target, bool insertAfterTarget)
-    {
-        if (ReferenceEquals(source, target) || !Tabs.Items.Contains(source) || !Tabs.Items.Contains(target))
-        {
-            return;
-        }
-
-        Tabs.Items.Remove(source);
-        var targetIndex = Tabs.Items.IndexOf(target);
-        var insertIndex = insertAfterTarget ? targetIndex + 1 : targetIndex;
-        Tabs.Items.Insert(Math.Clamp(insertIndex, 0, Tabs.Items.Count), source);
-        Tabs.SelectedItem = source;
-    }
-
-    private static T? FindAncestor<T>(DependencyObject? source)
-        where T : DependencyObject
-    {
-        while (source is not null)
-        {
-            if (source is T match)
+            // explorer.exe parses its own command line: quote everything except a
+            // drive root, whose trailing backslash would escape the closing quote.
+            var target = Path.TrimEndingDirectorySeparator(existing);
+            var arguments = target.EndsWith(Path.DirectorySeparatorChar)
+                ? target
+                : $"\"{target}\"";
+            Process.Start(new ProcessStartInfo("explorer.exe", arguments)
             {
-                return match;
-            }
+                UseShellExecute = false
+            })?.Dispose();
+        }
+        catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+        {
+            _logger.Error(exception, $"Failed to open directory '{existing}'.");
+            SetStatusText($"无法打开目录“{existing}”：{exception.Message}");
+            return;
+        }
 
-            source = source is Visual or Visual3D
-                ? VisualTreeHelper.GetParent(source)
-                : LogicalTreeHelper.GetParent(source);
+        if (!string.Equals(existing, directory, StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatusText($"目录“{directory}”已不存在，已打开上级目录“{existing}”");
+        }
+    }
+
+    private static string? FindNearestExistingDirectory(string directory)
+    {
+        try
+        {
+            for (string? current = directory;
+                 !string.IsNullOrEmpty(current);
+                 current = Path.GetDirectoryName(current))
+            {
+                if (Directory.Exists(current))
+                {
+                    return current;
+                }
+            }
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
         }
 
         return null;

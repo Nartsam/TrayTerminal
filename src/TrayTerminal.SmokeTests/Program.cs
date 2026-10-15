@@ -263,6 +263,47 @@ internal static partial class Program
             activeJobs.PendingSubmissions == 0
                 && activeJobs.ActiveShellJobs == 2,
             "PowerShell prompt marker did not retain active Job evidence.");
+
+        var directories = new List<string>();
+        var prompts = 0;
+        var directoryFilter = new TerminalPromptFilter(
+            token,
+            _ => prompts++,
+            directories.Add);
+        const string directory = @"D:\工作 目录;x";
+        var directoryMarker = Encoding.UTF8.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0, directory));
+        var split = directoryMarker.Length - 5;
+        var directoryOutput = directoryFilter.Process(directoryMarker[..split])
+            .Concat(directoryFilter.Process(
+                directoryMarker[split..].Concat("$ "u8.ToArray()).ToArray()))
+            .ToArray();
+        Assert(
+            Encoding.UTF8.GetString(directoryOutput) == "$ "
+                && prompts == 1
+                && directories.SequenceEqual([directory]),
+            "Prompt marker did not report its working directory across chunks.");
+
+        directoryFilter.Process(Encoding.UTF8.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0, string.Empty)));
+        Assert(
+            prompts == 2 && directories.Count == 1,
+            "An empty directory (non-file-system location) was reported.");
+
+        var invalid = Encoding.UTF8.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0, "C:\\bad\u0007dir"));
+        Assert(
+            directoryFilter.Process(invalid).SequenceEqual(invalid)
+                && prompts == 2,
+            "A control character inside the directory was accepted.");
+
+        var oversized = Encoding.UTF8.GetBytes(
+            TerminalPromptFilter.BuildMarker(token, 0, "C:\\" + new string('x', 5000)));
+        Assert(
+            directoryFilter.Process(oversized).SequenceEqual(oversized)
+                && prompts == 2
+                && directories.Count == 1,
+            "An oversized directory marker was not passed through unchanged.");
         return Task.CompletedTask;
     }
 
@@ -967,7 +1008,7 @@ internal static partial class Program
             "cmd",
             executablePath,
             string.Empty,
-            "ping -n 3 127.0.0.1 >nul\r");
+            "cd /d \"{dir}\" & ping -n 3 127.0.0.1 >nul\r");
     }
 
     private static Task TestPowerShellCloseAssessmentIntegration()
@@ -982,7 +1023,7 @@ internal static partial class Program
             "windows-powershell",
             executablePath,
             "-NoLogo",
-            "Start-Sleep -Seconds 2\r");
+            "Set-Location -LiteralPath '{dir}'; Start-Sleep -Seconds 2\r");
     }
 
     private static async Task RunShellCloseAssessmentIntegration(
@@ -998,6 +1039,21 @@ internal static partial class Program
         Assert(
             File.Exists(executablePath),
             $"Shell executable not found: {executablePath}");
+
+        // Spaces and CJK characters exercise quoting and the UTF-8 marker path.
+        var targetDirectory = Path.Combine(
+            Path.GetTempPath(),
+            $"TrayTerminal 目录 {Guid.NewGuid():N}");
+        Directory.CreateDirectory(targetDirectory);
+        testCommand = testCommand.Replace("{dir}", targetDirectory, StringComparison.Ordinal);
+        var reportedDirectories = new List<string>();
+        void ObserveDirectory(IpcMessage message)
+        {
+            if (message.Type == IpcMessageType.WorkingDirectory)
+            {
+                reportedDirectories.Add(IpcProtocol.DecodeText(message.Payload));
+            }
+        }
 
         var outputPipeName = $"TrayTerminal-Test-Output-{Guid.NewGuid():N}";
         var controlPipeName = $"TrayTerminal-Test-Control-{Guid.NewGuid():N}";
@@ -1015,6 +1071,7 @@ internal static partial class Program
             PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous);
 
+        var startDirectory = Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory);
         var arguments = string.Join(
             ' ',
             "--output-pipe", outputPipeName,
@@ -1022,7 +1079,7 @@ internal static partial class Program
             "--nonce", nonce,
             "--exe", EncodeHostArgument(executablePath),
             "--args", EncodeHostArgument(shellArguments),
-            "--cwd", EncodeHostArgument(AppContext.BaseDirectory),
+            "--cwd", EncodeHostArgument(startDirectory),
             "--profile-id", EncodeHostArgument(profileId),
             "--cols", "80",
             "--rows", "24");
@@ -1089,6 +1146,7 @@ internal static partial class Program
                         timeout.Token)
                         ?? throw new EndOfStreamException(
                             "CMD control pipe ended during close check.");
+                    ObserveDirectory(message);
                     if (message.Type != IpcMessageType.CloseCheckResult)
                     {
                         continue;
@@ -1130,6 +1188,7 @@ internal static partial class Program
                         timeout.Token)
                         ?? throw new EndOfStreamException(
                             "CMD control pipe ended before input acknowledgement.");
+                    ObserveDirectory(message);
                     if (message.Type is not IpcMessageType.InputAck)
                     {
                         continue;
@@ -1201,6 +1260,7 @@ internal static partial class Program
                     timeout.Token)
                     ?? throw new EndOfStreamException(
                         "CMD control pipe ended before exit status.");
+                ObserveDirectory(message);
                 if (message.Type == IpcMessageType.Exit)
                 {
                     exit = IpcProtocol.DecodeExitStatus(message.Payload);
@@ -1215,6 +1275,13 @@ internal static partial class Program
                 !Encoding.UTF8.GetString(captured.ToArray())
                     .Contains(nonce, StringComparison.Ordinal),
                 "Shell integration marker leaked into terminal output.");
+            // Every directory precedes Exit on the control pipe, so all are read.
+            Assert(
+                reportedDirectories.Count == 2
+                    && string.Equals(reportedDirectories[0], startDirectory, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(reportedDirectories[1], targetDirectory, StringComparison.OrdinalIgnoreCase),
+                $"{profileId} reported unexpected directories: "
+                + string.Join(" | ", reportedDirectories));
             await host.WaitForExitAsync(timeout.Token);
         }
         finally
@@ -1222,6 +1289,14 @@ internal static partial class Program
             if (!host.HasExited)
             {
                 host.Kill(entireProcessTree: true);
+            }
+
+            try
+            {
+                Directory.Delete(targetDirectory);
+            }
+            catch (IOException)
+            {
             }
         }
     }

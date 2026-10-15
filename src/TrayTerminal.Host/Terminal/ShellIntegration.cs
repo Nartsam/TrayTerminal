@@ -36,10 +36,11 @@ internal static class ShellIntegration
             existing = "$P$G";
         }
 
+        // $P reports the current drive and path for "open containing folder".
         return existing
             + "$E]633;TrayTerminal;"
             + markerToken
-            + ";0$E\\";
+            + ";0;$P$E\\";
     }
 
     private static string BuildPowerShellArguments(
@@ -54,9 +55,17 @@ internal static class ShellIntegration
                     Get-Job -ErrorAction SilentlyContinue |
                         Where-Object { $_.State -notin @('Completed', 'Failed', 'Stopped') }
                 ).Count
+                # Set-Location does not change the process directory, so report
+                # the last file-system location; it survives "cd HKLM:" as well.
+                $trayTerminalLocation = ''
+                try {
+                    $trayTerminalLocation =
+                        $executionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
+                } catch {}
                 [Console]::Write(
                     [char]27 + ']633;TrayTerminal;{{markerToken}};' +
-                    $trayTerminalActiveJobs + [char]27 + '\')
+                    $trayTerminalActiveJobs + ';' + $trayTerminalLocation +
+                    [char]27 + '\')
                 $trayTerminalPromptResult
             }
             """;

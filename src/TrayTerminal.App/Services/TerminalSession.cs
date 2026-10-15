@@ -87,6 +87,7 @@ public sealed class TerminalSession : IAsyncDisposable
     private int _inputFrozen;
     private int _authorityDegraded;
     private long _degradedSequence;
+    private string? _reportedWorkingDirectory;
 
     public TerminalSession(
         NewTerminalRequest request,
@@ -136,6 +137,14 @@ public sealed class TerminalSession : IAsyncDisposable
     /// because the user declined the UAC prompt.
     /// </summary>
     public bool ElevationDeclined { get; private set; }
+
+    /// <summary>
+    /// The shell's directory at its most recent prompt. Before the first prompt,
+    /// and for shells without prompt integration, this is the start directory.
+    /// The value is kept after the terminal exits.
+    /// </summary>
+    public string CurrentWorkingDirectory =>
+        Volatile.Read(ref _reportedWorkingDirectory) ?? GetStartWorkingDirectory();
 
     public Task Completion => _completion.Task;
 
@@ -1151,6 +1160,29 @@ public sealed class TerminalSession : IAsyncDisposable
             $"Started host process {_hostProcess.Id} for {_request.Profile.DisplayName}.");
     }
 
+    private string GetStartWorkingDirectory()
+    {
+        try
+        {
+            // A relative preset "cd" is resolved by Host against the base directory.
+            return Path.GetFullPath(
+                _request.Profile.WorkingDirectory,
+                _paths.BaseDirectory);
+        }
+        catch (Exception exception) when (exception is ArgumentException
+            or NotSupportedException or PathTooLongException)
+        {
+            return _paths.BaseDirectory;
+        }
+    }
+
+    private static bool IsReportableWorkingDirectory(string directory)
+    {
+        return directory.Length is > 0 and <= 4096
+            && !directory.Any(char.IsControl)
+            && Path.IsPathFullyQualified(directory);
+    }
+
     private ProcessStartInfo CreateHostStartInfo(string args, bool elevated)
     {
         var startInfo = new ProcessStartInfo
@@ -1565,6 +1597,16 @@ public sealed class TerminalSession : IAsyncDisposable
                             {
                                 source.TrySetResult(result.Accepted);
                             }
+                        }
+                        break;
+                    }
+
+                    case IpcMessageType.WorkingDirectory:
+                    {
+                        var directory = IpcProtocol.DecodeText(message.Value.Payload);
+                        if (IsReportableWorkingDirectory(directory))
+                        {
+                            Volatile.Write(ref _reportedWorkingDirectory, directory);
                         }
                         break;
                     }
