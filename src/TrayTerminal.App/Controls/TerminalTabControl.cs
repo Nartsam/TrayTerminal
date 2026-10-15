@@ -31,6 +31,7 @@ public sealed class TerminalTabControl : System.Windows.Controls.TabControl
     private const double TabGap = 4;
     private const double DropIndicatorWidth = 3;
     private const double MinimumRevealDistance = 24;
+    private const double EdgeFadeWidth = 24;
     private const double EdgeScrollZone = 36;
     // DIP per second at the outer edge; a third of it just inside the zone.
     private const double EdgeScrollMaxSpeed = 1200;
@@ -66,6 +67,17 @@ public sealed class TerminalTabControl : System.Windows.Controls.TabControl
         Loaded += (_, _) => AttachHorizontalWheelHook();
         Unloaded += (_, _) => DetachHorizontalWheelHook();
     }
+
+    /// <summary>Marks a tab whose terminal process has exited; its header is dimmed.</summary>
+    public static readonly DependencyProperty IsExitedProperty = DependencyProperty.RegisterAttached(
+        "IsExited",
+        typeof(bool),
+        typeof(TerminalTabControl),
+        new FrameworkPropertyMetadata(false));
+
+    public static bool GetIsExited(TabItem tab) => (bool)tab.GetValue(IsExitedProperty);
+
+    public static void SetIsExited(TabItem tab, bool value) => tab.SetValue(IsExitedProperty, value);
 
     /// <summary>Supplies the text shown for each tab in the overflow tab list.</summary>
     public Func<TabItem, string>? TabTitleProvider { get; set; }
@@ -181,6 +193,29 @@ public sealed class TerminalTabControl : System.Windows.Controls.TabControl
         {
             _scrollRightButton.IsEnabled = _scroll.HorizontalOffset < _scroll.ScrollableWidth - 0.5;
         }
+
+        UpdateEdgeFade(_scroll);
+    }
+
+    /// <summary>Fades out the strip's edges on the sides where tabs continue out of view.</summary>
+    private void UpdateEdgeFade(ScrollViewer scroll)
+    {
+        var fadeLeft = _overflowing && scroll.HorizontalOffset > 0.5;
+        var fadeRight = _overflowing && scroll.HorizontalOffset < scroll.ScrollableWidth - 0.5;
+        if (scroll.ActualWidth <= 0 || (!fadeLeft && !fadeRight))
+        {
+            scroll.OpacityMask = null;
+            return;
+        }
+
+        var fade = Math.Min(0.5, EdgeFadeWidth / scroll.ActualWidth);
+        var mask = new LinearGradientBrush { StartPoint = new(0, 0), EndPoint = new(1, 0) };
+        mask.GradientStops.Add(new GradientStop(fadeLeft ? Colors.Transparent : Colors.Black, 0));
+        mask.GradientStops.Add(new GradientStop(Colors.Black, fadeLeft ? fade : 0));
+        mask.GradientStops.Add(new GradientStop(Colors.Black, fadeRight ? 1 - fade : 1));
+        mask.GradientStops.Add(new GradientStop(fadeRight ? Colors.Transparent : Colors.Black, 1));
+        mask.Freeze();
+        scroll.OpacityMask = mask;
     }
 
     private void ScrollBy(double delta)
@@ -462,7 +497,7 @@ public sealed class TerminalTabControl : System.Windows.Controls.TabControl
 
     private void UpdateDropTarget(double x)
     {
-        if (_draggedTab is null)
+        if (_draggedTab is null || _scroll is null)
         {
             return;
         }
@@ -492,7 +527,14 @@ public sealed class TerminalTabControl : System.Windows.Controls.TabControl
         var gapCenter = index < tabs.Count
             ? GetTabLeft(tabs[index]) - TabGap / 2
             : GetTabLeft(tabs[^1]) + tabs[^1].ActualWidth - TabGap / 2;
-        ShowDropIndicator(gapCenter - DropIndicatorWidth / 2);
+        // A gap scrolled just out of view (such as the one before the first tab
+        // while the strip is scrolled) is marked at the nearest visible edge,
+        // instead of being clipped away.
+        var left = Math.Clamp(
+            gapCenter - DropIndicatorWidth / 2,
+            0,
+            Math.Max(0, _scroll.ActualWidth - DropIndicatorWidth));
+        ShowDropIndicator(left);
     }
 
     private void ShowDropIndicator(double left)

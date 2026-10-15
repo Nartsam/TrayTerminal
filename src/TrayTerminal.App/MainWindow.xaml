@@ -9,69 +9,83 @@
         MinHeight="480"
         Background="{StaticResource WindowBackgroundBrush}"
         Foreground="{StaticResource TextBrush}"
+        FontFamily="{StaticResource UiFont}"
+        FontSize="13"
         Icon="Assets/app.ico"
         WindowStartupLocation="CenterScreen">
     <Grid x:Name="RootGrid">
     <DockPanel>
-        <Border DockPanel.Dock="Top"
-                Height="48"
-                Background="{StaticResource PanelBackgroundBrush}"
-                BorderBrush="{StaticResource BorderBrush}"
-                BorderThickness="0,0,0,1">
-            <Grid Margin="12,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
+        <!-- Same color as the title bar and tab strip: one continuous chrome. -->
+        <Grid DockPanel.Dock="Top"
+              Height="44"
+              Margin="10,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
 
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button x:Name="NewTabButton"
-                            MinWidth="112"
-                            Height="30"
-                            Content="添加新终端"
-                            FontSize="13"
-                            Padding="12,0"
-                            ToolTip="添加新终端" />
-                </StackPanel>
+            <!-- Tag holds each button's icon glyph (see the Button style). -->
+            <Button x:Name="NewTabButton"
+                    Style="{StaticResource AccentSoftButtonStyle}"
+                    Height="30"
+                    Padding="12,0,14,0"
+                    VerticalAlignment="Center"
+                    Content="添加新终端"
+                    Tag="&#xE710;"
+                    ToolTip="添加新终端" />
 
-                <TextBlock Grid.Column="1"
-                           x:Name="StatusText"
+            <TextBlock Grid.Column="1"
+                       x:Name="StatusText"
+                       Foreground="{StaticResource MutedTextBrush}"
+                       VerticalAlignment="Center"
+                       Margin="16,0"
+                       TextTrimming="CharacterEllipsis" />
+
+            <StackPanel Grid.Column="2"
+                        Orientation="Horizontal"
+                        VerticalAlignment="Center">
+                <Button x:Name="OpenConfigButton"
+                        Style="{StaticResource ToolbarButtonStyle}"
+                        Height="30"
+                        Content="打开配置目录"
+                        Tag="&#xED25;"
+                        ToolTip="在资源管理器中打开 Data\Config" />
+                <Button x:Name="ReloadBackgroundButton"
+                        Style="{StaticResource ToolbarButtonStyle}"
+                        Height="30"
+                        Margin="2,0,0,0"
+                        Content="重载壁纸"
+                        Tag="&#xE72C;"
+                        IsEnabled="False"
+                        ToolTip="重新读取当前标签的壁纸设置" />
+                <Rectangle Width="1"
+                           Height="18"
+                           Margin="10,0"
+                           Fill="{StaticResource BorderBrush}" />
+                <TextBlock Text="字号"
                            Foreground="{StaticResource MutedTextBrush}"
                            VerticalAlignment="Center"
-                           Margin="24,0,0,0"
-                           TextTrimming="CharacterEllipsis" />
-
-                <StackPanel Grid.Column="2"
-                            Orientation="Horizontal"
-                            VerticalAlignment="Center">
-                    <Button x:Name="ReloadBackgroundButton"
-                            MinWidth="104"
-                            Height="30"
-                            Margin="0,0,12,0"
-                            Content="重载壁纸"
-                            IsEnabled="False"
-                            ToolTip="重新读取当前标签的壁纸设置" />
-                    <TextBlock Text="字号"
-                               VerticalAlignment="Center"
-                               Margin="0,0,8,0" />
-                    <ComboBox x:Name="FontSizeComboBox"
-                              Width="72"
-                              Height="30"
-                              Margin="0,0,12,0" />
-                    <Button x:Name="HideToTrayButton"
-                            MinWidth="96"
-                            Height="30"
-                            Content="隐藏到托盘"
-                            ToolTip="隐藏窗口到系统托盘" />
-                </StackPanel>
-            </Grid>
-        </Border>
+                           Margin="0,0,8,0" />
+                <ComboBox x:Name="FontSizeComboBox"
+                          Width="68"
+                          Height="30" />
+                <Rectangle Width="1"
+                           Height="18"
+                           Margin="10,0"
+                           Fill="{StaticResource BorderBrush}" />
+                <Button x:Name="HideToTrayButton"
+                        Style="{StaticResource ToolbarButtonStyle}"
+                        Height="30"
+                        Content="隐藏到托盘"
+                        Tag="&#xE896;"
+                        ToolTip="隐藏窗口到系统托盘" />
+            </StackPanel>
+        </Grid>
 
         <controls:TerminalTabControl x:Name="Tabs"
-                                     Background="{StaticResource WindowBackgroundBrush}"
                                      BorderThickness="0"
-                                     Padding="8" />
+                                     Padding="0" />
     </DockPanel>
     </Grid>
 </Window>

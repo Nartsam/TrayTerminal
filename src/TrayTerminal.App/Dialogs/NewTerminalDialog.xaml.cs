@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using TrayTerminal.App.Controls;
 using TrayTerminal.Shared.Terminal;
 using WpfKeyEventArgs = System.Windows.Input.KeyEventArgs;
 using WpfRadioButton = System.Windows.Controls.RadioButton;
@@ -17,6 +18,7 @@ public partial class NewTerminalDialog : Window
         string? preferredProfileId = null)
     {
         InitializeComponent();
+        WindowTheme.Apply(this);
         TitleTextBox.Text = defaultTitle;
         TextBoxSelection.SelectAllOnDoubleClick(TitleTextBox);
 

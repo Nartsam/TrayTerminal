@@ -7,8 +7,8 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 多标签终端：启动后默认创建一个终端，也可以点击左上角”添加新终端”创建更多标签。新建对话框打开时“标题”已全选，可直接输入新名称；双击输入框也会全选。终端类型以一排按钮呈现，默认选中本次运行中上一次创建时选的类型（重启后回到第一个），“以管理员模式启动”每次默认不勾选。
 - 终端类型：默认检测 CMD、Windows PowerShell；如果 `pwsh.exe` 在 `PATH` 中，会自动加入 PowerShell 7。
 - 管理员终端：新建标签时勾选”以管理员模式启动”，会通过 UAC 启动提权的 Host 进程。如果在 UAC 弹窗中选择“否”，该标签会改为以普通权限启动，并在标签左下角状态栏提示；`config.txt` 中的 `run`/`fill` 预设仍会照常应用到这个普通权限终端。
-- 标签栏：所有标签固定显示在一行。放不下时，可用鼠标滚轮（包括触控板横向滑动）或两侧箭头按钮左右滚动，每次点击箭头会完整露出下一个被遮住的标签；右端“全部标签”下拉按钮列出所有标签，点击即可切换。这些按钮只在标签放不下时出现。选中的标签会自动滚动到可见位置。
-- 标签排序：拖动顶部标签可以调整顺序。拖动时被拖的标签半透明，绿色竖线指示松手后的落点；拖到标签栏两端附近会自动滚动，拖出标签栏则不会移动。松手后，被移动的标签会短暂高亮。
+- 标签栏：所有标签固定显示在一行。放不下时，可用鼠标滚轮（包括触控板横向滑动）或两侧箭头按钮左右滚动，每次点击箭头会完整露出下一个被遮住的标签；右端“全部标签”下拉按钮列出所有标签，点击即可切换。这些按钮只在标签放不下时出现。选中的标签会自动滚动到可见位置。标题过长时以省略号结尾，鼠标悬停可以看到完整名称。
+- 标签排序：拖动顶部标签可以调整顺序。拖动时被拖的标签半透明，绿色竖线指示松手后的落点（包括第一个标签之前）；落点暂时滚出可见范围时，竖线停在标签栏对应一侧的边缘。拖到标签栏两端附近会自动滚动，拖出标签栏则不会移动。松手后，被移动的标签会短暂高亮。
 - 标签右键菜单：
   - “重命名”：与双击标签标题相同，修改标签名称。
   - “打开所在目录”：在资源管理器中打开该终端最近一次显示提示符时所在的目录。CMD 和 PowerShell 执行 `cd` 后会自动跟随；PowerShell 切到注册表等非文件系统位置时，保留上一个文件系统目录；还没出现过提示符时使用启动目录；目录已被删除时打开最近一个仍存在的上级目录，并在状态栏说明。在终端里进入 SSH、WSL、Python 或嵌套 Shell 后，其内部的目录变化无法感知。
@@ -17,10 +17,12 @@ TrayTerminal 是一个 Windows 11 x64 便携目录版终端工具。它把主界
 - 壁纸重载：右上角“重载壁纸”按钮会重新读取当前标签在 `config.txt` 中的 `bg`、`cover` 和 `Data\Backgrounds` 同名图片设置，不会重新应用 `cd`、`run` 或 `fill`。找不到目标图片时会清除当前壁纸；读取失败时会保留原壁纸。
 - 标签预设配置：通过 `Data\Config\config.txt` 为特定名称的标签指定工作目录、自动执行命令、预填命令、背景图片和背景遮罩；创建、关闭、重命名标签等相关操作前会重新加载配置。
 - 启动自动建标签：通过 `Data\Config\init.txt` 指定程序启动时自动创建的标签列表。
+- 打开配置目录：右上角“打开配置目录”按钮会在资源管理器中打开 `Data\Config`（`config.txt`、`init.txt`、`settings.txt` 所在目录）；目录被删除时会先重新创建。
 - 独立字号：右上角字号下拉框只调整当前标签，切换标签时会显示该标签自己的字号。
 - 托盘模式：点击”隐藏到托盘”隐藏窗口；托盘图标双击可显示或隐藏窗口；右键菜单会根据当前窗口状态显示”显示”或”隐藏”。
 - 关闭行为：点击窗口关闭按钮时会询问是退出程序还是隐藏到托盘；托盘右键”退出”跳过该选择，但仍执行相同的终端安全检查。只有已证实回到根 Shell 提示符、没有活动子进程或未完成 PowerShell Job、也没有未确认输入的标签才会无提示关闭；活动或状态不确定时会安全默认到“取消”，确认后才强制结束该终端及子进程。
 - 远程访问：可通过浏览器在同一局域网内的另一台设备上查看和操作指定的终端标签。需在 `settings.txt` 中配置端口、令牌和允许的终端名称后启用。
+- 界面外观：整体为深色主题，标题栏、工具栏和标签栏是同一块深色区域（Windows 11 上标题栏颜色与之相同，Windows 10 上为系统深色标题栏）。选中的标签与下方终端同色并带绿色顶线；标签内的图标区分普通终端和管理员终端，进程已退出的标签会变暗。终端文字四周留有边距，壁纸铺满整个终端区域；右侧滚动条为细的半透明样式，最后一列文字不会被它遮住。标签栏放不下时，有标签被遮住的一侧会渐隐。每个标签底部状态栏的圆点表示状态：绿色运行中，灰色准备中或已退出，黄色需要注意（如状态同步已停用），红色启动失败。托盘右键菜单同样为深色。
 
 ### 关闭安全判定
 
@@ -232,7 +234,7 @@ src/
 
 - `TrayTerminal.App.csproj`：WPF 主程序项目，引用 WebView2、Shared，并在构建后复制 Host 输出。
 - `app.manifest`：应用清单，声明 Windows 桌面程序运行信息。
-- `App.xaml`：全局 WPF 资源和暗色控件样式，包括单行标签栏模板、右键/下拉菜单和新建对话框的类型按钮。
+- `App.xaml`：全局 WPF 资源：配色、字体和暗色控件样式（按钮、输入框、下拉框、复选框、提示、滚动条、菜单），以及单行标签栏和标签模板、新建对话框的类型按钮。按钮的 `Tag` 放图标字形；`IsDefault` 的按钮自动显示为绿色主按钮。
 - `App.xaml.cs`：应用启动入口，初始化便携目录、日志、当前工作目录和主窗口。
 - `MainWindow.xaml`：主窗口布局，包含顶部工具栏、字号选择、隐藏按钮和标签容器。
 - `MainWindow.xaml.cs`：标签创建、重命名、配置重载、背景匹配、托盘行为、关闭确认等主界面逻辑。
@@ -242,9 +244,12 @@ src/
 - `Assets/terminal-snapshot.js`：权威引擎、本地页面和远程页面共用的检查点编解码与补充状态恢复；绑定锁定的 xterm 版本，同时修正滚动缓冲回收时保存光标的位置。
 - `Assets/xterm/xterm.css`、`xterm.js`：锁定的 `@xterm/xterm` 5.5.0 官方静态文件。
 - `Assets/xterm/addon-serialize.js`：锁定的 `@xterm/addon-serialize` 0.13.0，用于生成可恢复 VT 快照；具体来源、SHA-256 和 MIT 许可证见同目录 `THIRD-PARTY-NOTICES.md`、`LICENSE`。
-- `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、状态栏、TerminalSession 和 TerminalView。
+- `Controls/DarkMenuRenderer.cs`：托盘右键菜单（WinForms）的深色配色和行高。
+- `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、带状态圆点的状态栏、TerminalSession 和 TerminalView。
 - `Controls/TerminalTabControl.cs`：单行可滚动的标签栏（模板在 `App.xaml`），包含滚轮/箭头滚动、全部标签列表、拖动排序的落点指示与边缘自动滚动，并把 Home/End 留给终端。
+- `Controls/TrimmedTextToolTip.cs`：让标签标题的提示只在标题被省略号截断时出现。
 - `Controls/TerminalView.cs`：WebView2 终端控件，负责加载 `terminal.html`，把前端输入/resize 转给后端，把后端输出写回 xterm.js。
+- `Controls/WindowTheme.cs`：通过 DWM 把主窗口和各对话框的标题栏、边框设为与界面一致的深色。
 - `Dialogs/AppMessageDialog.xaml`：自定义消息对话框界面，替代系统 MessageBox（无系统音效）。
 - `Dialogs/AppMessageDialog.xaml.cs`：自定义消息对话框逻辑，支持确认、提示和多选操作。
 - `Dialogs/NewTerminalDialog.xaml`：新建终端对话框界面。
@@ -419,6 +424,9 @@ publish\TrayTerminal\TrayTerminal.exe
 - `config.txt` 不应作为长期缓存使用；凡是创建、关闭、重命名标签等可能受预设影响的操作，都应通过 `MainWindow` 的配置刷新逻辑读取最新配置。解析器以 section header（顶格、以 `:` 结尾的行）和缩进属性（`key: value`）为单位组织配置；section 内部的空行会被忽略，不会截断后续属性，但属性行必须保持缩进，否则会被误判为新 section。
 - App 与 Host 的 IPC 协议在 `TrayTerminal.Shared.Ipc`。每个会话有一条 Host→App 单向 output 管和一条双向 control 管，两条管都必须完成随机 nonce 握手；输出反压绝不能阻塞 input ACK、heartbeat、kill 或独立 interrupt。resize 由 control 管请求、Host 应用后在 output 管写入 boundary，因而与输出处于同一事件顺序。
 - 提示符标记格式为 `ESC ] 633 ; TrayTerminal ; <令牌> ; <PowerShell Job 数> [; <当前目录>] ESC \`。CMD 通过子进程环境里的 `PROMPT`（`$P`）、PowerShell 通过包装后的 `prompt` 函数（`CurrentFileSystemLocation.ProviderPath`）输出目录；目录只能用这种由 Shell 自己在提示符处上报的方式获取，因为 PowerShell 的 `Set-Location` 不会改变进程工作目录，读取进程信息拿到的是错的。Host 只在目录变化时通过 control 管发送 `WorkingDirectory` 消息，App 保存在 `TerminalSession.CurrentWorkingDirectory`。超过 4096 字节或含控制字符的目录段不视为标记，原样作为输出透传。
+- 终端底色 `#0C0E11` 同时写在 `App.xaml` 的 `TerminalBackgroundBrush`、`terminal.html` 的 `html` 背景和 `TerminalView` 的 WebView2 `DefaultBackgroundColor` 三处，修改时要一起改，否则选中标签、终端和加载瞬间的底色会对不上。
+- `terminal.html` 的滚动条只用 `::-webkit-scrollbar` 设置样式；Chromium 在元素设置了 `scrollbar-color`/`scrollbar-width` 后会忽略这些规则，所以本地页面不要加这两个属性（远程页面只在不支持 `::-webkit-scrollbar` 的浏览器里使用它们）。`estimateSize` 计算列数时会减去滚动条宽度，避免最后一列被滚动条遮住。
+- `App.xaml` 里的 TextBox 模板不要把 `Padding` 绑定到 `PART_ContentHost` 的 `Margin`：TextBox 会自己应用 `Padding` 和滚动条可见性，绑定后边距会加倍。
 - `TerminalTabControl` 重写了 `OnKeyDown`，不处理 Home/End：WebView2 会把这两个键作为加速键转发给 WPF，`TabControl` 默认用它们跳到首/末标签并吞掉按键。拖放依赖控件自身的 `AllowDrop = true`：标签项的逻辑父级是 `TabControl` 而不是模板里的标题行，`AllowDrop` 沿逻辑树继承，只给标题行设置会导致标签上收不到任何拖放事件。
 - ConPTY 相关句柄和进程生命周期集中在 `ConPtySession`，这里的释放顺序会影响关闭标签后子进程是否残留。
 - `ConPtySession.Start` 在每个 Win32 创建步骤之间都必须保持失败路径可释放：管道句柄、伪控制台、attribute list、Job Object 和 FileStream 的所有权转移不要简化，否则反复创建失败的终端可能泄漏句柄。

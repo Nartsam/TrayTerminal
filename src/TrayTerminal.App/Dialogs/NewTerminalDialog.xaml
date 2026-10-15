@@ -7,8 +7,10 @@
         ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource WindowBackgroundBrush}"
-        Foreground="{StaticResource TextBrush}">
-    <Grid Margin="18">
+        Foreground="{StaticResource TextBrush}"
+        FontFamily="{StaticResource UiFont}"
+        FontSize="13">
+    <Grid Margin="22,18,22,20">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -17,33 +19,38 @@
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <TextBlock Text="标题" Margin="0,0,0,6" />
+        <TextBlock Text="标题"
+                   Foreground="{StaticResource MutedTextBrush}"
+                   Margin="0,0,0,6" />
         <TextBox x:Name="TitleTextBox"
                  Grid.Row="1"
-                 Height="30"
-                 Margin="0,0,0,14" />
+                 Height="32"
+                 Margin="0,0,0,16" />
 
-        <TextBlock Grid.Row="2" Text="终端类型" Margin="0,0,0,6" />
+        <TextBlock Grid.Row="2"
+                   Text="终端类型"
+                   Foreground="{StaticResource MutedTextBrush}"
+                   Margin="0,0,0,6" />
         <!-- One equal-width button per detected profile; filled in code. -->
         <UniformGrid x:Name="ProfileButtons"
                      Grid.Row="3"
                      Rows="1" />
 
-        <StackPanel Grid.Row="4" Margin="0,22,0,0">
+        <StackPanel Grid.Row="4" Margin="0,18,0,0">
             <CheckBox x:Name="AdminCheckBox"
                       Content="以管理员模式启动"
-                      Margin="0,0,0,16" />
+                      Margin="0,0,0,22" />
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                 <Button x:Name="CancelButton"
                         Content="取消"
-                        Width="82"
-                        Height="30"
+                        Width="88"
+                        Height="32"
                         Margin="0,0,8,0"
                         IsCancel="True" />
                 <Button x:Name="OkButton"
                         Content="创建"
-                        Width="82"
-                        Height="30"
+                        Width="88"
+                        Height="32"
                         IsDefault="True" />
             </StackPanel>
         </StackPanel>

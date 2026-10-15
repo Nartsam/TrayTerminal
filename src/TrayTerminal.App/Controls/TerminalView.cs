@@ -252,7 +252,12 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
     {
         DisposeCurrentWebView();
 
-        var webView = new WebView2();
+        var webView = new WebView2
+        {
+            // Matches the page background in terminal.html, so a new or recovering
+            // view does not flash white before the page loads.
+            DefaultBackgroundColor = System.Drawing.Color.FromArgb(0x0C, 0x0E, 0x11)
+        };
         _webView = webView;
         Content = webView;
         return webView;

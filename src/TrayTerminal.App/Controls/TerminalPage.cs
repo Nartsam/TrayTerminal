@@ -1,11 +1,10 @@
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Media;
+using System.Windows.Shapes;
 using TrayTerminal.App.Dialogs;
 using TrayTerminal.App.Services;
 using TrayTerminal.Shared;
 using MediaBrush = System.Windows.Media.Brush;
-using MediaBrushes = System.Windows.Media.Brushes;
 
 namespace TrayTerminal.App.Controls;
 
@@ -14,6 +13,7 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
     private readonly TerminalSession _session;
     private readonly TerminalView _terminalView;
     private readonly TextBlock _status;
+    private readonly Ellipse _statusDot;
     private bool _disposed;
 
     public TerminalPage(
@@ -39,24 +39,45 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
             fontSize);
         _status = new TextBlock
         {
-            Text = request.RunAsAdministrator ? "准备启动管理员终端..." : "准备启动终端...",
-            Foreground = (MediaBrush)System.Windows.Application.Current.FindResource("MutedTextBrush"),
+            Foreground = FindBrush("MutedTextBrush"),
             FontSize = 12,
-            Padding = new Thickness(10, 4, 10, 4)
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        _statusDot = new Ellipse
+        {
+            Width = 7,
+            Height = 7,
+            Margin = new Thickness(0, 0, 8, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        SetStatus(
+            request.RunAsAdministrator ? "准备启动管理员终端..." : "准备启动终端...",
+            "StatusIdleBrush");
+
+        var statusContent = new DockPanel();
+        DockPanel.SetDock(_statusDot, Dock.Left);
+        statusContent.Children.Add(_statusDot);
+        statusContent.Children.Add(_status);
+        var statusBar = new Border
+        {
+            Background = FindBrush("WindowBackgroundBrush"),
+            Height = 26,
+            Padding = new Thickness(12, 0, 12, 0),
+            Child = statusContent
         };
 
-        var border = new Border
+        // No frame: the terminal surface continues the selected tab above it.
+        var surface = new Border
         {
-            BorderBrush = (MediaBrush)System.Windows.Application.Current.FindResource("BorderBrush"),
-            BorderThickness = new Thickness(1),
-            Background = MediaBrushes.Black,
+            Background = FindBrush("TerminalBackgroundBrush"),
             Child = _terminalView
         };
 
         var root = new DockPanel();
-        DockPanel.SetDock(_status, Dock.Bottom);
-        root.Children.Add(_status);
-        root.Children.Add(border);
+        DockPanel.SetDock(statusBar, Dock.Bottom);
+        root.Children.Add(statusBar);
+        root.Children.Add(surface);
         Content = root;
 
         // EnqueueOutput is thread-safe and non-blocking, so the session read loop
@@ -64,21 +85,23 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         _session.OutputReceived += (_, output) => _terminalView.EnqueueOutput(output);
         _session.Exited += (_, exitCode) =>
         {
-            Dispatcher.BeginInvoke(() => _status.Text = $"进程已退出，代码 {exitCode}");
+            Dispatcher.BeginInvoke(() => SetStatus($"进程已退出，代码 {exitCode}", "StatusIdleBrush"));
             Exited?.Invoke(this, exitCode);
         };
         _session.Failed += (_, message) => Dispatcher.BeginInvoke(() =>
         {
-            _status.Text = message;
+            SetStatus(message, "StatusErrorBrush");
         });
         _session.AuthorityDegraded += (_, reason) => Dispatcher.BeginInvoke(() =>
         {
-            _status.Text = $"{(_session.IsAdministrator ? "管理员终端" : "终端")}运行中；"
-                + $"状态同步已停用，远程访问不可用（{reason}）";
+            SetStatus(
+                $"{(_session.IsAdministrator ? "管理员终端" : "终端")}运行中；"
+                + $"状态同步已停用，远程访问不可用（{reason}）",
+                "StatusWarningBrush");
         });
         _terminalView.OutputPumpStopped += () => Dispatcher.BeginInvoke(() =>
         {
-            _status.Text = "终端显示已中断，终端进程可能仍在运行";
+            SetStatus("终端显示已中断，终端进程可能仍在运行", "StatusWarningBrush");
         });
     }
 
@@ -103,10 +126,24 @@ public sealed class TerminalPage : System.Windows.Controls.UserControl, IAsyncDi
         await _session.StartAsync(size.Columns, size.Rows);
         if (_session.IsRunning && !_session.IsAuthorityDegraded)
         {
-            _status.Text = _session.ElevationDeclined
-                ? "已取消管理员授权，已改为普通权限终端运行"
-                : _session.IsAdministrator ? "管理员终端运行中" : "终端运行中";
+            SetStatus(
+                _session.ElevationDeclined
+                    ? "已取消管理员授权，已改为普通权限终端运行"
+                    : _session.IsAdministrator ? "管理员终端运行中" : "终端运行中",
+                "StatusRunningBrush");
         }
+    }
+
+    private static MediaBrush FindBrush(string key)
+    {
+        return (MediaBrush)System.Windows.Application.Current.FindResource(key);
+    }
+
+    /// <summary>Shows a status line with a dot colored by one of the Status*Brush resources.</summary>
+    private void SetStatus(string text, string dotBrushKey)
+    {
+        _status.Text = text;
+        _statusDot.Fill = FindBrush(dotBrushKey);
     }
 
     public void SetFontSize(int fontSize)

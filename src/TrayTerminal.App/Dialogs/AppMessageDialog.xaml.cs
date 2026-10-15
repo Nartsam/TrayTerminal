@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using TrayTerminal.App.Controls;
 using WpfButton = System.Windows.Controls.Button;
 using WpfFontFamily = System.Windows.Media.FontFamily;
 using WpfOrientation = System.Windows.Controls.Orientation;
@@ -30,6 +31,7 @@ public partial class AppMessageDialog : Window
         int cancelButtonIndex)
     {
         InitializeComponent();
+        WindowTheme.Apply(this);
         if (owner is not null)
         {
             Owner = owner;
@@ -110,6 +112,7 @@ public partial class AppMessageDialog : Window
     private AppMessageDialog(string message, string[] buttonLabels, Window owner, string preview)
     {
         InitializeComponent();
+        WindowTheme.Apply(this);
         Owner = owner;
         ClickedIndex = -1;
         BuildPreviewLayout(message, preview, buttonLabels);

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Threading;
 using TrayTerminal.App.Controls;
@@ -12,7 +13,6 @@ using TrayTerminal.Shared.Terminal;
 using ContextMenuStrip = System.Windows.Forms.ContextMenuStrip;
 using ControlsButton = System.Windows.Controls.Button;
 using DrawingIcon = System.Drawing.Icon;
-using MediaBrush = System.Windows.Media.Brush;
 using NotifyIcon = System.Windows.Forms.NotifyIcon;
 using ToolStripMenuItem = System.Windows.Forms.ToolStripMenuItem;
 using ContextMenu = System.Windows.Controls.ContextMenu;
@@ -50,6 +50,7 @@ public partial class MainWindow : Window
     public MainWindow(PortablePaths paths, FileLogger logger)
     {
         InitializeComponent();
+        WindowTheme.Apply(this);
 
         _statusIdleTimer = new DispatcherTimer { Interval = StatusIdleDelay };
         _statusIdleTimer.Tick += (_, _) =>
@@ -77,6 +78,7 @@ public partial class MainWindow : Window
         FontSizeComboBox.SelectionChanged += (_, _) => ApplyFontSizeToSelectedTab();
 
         NewTabButton.Click += async (_, _) => await CreateTabFromDialogAsync();
+        OpenConfigButton.Click += (_, _) => OpenConfigDirectory();
         ReloadBackgroundButton.Click += async (_, _) => await ReloadSelectedBackgroundAsync();
         HideToTrayButton.Click += (_, _) => HideToTray();
         Tabs.TabTitleProvider = tab => (tab.Content as TerminalPage)?.Title ?? string.Empty;
@@ -219,6 +221,7 @@ public partial class MainWindow : Window
                 Close();
             });
         });
+        DarkMenuRenderer.Apply(menu);
 
         var processPath = Environment.ProcessPath;
         var appIcon = File.Exists(_paths.AppIconPath)
@@ -368,6 +371,11 @@ public partial class MainWindow : Window
         try
         {
             await page.StartAsync();
+            if (page.Session.ElevationDeclined)
+            {
+                // The header showed the administrator icon while starting.
+                item.Header = CreateTabHeader(page.Title, page);
+            }
             if (preset?.RunCommand is not null)
             {
                 await page.SendInputAsync(preset.RunCommand + "\r");
@@ -533,22 +541,29 @@ public partial class MainWindow : Window
 
     private FrameworkElement CreateTabHeader(string title, TerminalPage page)
     {
-        var panel = new DockPanel { LastChildFill = false, MinWidth = 120, Cursor = WpfCursors.Hand };
+        var panel = new DockPanel { MinWidth = 110, Cursor = WpfCursors.Hand };
+        var icon = new TextBlock
+        {
+            Text = page.Session.IsAdministrator ? "" : "",
+            Style = (Style)FindResource("TabIconStyle")
+        };
+        // No Foreground: the title follows the tab's selected and hover colors.
         var text = new TextBlock
         {
             Text = title,
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = (MediaBrush)FindResource("TextBrush"),
-            Margin = new Thickness(0, 0, 8, 0)
+            MaxWidth = 240,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            ToolTip = title
         };
+        TrimmedTextToolTip.Attach(text);
         var close = new ControlsButton
         {
-            Content = "x",
-            Width = 22,
-            Height = 22,
-            Padding = new Thickness(0),
+            Style = (Style)FindResource("TabCloseButtonStyle"),
+            Margin = new Thickness(8, 0, 0, 0),
             ToolTip = "关闭标签"
         };
+        AutomationProperties.SetName(close, "关闭标签");
 
         panel.MouseLeftButtonDown += async (_, args) =>
         {
@@ -565,9 +580,11 @@ public partial class MainWindow : Window
             await CloseTabAsync(page);
         };
 
+        DockPanel.SetDock(icon, Dock.Left);
         DockPanel.SetDock(close, Dock.Right);
-        panel.Children.Add(text);
+        panel.Children.Add(icon);
         panel.Children.Add(close);
+        panel.Children.Add(text);
         return panel;
     }
 
@@ -595,11 +612,37 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (TryOpenInExplorer(existing)
+            && !string.Equals(existing, directory, StringComparison.OrdinalIgnoreCase))
+        {
+            SetStatusText($"目录“{directory}”已不存在，已打开上级目录“{existing}”");
+        }
+    }
+
+    private void OpenConfigDirectory()
+    {
+        try
+        {
+            // Recreate it if it was deleted while the program was running.
+            Directory.CreateDirectory(_paths.ConfigDirectory);
+        }
+        catch (Exception exception) when (IsConfigurationException(exception))
+        {
+            _logger.Error(exception, $"Failed to create config directory '{_paths.ConfigDirectory}'.");
+            SetStatusText($"无法创建配置目录“{_paths.ConfigDirectory}”：{exception.Message}");
+            return;
+        }
+
+        TryOpenInExplorer(_paths.ConfigDirectory);
+    }
+
+    private bool TryOpenInExplorer(string directory)
+    {
         try
         {
             // explorer.exe parses its own command line: quote everything except a
             // drive root, whose trailing backslash would escape the closing quote.
-            var target = Path.TrimEndingDirectorySeparator(existing);
+            var target = Path.TrimEndingDirectorySeparator(directory);
             var arguments = target.EndsWith(Path.DirectorySeparatorChar)
                 ? target
                 : $"\"{target}\"";
@@ -607,17 +650,13 @@ public partial class MainWindow : Window
             {
                 UseShellExecute = false
             })?.Dispose();
+            return true;
         }
         catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
         {
-            _logger.Error(exception, $"Failed to open directory '{existing}'.");
-            SetStatusText($"无法打开目录“{existing}”：{exception.Message}");
-            return;
-        }
-
-        if (!string.Equals(existing, directory, StringComparison.OrdinalIgnoreCase))
-        {
-            SetStatusText($"目录“{directory}”已不存在，已打开上级目录“{existing}”");
+            _logger.Error(exception, $"Failed to open directory '{directory}'.");
+            SetStatusText($"无法打开目录“{directory}”：{exception.Message}");
+            return false;
         }
     }
 
@@ -647,7 +686,7 @@ public partial class MainWindow : Window
         var item = Tabs.Items.Cast<TabItem>().FirstOrDefault(tab => ReferenceEquals(tab.Content, page));
         if (item is not null)
         {
-            item.Background = (MediaBrush)FindResource("MutedTextBrush");
+            TerminalTabControl.SetIsExited(item, true);
         }
     }
 
