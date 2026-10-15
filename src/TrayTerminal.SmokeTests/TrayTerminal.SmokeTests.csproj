@@ -6,5 +6,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TrayTerminal.Shared\TrayTerminal.Shared.csproj" />
+    <ProjectReference Include="..\TrayTerminal.App\TrayTerminal.App.csproj" />
   </ItemGroup>
 </Project>

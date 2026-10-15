@@ -9,6 +9,7 @@
   <link rel="icon" href="/assets/app.ico" />
   <link rel="stylesheet" href="/assets/xterm/xterm.css" />
   <script src="/assets/xterm/xterm.js"></script>
+  <script src="/assets/terminal-snapshot.js"></script>
   <script src="/assets/remote-protocol.js"></script>
   <script src="/assets/terminal-input-policy.js"></script>
   <title>TrayTerminal Remote</title>
@@ -50,7 +51,7 @@
 
   <script>
     (() => {
-      const protocolVersion = 3;
+      const protocolVersion = 4;
       const terminalHost = document.getElementById('terminal');
       const fallback = document.getElementById('fallback');
       const statusBar = document.getElementById('status-bar');
@@ -118,22 +119,24 @@
         return false;
       }
 
-      function sendInput(text) {
+      function sendInput(text, userInput = true) {
         if (!text || !synchronized || pendingInputs.size >= 63) {
-          if (pendingInputs.size >= 63) {
+          if (pendingInputs.size >= 63 && !unresolvedInputResults) {
             showStatus('终端输入队列繁忙，请稍候…', false, 'input');
           }
           return;
         }
 
-        unresolvedInputResults = false;
+        if (userInput) unresolvedInputResults = false;
         const inputId = ++nextInputId;
         if (post({ type: 'input', inputId, data: text })) {
           pendingInputs.set(inputId, {
             sequence: expectedSequence - 1n,
             waitsForVisibleResponse: text.indexOf('\r') >= 0
           });
-          showStatus('正在将输入送往终端…', false, 'input');
+          if (!unresolvedInputResults) {
+            showStatus('正在将输入送往终端…', false, 'input');
+          }
         }
       }
 
@@ -162,9 +165,12 @@
         return bytes;
       }
 
-      function applyTerminalBytes(payload, signal) {
+      function applyTerminalBytes(payload, signal, isSnapshot) {
         if (signal.aborted) return Promise.resolve(false);
         const bytes = base64ToBytes(payload);
+        const snapshot = isSnapshot
+          ? window.TrayTerminalSnapshot.decode(bytes)
+          : { content: bytes, state: null };
         if (terminal) {
           const target = terminal;
           return new Promise(resolve => {
@@ -179,10 +185,18 @@
             const abort = () => complete(false);
             const timeout = window.setTimeout(() => complete(false), 30000);
             signal.addEventListener('abort', abort, { once: true });
-            target.write(bytes, () => complete(true));
+            target.write(snapshot.content, () => {
+              if (signal.aborted) return complete(false);
+              try {
+                window.TrayTerminalSnapshot.applyState(target, snapshot.state);
+                complete(true);
+              } catch (_) {
+                complete(false);
+              }
+            });
           });
         }
-        writeFallback(new TextDecoder().decode(bytes));
+        writeFallback(new TextDecoder().decode(snapshot.content));
         return Promise.resolve(true);
       }
 
@@ -417,8 +431,15 @@
           if (typeof event.data !== 'string') return;
           try {
             const message = JSON.parse(event.data);
-            if (!message || message.version !== protocolVersion ||
-                typeof message.type !== 'string') {
+            if (message && message.version !== protocolVersion) {
+              explicitRejection = true;
+              synchronized = false;
+              showStatus('页面版本与服务不一致，请刷新页面后重新连接。', true, 'connection');
+              abortController.abort();
+              socket.close(1008, 'Protocol mismatch');
+              return;
+            }
+            if (!message || typeof message.type !== 'string') {
               abortController.abort();
               socket.close(1002, 'Protocol mismatch');
               return;
@@ -446,7 +467,8 @@
           if (terminalEnded) {
             return;
           }
-          if (explicitRejection || event.code === 1008 || event.code === 4001) {
+          if (explicitRejection) return;
+          if (event.code === 1008 || event.code === 4001) {
             showStatus('连接被拒绝：终端不可用或访问被拒绝', true);
             return;
           }
@@ -519,7 +541,7 @@
               }
               if (terminal) terminal.resize(message.cols, message.rows);
             } else {
-              written = await applyTerminalBytes(message.data, signal);
+              written = await applyTerminalBytes(message.data, signal, message.type === 'snapshot');
             }
             if (signal.aborted || ws !== socket ||
                 generation !== socketGeneration) {
@@ -568,14 +590,21 @@
             if (!pending) break;
             pendingInputs.delete(message.inputId);
             if (message.accepted !== true) {
-              showStatus('输入未能写入终端，请检查连接状态。', true, 'input');
-            } else if (pending.waitsForVisibleResponse &&
+              // An operation can fail after earlier paste chunks were acknowledged,
+              // or after a write whose ACK was lost. A false result never proves
+              // that zero bytes reached the terminal.
+              unresolvedInputResults = true;
+              showStatus(
+                '操作未全部确认，可能已有内容写入终端。请检查终端状态，勿直接重复发送。',
+                true,
+                'input');
+            } else if (!unresolvedInputResults && pending.waitsForVisibleResponse &&
                        expectedSequence - 1n <= pending.sequence) {
               showStatus(
                 '输入已写入终端；前台程序可能暂未读取，因此屏幕尚无变化。',
                 false,
                 'input');
-            } else if (pendingInputs.size === 0) {
+            } else if (pendingInputs.size === 0 && !unresolvedInputResults) {
               hideStatus();
             }
             break;
@@ -672,10 +701,22 @@
             selectionBackground: '#264f78'
           }
         });
+        window.TrayTerminalSnapshot.prepare(terminal);
         terminal.open(terminalHost);
         terminal.focus();
         terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
-        terminal.onData(sendInput);
+        // onData also carries automatic cursor/focus reports. The pinned core
+        // identifies user actions immediately before emitting their data, so
+        // protocol responses cannot dismiss an uncertain delivery warning.
+        let userInputPending = false;
+        window.TrayTerminalSnapshot.inputHandler(terminal)._coreService.onUserInput(() => {
+          userInputPending = true;
+        });
+        terminal.onData(text => {
+          const userInput = userInputPending;
+          userInputPending = false;
+          sendInput(text, userInput);
+        });
         return true;
       }
 

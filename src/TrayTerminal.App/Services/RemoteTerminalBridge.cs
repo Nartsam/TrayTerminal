@@ -17,7 +17,9 @@ namespace TrayTerminal.App.Services;
 /// </summary>
 public sealed class RemoteTerminalBridge : IAsyncDisposable
 {
-    public const int ProtocolVersion = 3;
+    // v4 checkpoints carry parser state in addition to VT cells. Old pages must
+    // reject the version before interpreting the binary envelope as terminal text.
+    public const int ProtocolVersion = 4;
     private const int OutboundQueueCapacity = 512;
     private const int MaxInputBytes = 1024 * 1024;
     private const long MaxJavaScriptSafeInteger = 9_007_199_254_740_991;

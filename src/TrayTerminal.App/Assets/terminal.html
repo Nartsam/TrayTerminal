@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="./xterm/xterm.css" />
   <script src="./xterm/xterm.js"></script>
   <script src="./xterm/addon-serialize.js"></script>
+  <script src="./terminal-snapshot.js"></script>
   <script src="./terminal-input-policy.js"></script>
   <title>TrayTerminal</title>
   <style>
@@ -329,6 +330,7 @@
             serializeAddon = new window.SerializeAddon.SerializeAddon();
             terminal.loadAddon(serializeAddon);
           }
+          window.TrayTerminalSnapshot.prepare(terminal);
           terminal.open(terminalHost);
           terminal.focus();
           terminal.attachCustomKeyEventHandler(handleTerminalKeyEvent);
@@ -422,6 +424,7 @@
           }
 
           const snapshotBytes = base64ToBytes(snapshotPayload);
+          const snapshot = window.TrayTerminalSnapshot.decode(snapshotBytes);
           terminal.reset();
           terminal.resize(
             Math.max(20, Math.min(500, Number(columns) || 120)),
@@ -429,7 +432,8 @@
           queuedSequence = BigInt(snapshotSequence);
           parsedSequence = BigInt(snapshotSequence);
 
-          terminal.write(snapshotBytes, () => {
+          terminal.write(snapshot.content, () => {
+            window.TrayTerminalSnapshot.applyState(terminal, snapshot.state);
             parsedSequence = BigInt(snapshotSequence);
             let index = 0;
             const applyReplay = () => {
@@ -468,13 +472,6 @@
             applyReplay();
           });
           return true;
-        },
-        resizeAuthoritative(columns, rows) {
-          lastCols = Math.max(20, Math.min(500, Number(columns) || 120));
-          lastRows = Math.max(5, Math.min(200, Number(rows) || 30));
-          if (terminal) {
-            terminal.resize(lastCols, lastRows);
-          }
         },
         requestSizeEstimate() {
           window.requestAnimationFrame(() => estimateSize(true));

@@ -738,15 +738,12 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
             restoreCoreWebView2.WebMessageReceived -= RestoreHandler;
         }
 
-        Columns = state.Snapshot.Size.Columns;
-        Rows = state.Snapshot.Size.Rows;
-        var currentSize = _session.CurrentSize;
-        if (currentSize != state.Snapshot.Size)
-        {
-            await ApplyAuthoritativeSizeCoreAsync(webView, currentSize);
-            Columns = currentSize.Columns;
-            Rows = currentSize.Rows;
-        }
+        // Recovery has already replayed its sequenced resizes. A newer requested
+        // size may not have reached ConPTY yet and must not overtake queued output.
+        var restoredSize = state.Replay.LastOrDefault(output => output.IsResize)?.Resize
+            ?? state.Snapshot.Size;
+        Columns = restoredSize.Columns;
+        Rows = restoredSize.Rows;
         Interlocked.Exchange(ref _outputQueueOverflow, 0);
     }
 
@@ -817,15 +814,6 @@ public sealed class TerminalView : System.Windows.Controls.UserControl, IDisposa
                 _logger.Error(exception, "Failed to request local viewport size.");
             }
         }
-    }
-
-    private static async Task ApplyAuthoritativeSizeCoreAsync(
-        WebView2 webView,
-        TerminalSize size)
-    {
-        await webView.ExecuteScriptAsync(
-            $"window.trayTerminal.resizeAuthoritative("
-            + $"{size.Columns},{size.Rows});");
     }
 
     private static async Task RequestLocalSizeEstimateCoreAsync(WebView2 webView)

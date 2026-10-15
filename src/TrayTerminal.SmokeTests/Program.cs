@@ -9,7 +9,7 @@ using TrayTerminal.Shared.Terminal;
 
 namespace TrayTerminal.SmokeTests;
 
-internal static class Program
+internal static partial class Program
 {
     private static async Task<int> Main(string[] args)
     {
@@ -46,6 +46,8 @@ internal static class Program
             ("Unsafe authority checkpoints retain an exact bounded replay tail", TestAuthorityCheckpointTail),
             ("Slow and repeated subscribers are cleaned up", TestTerminalSubscriberCleanup),
             ("Terminal resize owner transfers deterministically", TestResizeOwnership),
+            ("Session coalesces sizes against applied state", TestSessionResizeCoalescing),
+            ("Interrupted paste can have an acknowledged prefix", TestPartialInputAcknowledgement),
             ("Input acknowledgements complete success and failure", TestInputAcknowledgements),
             ("Concurrency slots are bounded and released once", TestConcurrencySlots),
             ("Authority readiness is generation-scoped", TestAuthorityReadinessBarrier),

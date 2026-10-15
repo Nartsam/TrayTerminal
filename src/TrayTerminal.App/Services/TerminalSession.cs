@@ -77,6 +77,8 @@ public sealed class TerminalSession : IAsyncDisposable
     private int _queuedInputBytes;
     private int _queuedInterrupts;
     private TerminalSizeUpdate? _pendingSizeUpdate;
+    private TerminalSize _appliedSize = new(120, 30);
+    private Guid? _appliedSizeOwner;
     private Task? _sizeApplyTask;
     private Task _authorityRemovalTask = Task.CompletedTask;
     private TaskCompletionSource<TerminalCloseAssessment>? _pendingCloseCheck;
@@ -225,17 +227,16 @@ public sealed class TerminalSession : IAsyncDisposable
 
             _cts.Dispose();
             _cts = new CancellationTokenSource();
+            // Requests can change while authority/Host startup is awaiting. The
+            // new ConPTY still starts at initialSize, not the latest requested size.
+            _appliedSize = initialSize;
             IsRunning = true;
             _lastResponseTicks = Environment.TickCount64;
             _outputReaderTask = Task.Run(() => ReadOutputLoopAsync(_cts.Token));
             _controlReaderTask = Task.Run(() => ReadControlLoopAsync(_cts.Token));
             _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(_cts.Token));
 
-            var currentSize = CurrentSize;
-            if (currentSize != initialSize)
-            {
-                await SendResizeAsync(currentSize, _cts.Token);
-            }
+            await QueueSizeUpdate(GetCurrentSizeUpdate());
         }
         catch (OperationCanceledException)
         {
@@ -896,7 +897,13 @@ public sealed class TerminalSession : IAsyncDisposable
     {
         lock (_sizeApplyLock)
         {
-            _pendingSizeUpdate = update;
+            // Callers release _sizeLock before enqueueing, so an older revision
+            // can arrive after a newer one from another client.
+            if (_pendingSizeUpdate is not { } pending
+                || update.Revision >= pending.Revision)
+            {
+                _pendingSizeUpdate = update;
+            }
             if (_sizeApplyTask is null || _sizeApplyTask.IsCompleted)
             {
                 _sizeApplyTask = DrainSizeUpdatesAsync();
@@ -930,11 +937,6 @@ public sealed class TerminalSession : IAsyncDisposable
 
     private async Task ApplySizeUpdateCoreAsync(TerminalSizeUpdate update)
     {
-        if (!update.ShouldBroadcast)
-        {
-            return;
-        }
-
         try
         {
             await _resizeGate.WaitAsync(GetSessionToken());
@@ -951,6 +953,19 @@ public sealed class TerminalSession : IAsyncDisposable
                 return;
             }
 
+            // Coordinator flags compare adjacent requests, not what ConPTY has
+            // applied. Coalescing a duplicate or non-owner request must retain
+            // the difference from the last successfully applied state.
+            update = update with
+            {
+                SizeChanged = update.Size != _appliedSize,
+                OwnerChanged = update.OwnerId != _appliedSizeOwner
+            };
+            if (!update.ShouldBroadcast)
+            {
+                return;
+            }
+
             if (update.SizeChanged && IsRunning)
             {
                 if (!await SendResizeAsync(update.Size, GetSessionToken()))
@@ -958,11 +973,14 @@ public sealed class TerminalSession : IAsyncDisposable
                     return;
                 }
             }
-            else if (update.SizeChanged && _stateHub.LatestSequence == 0)
+            else if (update.SizeChanged && _stateHub.LatestSequence == 0
+                && Volatile.Read(ref _authorityCreated) == 0)
             {
                 _stateHub.TryAcceptSnapshot(0, [], update.Size);
             }
 
+            _appliedSize = update.Size;
+            _appliedSizeOwner = update.OwnerId;
             SizeChanged?.Invoke(this, update);
         }
         catch (Exception exception)

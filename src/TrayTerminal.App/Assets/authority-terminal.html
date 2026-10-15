@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <script src="./xterm/xterm.js"></script>
   <script src="./xterm/addon-serialize.js"></script>
+  <script src="./terminal-snapshot.js"></script>
 </head>
 <body>
 <script>
@@ -16,7 +17,6 @@
       Math.max(1024, Number(window.trayAuthorityMaxStateBytes) || 8 * 1024 * 1024));
     const engines = new Map();
     const chains = new Map();
-    const encoder = new TextEncoder();
     const eventOverheadBudget = Math.min(64 * 1024, maxStateBytes / 256);
     let probeActive = false;
     let probeStageCount = 0;
@@ -52,27 +52,30 @@
         rows,
         scrollback: 256,
         convertEol: true,
+        cursorBlink: true,
         allowProposedApi: false
       });
       const serializeAddon = new SerializeAddon.SerializeAddon();
       try {
         terminal.loadAddon(serializeAddon);
+        window.TrayTerminalSnapshot.prepare(terminal);
         // OSC 8 hyperlinks are presentation metadata that SerializeAddon never
         // emits. Consuming them here keeps link data out of authority memory,
         // while the link text itself is still parsed. Live replicas receive
         // the raw stream and keep their links; restored ones show plain text.
         terminal.parser.registerOscHandler(8, () => true);
+        // Block amplification in xterm's own dispatch path, before its built-in
+        // handler can mutate cells, including fragmented and restarted escapes.
+        const rejectAmplification = () => { throw new Error('stateAmplificationUnsupported'); };
+        terminal.parser.registerCsiHandler({ final: 'b' }, rejectAmplification);
+        terminal.parser.registerCsiHandler({ intermediates: '$', final: 'v' }, rejectAmplification);
+        terminal.parser.registerCsiHandler({ intermediates: '$', final: 'x' }, rejectAmplification);
+        terminal.parser.registerEscHandler({ intermediates: '#', final: '8' }, rejectAmplification);
         return {
           terminal,
           serializeAddon,
           sequence: 0n,
-          parserState: 0,
-          controlStringBytes: 0,
-          controlStringAllowsBell: false,
-          utf8Remaining: 0,
-          utf8Lead: 0,
-          stateBudgetBytes: 0,
-          csiHasDollar: false
+          stateBudgetBytes: 0
         };
       } catch (error) {
         try { terminal.dispose(); } catch (_) {}
@@ -99,121 +102,8 @@
       } catch (_) {}
     }
 
-    // xterm.js has its own OSC/DCS limit, but it is larger than TrayTerminal's
-    // per-session state budget. Track incomplete control strings as bytes arrive
-    // so they cannot hide outside SerializeAddon's visible buffer snapshot.
-    function scanControlStrings(engine, bytes) {
-      for (const value of bytes) {
-        const continuedUtf8 = engine.utf8Remaining > 0 &&
-          value >= 0x80 && value <= 0xbf;
-        const isC1 = continuedUtf8 && engine.utf8Remaining === 1 &&
-          engine.utf8Lead === 0xc2 && value >= 0x80 && value <= 0x9f;
-        if (engine.utf8Remaining > 0) {
-          if (continuedUtf8) {
-            engine.utf8Remaining--;
-            if (engine.utf8Remaining === 0) engine.utf8Lead = 0;
-          } else {
-            engine.utf8Remaining = 0;
-            engine.utf8Lead = 0;
-          }
-        }
-        if (!continuedUtf8) {
-          if (value >= 0xc2 && value <= 0xdf) engine.utf8Remaining = 1;
-          else if (value >= 0xe0 && value <= 0xef) engine.utf8Remaining = 2;
-          else if (value >= 0xf0 && value <= 0xf4) engine.utf8Remaining = 3;
-          if (engine.utf8Remaining > 0) engine.utf8Lead = value;
-        }
-
-        switch (engine.parserState) {
-          case 0:
-            if (value === 0x1b) {
-              engine.parserState = 1;
-            } else if (isC1 && value === 0x9b) {
-              engine.parserState = 4;
-              engine.controlStringBytes = 0;
-              engine.csiHasDollar = false;
-            } else if (isC1 && (value === 0x9d || value === 0x90 ||
-                value === 0x9f || value === 0x9e || value === 0x98)) {
-              engine.parserState = 2;
-              engine.controlStringBytes = 0;
-              engine.controlStringAllowsBell = value === 0x9d;
-            }
-            break;
-          case 1:
-            if (value === 0x5b) {
-              engine.parserState = 4;
-              engine.controlStringBytes = 0;
-              engine.csiHasDollar = false;
-            } else if (value === 0x23) {
-              engine.parserState = 5;
-            } else if (value === 0x5d || value === 0x50 || value === 0x5f ||
-                value === 0x5e || value === 0x58) {
-              engine.parserState = 2;
-              engine.controlStringBytes = 0;
-              engine.controlStringAllowsBell = value === 0x5d;
-            } else {
-              engine.parserState = value === 0x1b ? 1 : 0;
-            }
-            break;
-          case 2:
-            if ((value === 0x07 && engine.controlStringAllowsBell) ||
-                (isC1 && value === 0x9c)) {
-              engine.parserState = 0;
-              engine.controlStringBytes = 0;
-              engine.controlStringAllowsBell = false;
-            } else if (value === 0x1b) {
-              engine.parserState = 3;
-            } else {
-              if (++engine.controlStringBytes > maxStateBytes) {
-                throw new Error('stateTooLarge');
-              }
-            }
-            break;
-          case 3:
-            if (value === 0x5c) {
-              engine.parserState = 0;
-              engine.controlStringBytes = 0;
-              engine.controlStringAllowsBell = false;
-            } else {
-              engine.controlStringBytes += 2;
-              if (engine.controlStringBytes > maxStateBytes) {
-                throw new Error('stateTooLarge');
-              }
-              engine.parserState = value === 0x1b ? 3 : 2;
-            }
-            break;
-          case 4:
-            if (value >= 0x40 && value <= 0x7e) {
-              // REP and DEC rectangular fill/copy can multiply one stored cell
-              // over a large grid without carrying the multiplied text in this
-              // event. Reject those rare sequences before xterm mutates state;
-              // this makes the incremental byte budget a strict upper bound.
-              if (value === 0x62 ||
-                  (engine.csiHasDollar && (value === 0x76 || value === 0x78))) {
-                throw new Error('stateAmplificationUnsupported');
-              }
-              engine.parserState = 0;
-              engine.controlStringBytes = 0;
-              engine.csiHasDollar = false;
-            } else if (value === 0x24) {
-              engine.csiHasDollar = true;
-            } else if (++engine.controlStringBytes > maxStateBytes) {
-              throw new Error('stateTooLarge');
-            }
-            break;
-          case 5:
-            if (value === 0x38) {
-              throw new Error('stateAmplificationUnsupported');
-            }
-            engine.parserState = value === 0x1b ? 1 : 0;
-            break;
-        }
-      }
-    }
-
     function serializeBytes(engine) {
-      const text = engine.serializeAddon.serialize({ scrollback: 256 });
-      const bytes = encoder.encode(text);
+      const bytes = window.TrayTerminalSnapshot.encode(engine.terminal, engine.serializeAddon);
       if (bytes.byteLength > maxStateBytes) {
         throw new Error('stateTooLarge');
       }
@@ -224,16 +114,13 @@
       // Stored Unicode, combining marks, hyperlinks and serialized SGR runs are
       // derived from incoming bytes. Eight serialized bytes per input byte plus
       // fixed event overhead is deliberately conservative. The few VT commands
-      // that can amplify existing cell text are rejected by scanControlStrings.
+      // that can amplify existing cell text are rejected by parser handlers.
       let budget = eventOverheadBudget + bytes.byteLength * 8;
       return Math.min(maxStateBytes + 1, budget);
     }
 
     function getInputHandler(terminal) {
-      const inputHandler = terminal && terminal._core && terminal._core._inputHandler;
-      if (!inputHandler || typeof inputHandler.parse !== 'function') {
-        throw new Error('pinnedParserUnavailable');
-      }
+      const inputHandler = window.TrayTerminalSnapshot.inputHandler(terminal);
       return inputHandler;
     }
 
@@ -299,7 +186,9 @@
         const engine = createEngine(message.cols, message.rows);
         try {
           const bytes = fromBase64(message.snapshot);
-          await parseAsync(engine.terminal, bytes, message);
+          const snapshotState = window.TrayTerminalSnapshot.decode(bytes);
+          await parseAsync(engine.terminal, snapshotState.content, message);
+          window.TrayTerminalSnapshot.applyState(engine.terminal, snapshotState.state);
           engine.sequence = BigInt(message.sequence);
           const snapshot = serializeBytes(engine);
           engine.stateBudgetBytes = snapshot.byteLength;
@@ -343,7 +232,7 @@
         ? estimateMutationBudget(outputBytes)
         : eventOverheadBudget;
       if (engine.stateBudgetBytes > maxStateBytes - mutationBudget) {
-        if (engine.parserState !== 0 || engine.utf8Remaining !== 0) {
+        if (!window.TrayTerminalSnapshot.isCheckpointSafe(engine.terminal)) {
           throw new Error('stateTooLarge');
         }
         const before = serializeBytes(engine);
@@ -358,9 +247,6 @@
       }
 
       if (message.type === 'output') {
-        probeStage(message, 'scanBegin');
-        scanControlStrings(engine, outputBytes);
-        probeStage(message, 'scanComplete');
         await parseAsync(engine.terminal, outputBytes, message);
       } else if (message.type === 'resize') {
         engine.terminal.resize(message.cols, message.rows);
@@ -370,7 +256,7 @@
 
       engine.sequence = sequence;
       engine.stateBudgetBytes += mutationBudget;
-      const checkpointSafe = engine.parserState === 0 && engine.utf8Remaining === 0;
+      const checkpointSafe = window.TrayTerminalSnapshot.isCheckpointSafe(engine.terminal);
       if (message.checkpoint === true && checkpointSafe) {
         const current = serializeBytes(engine);
         snapshot = toBase64(current);

@@ -65,6 +65,9 @@ async function main() {
   vm.runInContext(
     fs.readFileSync(path.join(assets, 'xterm', 'addon-serialize.js'), 'utf8'),
     context);
+  vm.runInContext(
+    fs.readFileSync(path.join(assets, 'terminal-snapshot.js'), 'utf8'),
+    context);
   // This suite runs the same un-opened xterm InputHandler path as the hidden
   // authority. The separate App probe covers actual WebView2 message delivery.
   const html = fs.readFileSync(
@@ -87,6 +90,42 @@ async function main() {
       }
     });
     return result;
+  }
+
+  for (const [setup, continuation] of [
+    ['\x1b[2;4r\x1b[4;1H', '\nA\nB\nC'],
+    ['\x1b[2;3H\x1b7\x1b[4;5H', '\x1b8X'],
+    ['\x1b(0', 'q'],
+    ['\x1b[3g\x1b[1;4H\x1bH', '\r\tX']
+  ]) {
+    await invoke({ type: 'create', sessionId: 'roundtrip', sequence: '0', cols: 20, rows: 5 });
+    const checkpoint = await invoke({ type: 'output', sessionId: 'roundtrip', sequence: '1',
+      data: Buffer.from(setup).toString('base64'), checkpoint: true });
+    assert.equal(checkpoint.ok, true);
+    assert.equal((await invoke({ type: 'restore', sessionId: 'restored', sequence: '1',
+      snapshot: checkpoint.snapshot, cols: 20, rows: 5 })).ok, true);
+    const results = [];
+    for (const sessionId of ['roundtrip', 'restored']) {
+      results.push(await invoke({ type: 'output', sessionId, sequence: '2',
+        data: Buffer.from(continuation).toString('base64'), checkpoint: true }));
+      await invoke({ type: 'dispose', sessionId, sequence: '2' });
+    }
+    assert.equal(results[0].ok, true);
+    assert.equal(results[1].ok, true);
+    assert.equal(results[1].snapshot, results[0].snapshot, 'authority recovery changed future parsing');
+  }
+
+  for (const [prefix, suffix] of [['\x1b(', '0q'], ['\x1b[\x1b[31', 'mRED']]) {
+    await invoke({ type: 'create', sessionId: 'partial', sequence: '0', cols: 20, rows: 5 });
+    const partial = await invoke({ type: 'output', sessionId: 'partial', sequence: '1',
+      data: Buffer.from(prefix).toString('base64'), checkpoint: true });
+    assert.equal(partial.ok, true);
+    assert.equal(partial.checkpointSafe, false, 'authority committed an incomplete escape');
+    assert.equal(partial.snapshot, null);
+    const completed = await invoke({ type: 'output', sessionId: 'partial', sequence: '2',
+      data: Buffer.from(suffix).toString('base64'), checkpoint: true });
+    assert.equal(completed.checkpointSafe, true);
+    await invoke({ type: 'dispose', sessionId: 'partial', sequence: '2' });
   }
 
   for (const sessionId of ['a', 'b']) {

@@ -153,25 +153,26 @@ http://192.168.1.100:8443/ttyd?token=my_secret_token
 
 - 终端名称必须已存在于应用的标签栏中且正在运行，大小写敏感
 - 如果未配置令牌，可省略 `?token=` 部分，直接访问 `http://192.168.1.100:8443/ttyd`
-- 令牌错误、终端不在允许列表或终端未运行时，WebSocket 升级后会返回协议 v3 的明确拒绝原因，页面收到后停止重连
+- 令牌错误、终端不在允许列表或终端未运行时，WebSocket 升级后会返回协议 v4 的明确拒绝原因，页面收到后停止重连
 - 同一终端最多同时连接 8 个浏览器窗口，整个应用最多 32 个远程连接
 - 远程页面和软件端都支持安全的 `Ctrl+C`：只有终端输入区获得焦点、没有 xterm/DOM 非空选区、没有进行 IME 组合输入、按键事件可信、不是自动重复且按键已经释放后，才会通过独立 `interrupt` 通道向 ConPTY 写入恰好一个 ETX（`0x03`）。任何非空选区始终只复制，即使剪贴板写入失败也绝不回退为中断
-- 新连接和重连会先恢复进程级权威 xterm.js 状态，再按单调事件序列衔接输出和已接受的 resize，收到 `syncComplete` 后才开放输入与 resize。协议 v3 的序列号是十进制字符串，浏览器用 `BigInt` 校验；发现缺口时主动断开重连，不会继续显示一个悄悄损坏的终端状态
+- 新连接和重连会先恢复进程级权威 xterm.js 状态，再按单调事件序列衔接输出和已接受的 resize，收到 `syncComplete` 后才开放输入与 resize。协议 v4 的序列号是十进制字符串，浏览器用 `BigInt` 校验；发现缺口时主动断开重连，不会继续显示一个悄悄损坏的终端状态。升级程序后需刷新已打开的旧版远程页面
 - 标签名通过 UTF-8 percent encoding 放在 URL 中，因此空格、中文、`.` 以及 `/`、`?`、`#` 均可作为名称；仅 NUL 和其他控制字符被拒绝。标签名按 ordinal 精确匹配且区分大小写。远程页面自身的静态文件统一从 `/assets/` 路径加载，因此像 `api.v2` 这样带点的名称不会被误当成文件
 - 浏览器输入带有 `inputId`。只有 Host 已把对应字节写入 ConPTY 输入管道后，页面才会收到成功确认；如果前台程序暂时不读取输入，页面会明确提示“已写入但屏幕尚无变化”，不会在浏览器中伪造本地回显
 
 ### 限制
 
-- **快照历史有界**：远程连接会恢复当前屏幕、终端模式及最近最多 256 行滚动历史，而不是保存进程启动以来的无限原始输出。本地终端仍保留 5000 行滚动缓冲
+- **快照历史有界**：远程连接会恢复当前屏幕、终端模式及最近最多 256 行滚动历史，同时恢复滚动区域、保存的光标和属性、字符集及自定义制表位，保证后续输出继续按原状态解析。本地终端仍保留 5000 行滚动缓冲
 - **权威状态与可见页面分离**：主进程维护一个独立于主窗口、始终处于 shown 状态的离屏 1×1 WebView2 权威宿主，每个会话在其中拥有独立且不调用 `open()` 的 headless xterm.js + SerializeAddon 引擎。每个事件先经过严格保守的增量状态预算检查，再由锁定版本 xterm 的 InputHandler 完整解析，之后才推进序列并广播；这条路径不依赖后台 renderer 的计时器或绘制。可见软件端和浏览器都只是副本，隐藏到托盘或切换标签不会停止权威解析
 - **状态同步失败只降级，不终止任务**：每个权威状态最多 8 MiB；不完整 OSC/DCS、组合字符单元和序列化状态都受同一硬上限约束。权威 WebView2 崩溃会立即用最近检查点恢复所有仍有效的独立会话，最多等待 30 秒。超时、序列缺口、解析异常、状态超限或少数会放大状态的控制序列（REP、DECALN 等）只会令对应会话的状态同步降级：该标签的远程浏览器在最后一个连续事件处收到 `stateUnavailable` 并停止重连，之后的新连接也会被拒绝；终端进程、Host/ConPTY 和本地显示照常运行，标签状态栏会注明“状态同步已停用”。降级后若本地视图需要重建（例如 renderer 崩溃），只能从带提示的空白屏幕继续跟随新输出，不会伪造历史。要恢复远程访问，需在任务结束后关闭并重新创建该标签
 - **超链接**：OSC 8 超链接会原样送到本地和远程副本，可正常显示；权威引擎只解析链接文字、不保存链接元数据，因此从检查点恢复的副本中，检查点之前的内容显示为普通文字
+- **扩展下划线样式**：现有 SerializeAddon 不保留已显示文字的波浪线等扩展下划线样式和独立颜色；从检查点恢复时，这些文字可能变为普通下划线
 - **尺寸只有一个 owner**：本地终端可见时由本地窗口决定 ConPTY 尺寸；应用隐藏到托盘或标签不可见时，由最早连接的远程浏览器持有尺寸租约。owner 断开后租约按连接顺序移交，接受的尺寸会广播给本地和所有远程渲染器，非 owner 的 resize 请求只作为其将来接管时的候选尺寸
 - **无输入冲突处理**：本地和远程可以同时在同一个终端中输入，等价于两个键盘同时插在一台电脑上。若需协调操作，请自行约定
 - **慢速/失联客户端会被自动断开**：每个远程状态订阅和 WebSocket 发送队列都是 512 块的硬上限，单次发送超时 30 秒，同时启用 WebSocket 心跳检测（每 30 秒 ping，20 秒内未收到 pong 即断开）。慢客户端只断开自己，不能反压 ConPTY、软件端或其他浏览器。普通网络断线和 App/服务重启会由单一计时器无限重连，指数退避最高 30 秒；认证失败、明确拒绝、终端正常结束或永久状态不可用会停止重连
 - **HTTP 请求总数有硬上限**：从 TCP 接受开始计算，整个服务最多同时处理 64 个请求（其中 WebSocket 仍受 32 个连接上限约束）；请求头必须在 10 秒内读完，超限的新连接立即关闭，慢速请求不会形成无界任务或长期占满服务
 - **终端结束有明确边界**：进程退出后 Host 最多用 3 秒排空最终 ConPTY 输出，再发送 `terminalEnded` 和退出码；浏览器收到后停止重连。排空超时或错误会标记为输出不完整、不可验证，而不伪装成正常完整退出
-- **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的控制管按 64 KiB 分片并逐块等待 ConPTY 写入确认；单个远程输入限制为 1 MiB，任一输入操作限制为 4 MiB，远程单条 WebSocket 消息限制为 16 MiB。每个会话最多保留 64 个、合计 16 MiB 的等待输入/中断操作。中断会取消尚未写入的普通输入，并在当前小分片后优先写入；断线前未确认的操作不会自动重发，页面会提示结果未知
+- **大输入会分片发送**：本地和远程粘贴会在主程序到 Host 的控制管按 64 KiB 分片并逐块等待 ConPTY 写入确认；单个远程输入限制为 1 MiB，任一输入操作限制为 4 MiB，远程单条 WebSocket 消息限制为 16 MiB。每个会话最多保留 64 个、合计 16 MiB 的等待输入/中断操作。中断会取消尚未写入的普通输入，并在当前小分片后优先写入；失败或断线前未确认的操作不会自动重发。失败可能发生在部分内容已经写入之后，页面会提示检查终端状态、不要直接重复发送；后续日志或其他操作的成功确认不会清除这条提示，用户再次主动输入时才恢复普通状态提示
 - **进程和连接硬上限**：最多 32 个标签，标题必须按大小写敏感规则唯一；`init.txt` 仅接受前 32 个有效且不重复的名称，后续项会记录并跳过。每终端最多 8 个浏览器、全局最多 32 个 WebSocket。这些资源/容量/时间限制是代码硬上限，未来配置只能降低，不能无限提高
 - **权威宿主资源成本**：复用同一 WebView2 environment，不引入 Node 或第二套 VT parser。经验预估中，共享不可见宿主通常增加约 20–80 MiB browser working set；普通内容约再增加 0.5–1.5 MiB/会话，并多做一次 VT 解析和有界序列化。实际值必须以目标机器上的 soak 采样为准，且取决于 WebView2 Runtime、字体、屏幕内容和标签数；8 MiB/会话状态与 32 标签硬上限保证恶意输出不能无限增长
 - **不显示背景图**：远程浏览器不接收本机的 `Data\Backgrounds` 图片，因此不会显示终端背景图
@@ -194,6 +195,8 @@ scripts/
   test-authority-state.cjs
   test-input-policy.cjs
   test-remote-protocol.cjs
+  test-terminal-snapshot.cjs
+  test-terminal-pages.cjs
 src/
   TrayTerminal.App/
   TrayTerminal.Host/
@@ -216,6 +219,8 @@ src/
 - `scripts/test-remote-protocol.cjs`：使用 Node.js 验证远程浏览器必须等待 xterm 写入回调，才能依次处理 size 和 `syncComplete`。
 - `scripts/test-authority-state.cjs`：使用 vendored xterm.js 做 headless 压力测试，覆盖极碎片输出、不完整控制序列/UTF-8 的安全检查点、resize storm、超长 OSC/DCS、OSC 8 超链接不入状态、组合字符状态超限和会话失败隔离。
 - `scripts/test-input-policy.cjs`：覆盖本地和远程共用的 Ctrl+C 判定规则，确保 selection、失焦、IME 和按键重复不会误触发中断。
+- `scripts/test-terminal-snapshot.cjs`：使用真实 xterm 解析器验证补充状态恢复、不同滚动历史容量、后续输出及 resize，以及各类控制序列和 UTF-8 分片的检查点边界。
+- `scripts/test-terminal-pages.cjs`：执行本地和远程页面脚本，验证两端恢复后继续输出、输入失败提示的保留，以及远程协议版本不匹配时的刷新提示。
 - `scripts/probe-authority-webview.ps1`：启动仓库内已构建 App 的隔离 probe，使用真实 WebView2 覆盖 authority create、首个 output、checkpoint、同 ID restore 后继续 output，以及 dispose；运行前要求没有同路径 App 进程。
 - `scripts/soak-terminal-sync.ps1`：30 分钟真实进程采样工具；保存 App + 相关 WebView2 的 private memory、句柄、线程和连接完整 CSV，并按 warmup 后首尾 5 分钟中位数执行验收。可选注入 renderer crash、浏览器重连和不消费数据的慢客户端。
 
@@ -230,6 +235,7 @@ src/
 - `Assets/app.ico`：应用窗口、任务栏和托盘图标。
 - `Assets/terminal.html`：WebView2 加载的终端页面，承载 xterm.js、键盘输入、resize、背景图和轻量 fallback 渲染。
 - `Assets/remote-protocol.js`：远程页面的逐连接串行消息处理器，保证异步 xterm 写入不会被后续协议消息越过。
+- `Assets/terminal-snapshot.js`：权威引擎、本地页面和远程页面共用的检查点编解码与补充状态恢复；绑定锁定的 xterm 版本，同时修正滚动缓冲回收时保存光标的位置。
 - `Assets/xterm/xterm.css`、`xterm.js`：锁定的 `@xterm/xterm` 5.5.0 官方静态文件。
 - `Assets/xterm/addon-serialize.js`：锁定的 `@xterm/addon-serialize` 0.13.0，用于生成可恢复 VT 快照；具体来源、SHA-256 和 MIT 许可证见同目录 `THIRD-PARTY-NOTICES.md`、`LICENSE`。
 - `Controls/TerminalPage.cs`：单个标签页的 WPF 包装，管理标题、字号、背景、状态栏、TerminalSession 和 TerminalView。
@@ -280,6 +286,7 @@ src/
 
 - `TrayTerminal.SmokeTests.csproj`：轻量 smoke test 控制台项目。
 - `Program.cs`：测试便携路径边界、IPC 编解码、快照/事件连续性、恢复 generation barrier、远端同步门与共享操作上限、resize ownership，以及真实 Host/ConPTY 的输出背压、resize 顺序、ETX 写入、关闭期间输入拒绝、CMD 子进程和 PowerShell 进程内命令判定。
+- `TerminalSessionTests.cs`：直接验证会话合并 resize 请求时不丢失尺寸或 owner 变化、旧请求不覆盖新请求，以及大输入部分写入后被中断时的返回结果。
 
 ### 构建输出
 
@@ -339,6 +346,8 @@ dotnet run --project src\TrayTerminal.SmokeTests\TrayTerminal.SmokeTests.csproj 
 node .\scripts\test-remote-protocol.cjs
 node .\scripts\test-authority-state.cjs
 node .\scripts\test-input-policy.cjs
+node .\scripts\test-terminal-snapshot.cjs
+node .\scripts\test-terminal-pages.cjs
 ```
 
 构建后运行真实 WebView2 authority probe（不要同时运行同一构建目录中的 TrayTerminal）：
@@ -408,10 +417,10 @@ publish\TrayTerminal\TrayTerminal.exe
 - WebView2 的用户数据目录固定在 `Data\WebView2`，不要改回系统默认目录，否则会破坏便携数据约定。
 - `terminal.html` 保留轻量 fallback 用于显示静态加载错误，但可恢复状态依赖锁定版本的 xterm.js + SerializeAddon；这两个静态文件缺失或不兼容时终端初始化必须失败，不能让不完整的 fallback 状态冒充权威状态。
 - 终端背景图只从 `Data\Backgrounds` 自动匹配；`config.txt` 的相对 `bg` 路径仍相对于程序目录。图片读取完成并确认不超过 32 MiB 后，才会通过 `data:` URL 原子应用到 WebView2；读取、大小检查或渲染失败会保留旧壁纸，避免重载竞态和浏览器缓存造成状态不一致。
-- `TerminalAuthorityHost` 必须在创建任何 Host/ConPTY 前成功加载锁定版本的 xterm.js + SerializeAddon；初始化失败没有降级路径。独立的离屏 1×1 authority Window 会在主窗口隐藏到托盘后继续保持 WebView2 shown，并在宿主释放时连同 WebView 一起关闭。每个 headless xterm 不创建 DOM/canvas；权威写入直接驱动当前 vendored 版本的可续传 InputHandler，并将 restore 数据按不超过 64 KiB 分片，因此不会依赖 offscreen renderer 可能被节流的 `write()` 定时器。它为每会话保留最近 256 行的权威 VT 状态；每个事件在写入前受 8 MiB 保守增量预算约束，正常检查点最迟每 2 秒生成一次，tail 接近 8 MiB 或 4096 项时会提前生成。检查点执行精确序列化上限检查，未完成 OSC/DCS 另有逐字节硬上限；可放大既有单元文本的少数 VT 序列（REP、DEC 矩形填充/复制、DECALN）会在到达 xterm 前被拒绝；OSC 8 超链接由每个引擎注册的空处理器消费，只保留链接文字，不得改回拒绝，因为 ConPTY 会转发普通 CLI 输出的超链接。renderer/browser crash 时立即恢复隐藏和可见会话；单个引擎超限、异常或 30 秒超时只能令对应会话的状态同步降级，不会终止其终端进程。
+- `TerminalAuthorityHost` 必须在创建任何 Host/ConPTY 前成功加载锁定版本的 xterm.js + SerializeAddon；初始化失败没有降级路径。独立的离屏 1×1 authority Window 会在主窗口隐藏到托盘后继续保持 WebView2 shown，并在宿主释放时连同 WebView 一起关闭。每个 headless xterm 不创建 DOM/canvas；权威写入直接驱动当前 vendored 版本的可续传 InputHandler，并将 restore 数据按不超过 64 KiB 分片，因此不会依赖 offscreen renderer 可能被节流的 `write()` 定时器。它为每会话保留最近 256 行的权威 VT 状态；每个事件在写入前受 8 MiB 保守增量预算约束，正常检查点最迟每 2 秒生成一次，tail 接近 8 MiB 或 4096 项时会提前生成。检查点执行精确序列化上限检查；未完成的 OSC/DCS 期间 parser 不处于安全边界、无法生成检查点，增量预算耗尽时直接按状态超限处理，因此同样有硬上限；可放大既有单元文本的少数 VT 序列（REP、DEC 矩形填充/复制、DECALN）会由 xterm 注册的处理器在修改屏幕前拒绝；OSC 8 超链接由每个引擎注册的空处理器消费，只保留链接文字，不得改回拒绝，因为 ConPTY 会转发普通 CLI 输出的超链接。renderer/browser crash 时立即恢复隐藏和可见会话；单个引擎超限、异常或 30 秒超时只能令对应会话的状态同步降级，不会终止其终端进程。
 - `TerminalStateHub` 原子保存 authority checkpoint、单调的 output/resize 事件和 bounded subscriber。权威提交完成后才能调用副本订阅者；本地 `TerminalView` 和远程浏览器禁止反向提交快照。`TerminalView` 的 1024 块队列以及每批 256 KiB 都是硬边界，必须等待 JS 的 batch write callback；队列满或序列缺口只能从权威快照重建，不能 `DropOldest` 后继续。
 - `TerminalView` 订阅 `CoreWebView2.ProcessFailed`，但它只是可见副本：隐藏标签时权威状态仍持续更新。可见 renderer crash、脚本断连和副本序列缺口从 authority checkpoint 重建，不会把可见页面生命周期重新提升为权威。
-- 远程访问继续使用轻量 TCP HTTP/WebSocket 服务，不依赖 `Microsoft.AspNetCore.App`。协议仅支持 v3，不保留 v2 兼容分支：`syncStart → snapshot → replay(output/resize) → syncComplete` 全程使用十进制字符串序列；页面按 WebSocket 世代串行等待 xterm write callback，旧连接回调不能污染重连后的状态。
+- 远程访问继续使用轻量 TCP HTTP/WebSocket 服务，不依赖 `Microsoft.AspNetCore.App`。协议仅支持 v4，不保留旧版本兼容分支：`syncStart → snapshot → replay(output/resize) → syncComplete` 全程使用十进制字符串序列。snapshot 使用带版本标记的二进制封装，包含 SerializeAddon 的 VT 屏幕内容和补充状态；本地、远程、authority 恢复都先完成 VT 写入，再应用补充状态，然后按序回放。检查点安全性必须读取实际 xterm parser/decoder 状态，不能用另一套简化解析器推测。页面按 WebSocket 世代串行等待 xterm write callback，旧连接回调不能污染重连后的状态。
 - `TerminalSession` 暴露 `Completion`/`Terminated`，并区分 `terminalEnded`、输出不完整和 Host/IPC 失败。authority failure 不属于会话失败：`TerminalSession` 只切换到降级模式（`IsAuthorityDegraded`/`AuthorityDegraded`），在 `_commitLock` 下从最后一个权威序列继续编号并只投递给本地副本，同时用 `TerminalStateUnavailableException` 结束全部远程订阅；不要在这条路径上终止 Host，否则一次同步故障就会杀掉用户挂着的任务。正常退出必须先收到 output 管的完成边界；所有失败/关闭路径都要取消有界泵、失败 pending ACK、释放订阅/管/进程/authority engine，并只触发一次完成通知。
 - 普通输入和独立 interrupt 都携带 App 请求 ID。Host 只有在 `ConPtySession.Input.WriteAsync` 和 `FlushAsync` 成功后才返回 ACK；interrupt 由 Host 的优先队列生成固定单字节 ETX，远端无法用普通 input 伪造优先级。不要在 App 写入 control 管后提前确认。
 - `RemoteTerminalBridge` 的状态订阅和统一发送队列各有 512 块硬上限，由单一发送循环串行发送，单次发送超时 30 秒；任一队列写满、发送超时、终端结束、协议版本/序列不合法或远程单条消息超过 16 MB 都会主动断开。每会话最多 8 个状态订阅，全局最多 32 个桥接。WebSocket 接受时设置了 `KeepAliveTimeout`，对端不回 pong 会被自动断开。不要把发送改回每块输出 fire-and-forget 的模式。
